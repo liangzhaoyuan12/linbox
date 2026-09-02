@@ -39,6 +39,10 @@ pub struct PlatformConfig {
     pub headers: Vec<(String, String)>,
     /// 备注。
     pub note: String,
+    /// 该平台独立的扫描参数（并发/限速/超时/重试/字典规模/断点/入库）。
+    /// 老配置文件没有此字段时回落到默认值。
+    #[serde(default)]
+    pub scan: ScanConfig,
 }
 
 impl PlatformConfig {
@@ -51,6 +55,7 @@ impl PlatformConfig {
             pattern: pattern.to_string(),
             headers: Vec::new(),
             note: note.to_string(),
+            scan: ScanConfig::default(),
         }
     }
 
@@ -137,7 +142,8 @@ pub struct ScanConfig {
     /// 网络错误 / 5xx / 429 的自动重试次数。
     pub retries: usize,
     /// 字典最大生成条数（密钥空间更大时截断）。
-    pub max_candidates: usize,
+    /// 最大生成条数（u128 无硬性上限，实际受运存约束）。
+    pub max_candidates: u128,
     /// `*`、`+`、`{n,}` 等无界量词的展开上限。
     pub unbounded_repeat: usize,
     /// 是否启用断点续跑。

@@ -39,7 +39,10 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
 // 统一在本模块重导出，页面层只需 `use crate::utils::sniffer::{...}`。
 // 作为本模块对外的完整 API 面，部分符号暂未被当前页面用到，故关掉未使用告警。
 #[allow(unused_imports)]
-pub use generate::{estimate_space, format_count, generate, sample_seed_for, Dictionary, GenerateOptions};
+pub use generate::{
+    available_memory_bytes, estimate_space, format_count, generate, recommended_max_keys,
+    sample_seed_for, Dictionary, GenerateOptions,
+};
 #[allow(unused_imports)]
 pub use probe::{chat_body, join_url, now_unix, parse_header_lines, ProbeMethod, ProbeTarget};
 #[allow(unused_imports)]
@@ -47,6 +50,7 @@ pub use scan::{start as start_scan, Control, ScanEvent, ScanParams, StopReason};
 #[allow(unused_imports)]
 pub use store::{
     append_valid, checkpoint_path, clear_checkpoint, clear_valid, config_dir, data_dir,
-    db_path, delete_valid, export_valid, init_db, load_checkpoint, load_store,
-    load_valid, save_checkpoint, save_platforms, save_store, default_store,
+    db_path, delete_valid, export_valid, init_db, load_checkpoint, load_store, load_valid,
+    rename_checkpoint, rename_platform, save_checkpoint, save_platforms, save_store,
+    default_store,
 };

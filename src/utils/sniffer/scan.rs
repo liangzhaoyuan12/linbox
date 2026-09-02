@@ -306,7 +306,11 @@ async fn worker(ctx: Arc<Ctx>, tx: Sender<ScanEvent>) {
 
     // 最后一个退出的任务负责收尾
     if ctx.shared.alive.fetch_sub(1, Ordering::AcqRel) == 1 {
-        write_checkpoint(&ctx).await;
+        // 停止 = 主动放弃本轮进度：不再写断点，避免「页面刚清掉、这里又写回」。
+        // 仅自然跑完才写最终断点（应用中途退出时断点仍可续跑）。
+        if !ctx.shared.stop.load(Ordering::Relaxed) {
+            write_checkpoint(&ctx).await;
+        }
         let reason = if ctx.shared.stop.load(Ordering::Relaxed) {
             StopReason::Stopped
         } else {
@@ -487,6 +491,58 @@ mod tests {
         assert!(finished, "扫描未正常结束");
         assert_eq!(valid_keys, vec!["sk-good".to_string()]);
         assert_eq!(unauthorized, 3);
+    }
+
+    #[test]
+    fn stop_mid_scan_always_emits_finished() {
+        let port = spawn_fake_api();
+        let keys: Vec<String> = (0..400).map(|i| format!("sk-stop-{i:03}")).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let control = start(
+            ScanParams {
+                platform: "p".into(),
+                fingerprint: "f".into(),
+                target: ProbeTarget {
+                    base_url: format!("http://127.0.0.1:{port}/v1"),
+                    endpoint: "/chat/completions".into(),
+                    model: "m".into(),
+                    headers: Vec::new(),
+                    timeout: Duration::from_secs(5),
+                },
+                keys: Arc::new(keys),
+                start_index: 0,
+                concurrency: 4,
+                // 限速 50/s：400 条 ≈ 8 秒才能扫完，保证 stop 时扫描必然还在进行中
+                rate_per_sec: 50.0,
+                retries: 0,
+                persist_valid: false,
+                write_checkpoint: false,
+            },
+            tx,
+        );
+        // 让扫描跑一会儿（此时有请求在途/暂停轮询的多种状态并存）
+        std::thread::sleep(Duration::from_millis(600));
+        control.stop();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_stopped = false;
+        loop {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(ScanEvent::Finished { reason, .. }) => {
+                    // 只应发一次，且 stop 后必为 Stopped
+                    assert_eq!(reason, StopReason::Stopped);
+                    saw_stopped = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if std::time::Instant::now() > deadline {
+                        panic!("停止后 10 秒内未收到 Finished（saw_stopped={saw_stopped}）");
+                    }
+                }
+                Err(e) => panic!("通道错误 {e}"),
+            }
+        }
+        assert!(saw_stopped);
     }
 
     #[test]

@@ -126,6 +126,8 @@ struct Inner {
     config_expander: adw::ExpanderRow,
     /// 开始扫描时等待生成字典的平台队列（逐个生成）。
     pending_dict: RefCell<Vec<String>>,
+    /// 字典生成被取消（停止按钮在生成期间被点击）；在途任务完成后据此不再继续生成/开扫。
+    gen_cancelled: Cell<bool>,
     name_row: adw::EntryRow,
     base_row: adw::EntryRow,
     endpoint_combo: adw::ComboRow,
@@ -137,7 +139,8 @@ struct Inner {
     // 字典
     pattern_row: adw::EntryRow,
     template_combo: adw::ComboRow,
-    max_row: adw::SpinRow,
+    max_row: adw::EntryRow,
+    max_hint: adw::ActionRow,
     unbounded_row: adw::SpinRow,
     dict_info: gtk::Label,
     dict_preview: gtk::TextView,
@@ -185,6 +188,8 @@ struct Inner {
     runs: RefCell<Vec<RunState>>,
     running: Cell<bool>,
     paused: Cell<bool>,
+    /// 「新平台」表单回落的全局默认扫描参数（启动时从 store.scan 快照）。
+    default_scan: RefCell<ScanConfig>,
     started_at: RefCell<Option<Instant>>,
 }
 
@@ -453,10 +458,37 @@ pub fn build() -> ApiKeySnifferPage {
     pattern_row.set_sensitive(false); // 默认选中预设模板，正则不可编辑
     config_expander.add_row(&pattern_row);
 
-    let max_row = spin_row("最大生成条数（密钥空间更大时截断）", 1.0, 2_000_000.0, 10_000.0, 0, 100_000.0);
+    let max_row = adw::EntryRow::new();
+    max_row.set_title("最大生成条数（密钥空间更大时截断）");
+    max_row.set_text("100000");
     config_expander.add_row(&max_row);
+    let max_hint = adw::ActionRow::new();
+    max_hint.set_title("注意");
+    max_hint.set_subtitle("u128 无上限，不设固定条数上限；生成前按当前可用运存判断，数值越大占用的运存越多");
+    config_expander.add_row(&max_hint);
     let unbounded_row = spin_row("* + {n,} 等无界量词展开上限", 1.0, 8.0, 1.0, 0, 3.0);
     config_expander.add_row(&unbounded_row);
+
+    // 扫描参数并入 item 设置：每个平台各自记忆一式（并发/限速/超时/重试/断点/入库）
+    let scan_sep = adw::ActionRow::new();
+    scan_sep.set_title("扫描参数（每个平台独立记忆）");
+    scan_sep.set_subtitle("「开始扫描」时按各平台自己的参数执行");
+    scan_sep.set_selectable(false);
+    scan_sep.set_activatable(false);
+    config_expander.add_row(&scan_sep);
+
+    let concurrency_row = spin_row("并发数（线程）", 1.0, 512.0, 1.0, 0, 4.0);
+    config_expander.add_row(&concurrency_row);
+    let rate_row = spin_row("限速（请求 / 秒，0 = 不限）", 0.0, 10000.0, 1.0, 0, 5.0);
+    config_expander.add_row(&rate_row);
+    let timeout_row = spin_row("单次请求超时（秒）", 1.0, 120.0, 1.0, 0, 15.0);
+    config_expander.add_row(&timeout_row);
+    let retry_row = spin_row("失败重试次数（网络错误 / 5xx / 429）", 0.0, 5.0, 1.0, 0, 1.0);
+    config_expander.add_row(&retry_row);
+    let resume_switch = switch_row("断点续跑", "中断后下次从断点继续；配置变更会自动失效", true);
+    config_expander.add_row(&resume_switch);
+    let persist_switch = switch_row("命中即入本地库", "有效 Key 追加写入 SQLite，自动去重，永久保存", true);
+    config_expander.add_row(&persist_switch);
 
     let save_btn = gtk::Button::with_label("保存");
     save_btn.add_css_class("suggested-action");
@@ -477,28 +509,12 @@ pub fn build() -> ApiKeySnifferPage {
     dict_scroll.set_max_content_height(260);
     config_expander.add_row(&dict_scroll);
 
-    // ---------- 扫描参数 ----------
-    let (scan_card, sc) = card("扫描参数", "并发、限速、超时、重试与断点续跑");
-    root_box.append(&scan_card);
-
-    let concurrency_row = spin_row("并发数（线程）", 1.0, 128.0, 1.0, 0, 4.0);
-    sc.add(&concurrency_row);
-    let rate_row = spin_row("限速（请求 / 秒，0 = 不限）", 0.0, 1000.0, 1.0, 0, 5.0);
-    sc.add(&rate_row);
-    let timeout_row = spin_row("单次请求超时（秒）", 1.0, 120.0, 1.0, 0, 15.0);
-    sc.add(&timeout_row);
-    let retry_row = spin_row("失败重试次数（网络错误 / 5xx / 429）", 0.0, 5.0, 1.0, 0, 1.0);
-    sc.add(&retry_row);
-    let resume_switch = switch_row("断点续跑", "中断后下次从断点继续；配置变更会自动失效", true);
-    sc.add(&resume_switch);
-    let persist_switch = switch_row("命中即入本地库", "有效 Key 追加写入 JSONL，永久保存", true);
-    sc.add(&persist_switch);
-    let verbose_switch = switch_row("记录每一条的判定", "关闭时只记录命中、汇总与异常", false);
-    sc.add(&verbose_switch);
-
     // ---------- 执行 ----------
     let (run_card, rc_) = card("执行", "");
     root_box.append(&run_card);
+
+    let verbose_switch = switch_row("记录每一条的判定", "关闭时只记录命中、汇总与异常", false);
+    rc_.add(&verbose_switch);
 
     let start_btn = gtk::Button::with_label("开始扫描");
     start_btn.add_css_class("suggested-action");
@@ -627,6 +643,7 @@ pub fn build() -> ApiKeySnifferPage {
         task_empty: task_empty.clone(),
         config_expander: config_expander.clone(),
         pending_dict: RefCell::new(Vec::new()),
+        gen_cancelled: Cell::new(false),
         name_row: name_row.clone(),
         base_row: base_row.clone(),
         endpoint_combo: endpoint_combo.clone(),
@@ -637,6 +654,7 @@ pub fn build() -> ApiKeySnifferPage {
         pattern_row: pattern_row.clone(),
         template_combo: template_combo.clone(),
         max_row: max_row.clone(),
+        max_hint: max_hint.clone(),
         unbounded_row: unbounded_row.clone(),
         dict_info: dict_info.clone(),
         dict_preview: dict_preview.clone(),
@@ -671,6 +689,7 @@ pub fn build() -> ApiKeySnifferPage {
         runs: RefCell::new(Vec::new()),
         running: Cell::new(false),
         paused: Cell::new(false),
+        default_scan: RefCell::new(ScanConfig::default()),
         started_at: RefCell::new(None),
     });
 
@@ -679,6 +698,7 @@ pub fn build() -> ApiKeySnifferPage {
     select_none_btn.connect_clicked(|_| g_select_all(false));
     endpoint_combo.connect_selected_notify(|_| g_on_endpoint_changed());
     template_combo.connect_selected_notify(|_| g_on_template_selected());
+    pattern_row.connect_changed(|_| g_on_pattern_changed());
 
     new_btn.connect_clicked(|_| g_new_platform());
     save_btn.connect_clicked(|_| g_save_platform());
@@ -710,6 +730,7 @@ pub fn build() -> ApiKeySnifferPage {
         let store_data = store::load_store();
         *inner.platforms.borrow_mut() = store_data.platforms;
         inner.apply_scan_config(&store_data.scan);
+        *inner.default_scan.borrow_mut() = store_data.scan; // 「新平台」回落默认值
         inner.rebuild_platform_list(Some(&store_data.last_platform));
         if let Some(p) = inner.current_platform() {
             inner.load_platform(&p);
@@ -717,6 +738,7 @@ pub fn build() -> ApiKeySnifferPage {
         inner.reload_valid();
         inner.refresh_resume_hint();
         inner.update_stats();
+        inner.refresh_max_hint();
     }
 
     // 主循环里排空扫描事件队列（闭包不带捕获，满足 signal 的 Send 要求）
@@ -772,6 +794,10 @@ fn g_on_endpoint_changed() {
         i.endpoint_row
             .set_visible(i.endpoint_combo.selected() == ENDPOINT_CUSTOM);
     });
+}
+
+fn g_on_pattern_changed() {
+    with_inner(|i| i.refresh_max_hint());
 }
 
 fn g_on_template_selected() {
@@ -877,6 +903,36 @@ impl Inner {
         self.platforms.borrow().iter().find(|p| p.name == name).cloned()
     }
 
+    /// 根据当前可用运存与当前正则，实时刷新「注意」行的推荐最大条数。
+    fn refresh_max_hint(&self) {
+        let pattern = self.pattern_row.text().trim().to_string();
+        let unbounded = self.unbounded_row.value().max(1.0) as usize;
+        let avail = crate::utils::sniffer::available_memory_bytes();
+        let recommended = crate::utils::sniffer::recommended_max_keys(&pattern, unbounded);
+        match (avail, recommended) {
+            (Some(bytes), Some(keys)) => {
+                self.max_hint.set_subtitle(&format!(
+                    "u128 无上限；超出当前可用运存（约 {:.1} GB）会在生成时被拦截。\
+                     按当前正则推荐最大生成条数 ≤ {} 条",
+                    bytes as f64 / 1_000_000_000.0,
+                    crate::utils::sniffer::format_count(keys)
+                ));
+            }
+            (Some(_), None) => {
+                self.max_hint.set_subtitle(
+                    "u128 无上限；超出当前可用运存会在生成时被拦截。填入合法的正则后，\
+                     将按当前可用运存显示推荐最大条数",
+                );
+            }
+            _ => {
+                // 读不到可用内存信息（非 Linux）：回到静态提示
+                self.max_hint.set_subtitle(
+                    "u128 无上限，不设固定条数上限；生成前按当前可用运存判断，数值越大占用的运存越多",
+                );
+            }
+        }
+    }
+
     /// 把一份配置填进表单。
     fn load_platform(&self, p: &PlatformConfig) {
         *self.loaded_name.borrow_mut() = p.name.clone();
@@ -923,6 +979,8 @@ impl Inner {
                 self.endpoint_row.set_visible(true);
             }
         }
+        // 载入该平台自己记忆的扫描参数（表单同步回填）
+        self.apply_scan_config(&p.scan);
         // 载入平台时展示该平台已生成的字典状态（若有）
         let dict_state = self
             .dicts
@@ -969,6 +1027,8 @@ impl Inner {
             pattern: self.pattern_row.text().to_string(),
             headers: parse_header_lines(&buffer_text(&self.headers_view.buffer())),
             note: self.note_row.text().to_string(),
+            // 平台自带的扫描参数（每个 item 独立记忆）
+            scan: self.collect_scan_config(),
         }
     }
 
@@ -991,6 +1051,8 @@ impl Inner {
         self.name_row.set_text(&name);
         self.base_row.set_text("https://example.com/v1");
         self.model_row.set_text("gpt-3.5-turbo");
+        // 新平台回落全局默认扫描参数（store.scan 快照）
+        self.apply_scan_config(&self.default_scan.borrow());
         self.template_combo.set_selected(0);
         // 确保正则填入并锁定（set_selected 在已经是 0 时不会触发信号）
         if let Some((_, pattern)) = PATTERN_TEMPLATES.first() {
@@ -1050,6 +1112,20 @@ impl Inner {
                     dicts.insert(cfg.name.clone(), d);
                 }
             }
+        }
+        // 级联改名：本地库（valid_keys 表）与断点文件里的平台名一起迁移，
+        // 并刷新「有效 Key」列表，避免旧记录仍挂着旧平台名
+        if old_name != cfg.name {
+            if let Err(e) = store::rename_platform(&old_name, &cfg.name) {
+                self.toast(&format!("本地库平台名迁移失败：{e}"));
+            } else {
+                self.log(&format!(
+                    "平台「{old_name}」已改名为「{}」，本地库命中记录与断点已同步迁移",
+                    cfg.name
+                ));
+            }
+            store::rename_checkpoint(&old_name, &cfg.name);
+            self.reload_valid();
         }
         self.dict_info
             .set_text("配置已保存（「开始扫描」时自动生成字典）");
@@ -1189,13 +1265,23 @@ impl Inner {
 
     // ---------- 运行参数 ----------
 
+    /// 读取「最大生成条数」：u128 无硬性上限（受运存约束）；空/非法输入回退 100_000。
+    fn max_candidates(&self) -> u128 {
+        self.max_row
+            .text()
+            .trim()
+            .parse::<u128>()
+            .unwrap_or(100_000)
+            .max(1)
+    }
+
     fn collect_scan_config(&self) -> ScanConfig {
         ScanConfig {
             concurrency: self.concurrency_row.value() as usize,
             rate_per_sec: self.rate_row.value(),
             timeout_secs: self.timeout_row.value() as u64,
             retries: self.retry_row.value() as usize,
-            max_candidates: self.max_row.value() as usize,
+            max_candidates: self.max_candidates(),
             unbounded_repeat: self.unbounded_row.value() as usize,
             resume: self.resume_switch.is_active(),
             persist_valid: self.persist_switch.is_active(),
@@ -1208,7 +1294,7 @@ impl Inner {
         self.rate_row.set_value(cfg.rate_per_sec);
         self.timeout_row.set_value(cfg.timeout_secs as f64);
         self.retry_row.set_value(cfg.retries as f64);
-        self.max_row.set_value(cfg.max_candidates as f64);
+        self.max_row.set_text(&cfg.max_candidates.to_string());
         self.unbounded_row.set_value(cfg.unbounded_repeat as f64);
         self.resume_switch.set_active(cfg.resume);
         self.persist_switch.set_active(cfg.persist_valid);
@@ -1235,8 +1321,9 @@ impl Inner {
             self.set_task_status(&name, "配置缺失");
             return self.gen_next_dict();
         };
-        let max = self.max_row.value().max(1.0) as usize;
-        let unbounded = self.unbounded_row.value().max(1.0) as usize;
+        // 用该平台自己记忆的字典规模参数生成（不是表单当前值）
+        let max = p.scan.max_candidates;
+        let unbounded = p.scan.unbounded_repeat.max(1);
         let opts = GenerateOptions {
             max_results: max,
             unbounded_repeat: unbounded,
@@ -1326,8 +1413,16 @@ impl Inner {
             Some((name, Err(e))) => {
                 self.set_task_status(&name, "生成失败");
                 self.log(&format!("「{name}」字典生成失败：{e}"));
+                self.toast(&format!("「{name}」字典生成失败：{e}"));
             }
             None => self.dict_info.set_text("生成失败：内部状态丢失"),
+        }
+        // 停止被点击过：不再继续生成、也不进入扫描（生成的字典缓存已被 stop 清除）
+        if self.gen_cancelled.get() {
+            self.gen_cancelled.set(false);
+            self.start_btn.set_sensitive(true);
+            self.log("字典生成已取消，未开始扫描");
+            return;
         }
         // 队列里还有平台就继续生成，否则进入扫描
         if self.pending_dict.borrow().is_empty() {
@@ -1351,15 +1446,14 @@ impl Inner {
 
     /// 按具体平台配置计算指纹（多平台各自独立断点）。
     fn fingerprint_for(&self, cfg: &PlatformConfig) -> String {
-        let scan = self.collect_scan_config();
         fingerprint(&[
             &cfg.name,
             &cfg.base_url,
             &cfg.endpoint,
             &cfg.model,
             &cfg.pattern,
-            &scan.max_candidates.to_string(),
-            &scan.unbounded_repeat.to_string(),
+            &cfg.scan.max_candidates.to_string(),
+            &cfg.scan.unbounded_repeat.to_string(),
         ])
     }
 
@@ -1457,8 +1551,6 @@ impl Inner {
             for name in &need {
                 self.set_task_status(name, "待生成字典");
             }
-            // 展开配置卡，生成进度可见
-            self.config_expander.set_expanded(true);
             self.gen_next_dict();
             return;
         }
@@ -1470,7 +1562,7 @@ impl Inner {
         if self.running.get() {
             return;
         }
-        let scan = self.collect_scan_config();
+        // 注意：扫描参数按平台各自记忆（p.scan），不在此处取全局
         let enabled = self.enabled_platforms();
         if enabled.is_empty() {
             self.start_btn.set_sensitive(true);
@@ -1494,9 +1586,9 @@ impl Inner {
             };
             let fp = self.fingerprint_for(p);
 
-            // 断点续跑（每个平台独立断点文件）
+            // 断点续跑（每个平台独立断点文件、独立开关）
             let mut start_index = 0usize;
-            if scan.resume {
+            if p.scan.resume {
                 if let Some(cp) = load_checkpoint(&p.name) {
                     if cp.fingerprint == fp {
                         if cp.cursor >= keys.len() {
@@ -1527,7 +1619,7 @@ impl Inner {
                 endpoint: p.endpoint.clone(),
                 model: p.model.clone(),
                 headers: p.headers.clone(),
-                timeout: Duration::from_secs(scan.timeout_secs.max(1)),
+                timeout: Duration::from_secs(p.scan.timeout_secs.max(1)),
             };
             let params = ScanParams {
                 platform: p.name.clone(),
@@ -1535,11 +1627,11 @@ impl Inner {
                 target,
                 keys: Arc::clone(&keys),
                 start_index,
-                concurrency: scan.concurrency.max(1),
-                rate_per_sec: scan.rate_per_sec,
-                retries: scan.retries,
-                persist_valid: scan.persist_valid,
-                write_checkpoint: scan.resume,
+                concurrency: p.scan.concurrency.max(1),
+                rate_per_sec: p.scan.rate_per_sec,
+                retries: p.scan.retries,
+                persist_valid: p.scan.persist_valid,
+                write_checkpoint: p.scan.resume,
             };
             let (tx, rx) = mpsc::channel();
             let control = scan_util::start(params, tx);
@@ -1579,14 +1671,16 @@ impl Inner {
 
         let total_runs = self.runs.borrow().len();
         for run in self.runs.borrow().iter() {
+            let p = self.platforms.borrow().iter().find(|p| p.name == run.name).cloned();
+            let Some(cfg) = p else { continue };
             self.log(&format!(
                 "开始扫描「{}」：字典 {} 条，从第 {} 条开始，并发 {}，限速 {} 次/秒",
                 run.name,
                 format_count(run.total as u128),
                 format_count((run.start_index + 1) as u128),
-                scan.concurrency.max(1),
-                if scan.rate_per_sec > 0.0 {
-                    scan.rate_per_sec.to_string()
+                cfg.scan.concurrency.max(1),
+                if cfg.scan.rate_per_sec > 0.0 {
+                    cfg.scan.rate_per_sec.to_string()
                 } else {
                     "不限".to_string()
                 }
@@ -1614,7 +1708,14 @@ impl Inner {
     }
 
     fn stop(&self) {
+        // 场景一：还在字典生成阶段（扫描未开始）→ 取消剩余生成
         if !self.running.get() {
+            if !self.pending_dict.borrow().is_empty() {
+                self.gen_cancelled.set(true);
+                self.pending_dict.borrow_mut().clear();
+                self.start_btn.set_sensitive(true);
+                self.log("已取消字典生成，尚未开始扫描");
+            }
             return;
         }
         if self.paused.get() {
@@ -1624,10 +1725,24 @@ impl Inner {
                 run.control.set_paused(false);
             }
         }
+        // 先置停止信号（引擎收尾因此不再写断点），再清断点 → 不会被写回
         for run in self.runs.borrow().iter() {
             run.control.stop();
         }
-        self.log("正在停止全部扫描…（等待在途请求结束）");
+        let names: Vec<String> = self.runs.borrow().iter().map(|r| r.name.clone()).collect();
+        for name in &names {
+            store::clear_checkpoint(name);
+        }
+        for name in &names {
+            self.set_task_status(name, "已停止");
+        }
+        // 立即完成界面收尾，不等待引擎的 Finished（在途请求最长可能拖满超时）
+        self.reset_controls_after_scan();
+        self.refresh_resume_hint();
+        self.log(&format!(
+            "已停止全部扫描（{} 个平台）：断点、字典缓存已清除，进度已复位",
+            names.len()
+        ));
     }
 
     /// 更新任务列表里某平台行的状态文字。
@@ -1772,16 +1887,17 @@ impl Inner {
                         tested,
                         valid,
                     } => {
+                        // 扫描结束即清断点：无论「跑完」还是「停止」都代表放弃本轮的
+                        // 中间进度（停止 = 放弃，下次从头开始）。只有「暂停」（不触发
+                        // Finished）或中途退出应用时才保留断点，供「断点续跑」使用。
+                        store::clear_checkpoint(&run.name);
                         self.log(&format!(
-                            "「{}」扫描{}：本次测 {} 条，命中 {} 条",
+                            "「{}」扫描{}：本次测 {} 条，命中 {} 条（断点已清除）",
                             run.name,
                             reason.label(),
                             format_count(tested as u128),
                             valid
                         ));
-                        if reason == StopReason::Completed {
-                            store::clear_checkpoint(&run.name);
-                        }
                         finished_ids.push(i);
                         finished_notes.push(if reason == StopReason::Completed {
                             format!("{} 已完成，命中 {valid} 条", run.name)
@@ -1841,13 +1957,28 @@ impl Inner {
     }
 
     fn finish_run(&self) {
+        // 自然跑完或全部收到停止事件后的统一界面收尾
+        self.reset_controls_after_scan();
+        self.refresh_resume_hint();
+    }
+
+    /// stop / finish_run 共用的界面复位：任务与按钮状态、进度条、统计标签。
+    /// 一轮扫描结束（无论「自然跑完」还是「主动停止」）都会清除每平台的内存
+    /// 字典缓存，下次「开始扫描」时按当前配置重新生成；暂停不触发此函数，
+    /// 缓存保留，供继续扫描使用。
+    fn reset_controls_after_scan(&self) {
         self.running.set(false);
         self.paused.set(false);
         self.runs.borrow_mut().clear();
+        // 一轮结束即清字典缓存（正在扫描的任务持有 Arc 克隆，不受影响）
+        self.dicts.borrow_mut().clear();
         self.start_btn.set_sensitive(true);
         self.pause_btn.set_sensitive(false);
         self.pause_btn.set_label("暂停");
         self.stop_btn.set_sensitive(false);
+        self.progress.set_fraction(0.0);
+        self.progress.set_text(Some("0 / 0"));
+        self.stat_label.set_text("就绪");
     }
 
     /// 汇总所有平台的进度。

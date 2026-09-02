@@ -258,6 +258,48 @@ pub fn clear_valid() -> Result<(), String> {
     })
 }
 
+/// 平台改名：把本地库（`valid_keys` 表）里该平台的全部记录迁移到新平台名。
+/// 若新平台名下已存在同一个 key，则保留新名下的原记录（`INSERT OR IGNORE`
+/// 按 `UNIQUE(platform, key)` 跳过冲突），随后清理旧平台名的记录。事务保证原子。
+pub fn rename_platform(old: &str, new: &str) -> Result<(), String> {
+    if old == new {
+        return Ok(());
+    }
+    super::runtime().block_on(async {
+        let mut tx = pool().begin().await.map_err(|e| format!("开启事务失败：{e}"))?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO valid_keys
+                (platform, base_url, endpoint, model, key, status, latency_ms, found_at, snippet)
+             SELECT ?, base_url, endpoint, model, key, status, latency_ms, found_at, snippet
+             FROM valid_keys WHERE platform = ?",
+        )
+        .bind(new)
+        .bind(old)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("迁移命中记录失败：{e}"))?;
+        sqlx::query("DELETE FROM valid_keys WHERE platform = ?")
+            .bind(old)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("清理旧平台名记录失败：{e}"))?;
+        tx.commit().await.map_err(|e| format!("提交事务失败：{e}"))?;
+        Ok(())
+    })
+}
+
+/// 断点文件随平台名迁移（旧文件存在且新文件不存在时移动；同名不操作）。
+pub fn rename_checkpoint(old: &str, new: &str) {
+    if old == new {
+        return;
+    }
+    let from = checkpoint_path(old);
+    let to = checkpoint_path(new);
+    if from.exists() && !to.exists() {
+        let _ = std::fs::rename(&from, &to);
+    }
+}
+
 /// 导出命中记录。
 ///
 /// - `csv` = true → CSV（含 BOM，Excel 直接打开不乱码）
@@ -360,6 +402,25 @@ mod tests {
     }
 
     #[test]
+    fn platform_json_without_scan_falls_back_to_defaults() {
+        // 老版本配置文件里的平台没有内嵌 scan 字段，serde 应回落默认扫描参数
+        let text = r#"{
+            "name": "旧平台",
+            "base_url": "https://x.example/v1",
+            "endpoint": "/chat/completions",
+            "model": "m",
+            "pattern": "^sk-[0-9]{4}$",
+            "headers": [],
+            "note": ""
+        }"#;
+        let p: PlatformConfig = serde_json::from_str(text).expect("旧格式应可解析");
+        assert_eq!(p.scan.max_candidates, 100_000);
+        assert_eq!(p.scan.concurrency, 4);
+        assert!(p.scan.resume);
+        assert!(p.scan.persist_valid);
+    }
+
+    #[test]
     fn valid_record_serializes_to_one_line() {
         let line = serde_json::to_string(&sample(7)).unwrap();
         assert!(!line.contains('\n'));
@@ -407,6 +468,31 @@ mod tests {
         let all = load_valid();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].key, r2.key);
+
+        // 平台改名：本地库记录应随行迁移到新平台名（级联改名）
+        let new_name = format!("{} 改名后", r2.platform);
+        rename_platform(&r2.platform, &new_name).unwrap();
+        let all = load_valid();
+        assert_eq!(all.len(), 1, "改名不增删记录");
+        assert_eq!(all[0].platform, new_name);
+        assert_eq!(all[0].key, r2.key);
+        rename_platform(&r2.platform, &new_name).unwrap(); // 同平台名幂等，不报错
+
+        // 断点文件也应随平台名迁移
+        let cp = Checkpoint {
+            platform: r2.platform.clone(),
+            fingerprint: "fp".into(),
+            total: 100,
+            cursor: 3,
+            tested: 3,
+            valid: 1,
+            updated_at: 1,
+        };
+        save_checkpoint(&cp).unwrap();
+        rename_checkpoint(&r2.platform, &new_name);
+        assert!(load_checkpoint(&r2.platform).is_none(), "旧平台名的断点应被迁走");
+        let moved = load_checkpoint(&new_name).expect("断点应随平台名迁移");
+        assert_eq!(moved.fingerprint, "fp");
 
         clear_valid().unwrap();
         assert!(load_valid().is_empty());

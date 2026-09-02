@@ -26,8 +26,9 @@
 /// 生成参数。
 #[derive(Debug, Clone, Copy)]
 pub struct GenerateOptions {
-    /// 结果条数上限（>= 1）。
-    pub max_results: usize,
+    /// 结果条数上限（>= 1，u128 无硬性上限；实际生成量受运存与
+    /// 平台 `usize` 位宽约束，超出部分按平台上限饱和）。
+    pub max_results: u128,
     /// 无界量词（`*`、`+`、`{n,}`）的展开上限（>= 1）。
     pub unbounded_repeat: usize,
     /// 是否从整个密钥空间随机采样（true = 每一位独立均匀取值，天然乱序、
@@ -631,6 +632,68 @@ pub struct Dictionary {
     pub dropped: usize,
 }
 
+/// 当前可用物理内存（Linux `/proc/meminfo` 的 MemAvailable）。
+/// 读不到（非 Linux / 特殊环境）时返回 None，此时不做内存闸门、直接放行。
+pub fn available_memory_bytes() -> Option<u128> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some((kb as u128).saturating_mul(1024));
+        }
+    }
+    None
+}
+
+/// 按当前可用运存推荐的最大生成条数：可用内存 ÷ 每条 Key 的字节上界。
+/// `None` = 读不到可用内存信息，或当前正则无法解析（此时无法预估）。
+pub fn recommended_max_keys(pattern: &str, unbounded: usize) -> Option<u128> {
+    let avail = available_memory_bytes()?;
+    let node = parse(pattern, unbounded).ok()?;
+    let per_key = estimate_key_bytes_upper(&node);
+    Some(avail / per_key)
+}
+
+/// 估算单条候选 Key 的最大字节数（AST 上界，含 String 结构体与分配器开销）。
+fn estimate_key_bytes_upper(node: &Node) -> u128 {
+    fn bound(n: &Node) -> u128 {
+        match n {
+            Node::Literal(s) => s.len() as u128,
+            Node::Set(_) => 1,
+            Node::Alternate(branches) => branches.iter().map(bound).max().unwrap_or(1),
+            Node::Concat(parts) => parts.iter().map(bound).fold(0u128, |a, b| a.saturating_add(b)),
+            Node::Repeat(inner, _, max) => bound(inner).saturating_mul(*max as u128),
+        }
+    }
+    // 字符串内容上界 + String 结构体（24B）+ 分配器对齐/头开销（约 40B）
+    bound(node).saturating_add(64)
+}
+
+fn fmt_gb(bytes: u128) -> String {
+    format!("{:.1}", bytes as f64 / 1_000_000_000.0)
+}
+
+/// 内存闸门（取代固定「500 万上限」）：没有固定条数限制，宿主机能装多少
+/// 就生成多少；仅在估算需求明显超出**当前可用运存**时拒绝。
+/// 这是防闪退的最后一道防线——Rust 在分配失败时直接 abort，无法捕获。
+fn check_memory(node: &Node, keys: u128) -> Result<(), String> {
+    let Some(avail) = available_memory_bytes() else {
+        return Ok(()); // 读不到可用内存信息 → 放行（由系统自行承担）
+    };
+    let per_key = estimate_key_bytes_upper(node);
+    let need = per_key.saturating_mul(keys);
+    if need > avail {
+        return Err(format!(
+            "预估需要 {} GB 运存（{} 条 × 每条约 {} 字节），当前可用约 {} GB；请调小「最大生成条数」",
+            fmt_gb(need),
+            format_count(keys),
+            per_key,
+            fmt_gb(avail)
+        ));
+    }
+    Ok(())
+}
+
 /// 解析 + 生成：把正则展开成候选 Key 字典。
 ///
 /// - `random_sample = false`：按枚举顺序取前 `max_results` 条（兼容旧语义）；
@@ -639,9 +702,12 @@ pub struct Dictionary {
 ///   「高位全是 0」这类偏斜）；采样多线程并行（线程数只由 `max_results` 决定，
 ///   与机器无关，跨会话可复现）。空间 ≤ 上限时改为完整枚举 + 种子洗牌，一个不漏。
 ///
+/// 条数没有固定上限：生成前按当前可用运存估算，装得下就生成，装不下则报错。
 /// 采样/洗牌共用 `seed`，同配置每次生成内容与顺序一致，断点续跑游标仍然有效。
 pub fn generate(pattern: &str, opts: &GenerateOptions) -> Result<Dictionary, String> {
-    let limit = opts.max_results.max(1);
+    let limit_u128 = opts.max_results.max(1);
+    // 内存侧实际可用条数：先受平台 usize 位宽约束（u128 输入向下饱和）
+    let limit = usize::try_from(limit_u128).unwrap_or(usize::MAX);
     let node = parse(pattern, opts.unbounded_repeat)?;
     let total_space = count(&node);
     let total_usize = usize::try_from(total_space).unwrap_or(usize::MAX);
@@ -649,11 +715,13 @@ pub fn generate(pattern: &str, opts: &GenerateOptions) -> Result<Dictionary, Str
     let mut keys = Vec::new();
     let mut dropped = 0usize;
 
-    if opts.random_sample && total_usize > limit {
+    if opts.random_sample && total_space > limit_u128 {
         // 空间比上限大：多线程并行采样，保证分布足够分散
+        check_memory(&node, limit_u128)?;
         keys = sample_dict(&node, limit, opts.seed, total_usize);
     } else if opts.random_sample {
         // 空间 ≤ 上限：完整枚举 + 种子洗牌，一个不漏
+        check_memory(&node, total_space)?;
         let mut raw = Vec::new();
         enumerate_into(&node, total_usize, &mut raw);
         for k in raw {
@@ -687,7 +755,7 @@ pub fn generate(pattern: &str, opts: &GenerateOptions) -> Result<Dictionary, Str
             }
         }
     }
-    let truncated = keys.len() >= limit && total_space > keys.len() as u128;
+    let truncated = keys.len() as u128 >= limit_u128 && total_space > keys.len() as u128;
 
     Ok(Dictionary {
         keys,
@@ -949,6 +1017,50 @@ mod tests {
         // 与标准正则语义一致
         let v = gen_keys(r"sk-a{2}");
         assert_eq!(v, vec!["sk-aa".to_string()]);
+    }
+
+    #[test]
+    fn recommended_max_keys_tracks_available_memory() {
+        // 32 位 hex：单条上界 = 3 字面前缀 + 32 + 64 开销 = 99 字节
+        let keys = recommended_max_keys(r"sk-[a-f0-9]{32}", 3).unwrap();
+        let avail = available_memory_bytes().unwrap();
+        assert_eq!(keys, avail / 99, "推荐条数 = 可用运存 ÷ 单条字节上界");
+        // 非法正则 → 无法预估（None）
+        assert!(recommended_max_keys(r"sk-[a-f0-9]{32}((", 3).is_none());
+        // 合法但空间巨大 → 推荐条数与正则长度线性相关
+        let long = recommended_max_keys(r"sk-[A-Za-z0-9]{64}", 3).unwrap();
+        assert!(long < keys);
+    }
+
+    #[test]
+    fn huge_max_results_refused_instead_of_oom() {
+        // 复现崩溃场景：150 万亿的「最大生成条数」曾导致一次性申请
+        // 1.5e14 字节内存并把进程 OOM 中止；现在应在分配前按可用运存报错。
+        let opts = GenerateOptions {
+            max_results: 150_000_000_000_000,
+            random_sample: true,
+            seed: 1,
+            ..GenerateOptions::default()
+        };
+        let err = generate(r"sk-[a-f0-9]{32}", &opts).unwrap_err();
+        assert!(err.contains("运存"), "应提示内存不足：{err}");
+
+        // 全量枚举路径（12 位数字空间 ≈ 1 万亿条，任何机器都装不下）同样在分配前被拦下
+        let err2 = generate(r"sk-[0-9]{12}", &opts).unwrap_err();
+        assert!(err2.contains("运存"), "枚举路径也应提示：{err2}");
+
+        // 正常量级不受影响（不因加了闸门而误伤）
+        let ok = generate(
+            r"sk-[a-f0-9]{32}",
+            &GenerateOptions {
+                max_results: 100_000,
+                random_sample: true,
+                seed: 1,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ok.keys.len(), 100_000);
     }
 
     #[test]
