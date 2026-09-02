@@ -30,6 +30,12 @@ pub struct GenerateOptions {
     pub max_results: usize,
     /// 无界量词（`*`、`+`、`{n,}`）的展开上限（>= 1）。
     pub unbounded_repeat: usize,
+    /// 是否从整个密钥空间随机采样（true = 每一位独立均匀取值，天然乱序、
+    /// 高位不再全是小数字；false = 按枚举顺序取前 `max_results` 条）。
+    pub random_sample: bool,
+    /// 采样/洗牌种子。同一配置 + 种子每次生成内容与顺序完全一致，
+    /// 保证「断点续跑」的游标在下次启动重生成字典后仍然有效。
+    pub seed: u64,
 }
 
 impl Default for GenerateOptions {
@@ -37,8 +43,26 @@ impl Default for GenerateOptions {
         GenerateOptions {
             max_results: 100_000,
             unbounded_repeat: 3,
+            random_sample: false,
+            seed: 0,
         }
     }
+}
+
+/// 由若干配置片段计算采样种子（FNV-1a 64 位），保证相同的
+/// 平台正则 + 生成参数在多次运行间产生完全相同的采样结果。
+pub fn sample_seed_for(parts: &[&str]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for b in part.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        // 段分隔，避免 "a"+"bc" 与 "ab"+"c" 碰撞
+        hash ^= 0x1f;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
 }
 
 /// 量词 `{n,m}` 中 m 的绝对上限，防止用户手滑写出 `{999999999}`。
@@ -607,29 +631,60 @@ pub struct Dictionary {
     pub dropped: usize,
 }
 
-/// 解析 + 枚举：把正则展开成候选 Key 字典。
+/// 解析 + 生成：把正则展开成候选 Key 字典。
+///
+/// - `random_sample = false`：按枚举顺序取前 `max_results` 条（兼容旧语义）；
+/// - `random_sample = true`：对**任意**正则都从整个密钥空间逐位独立均匀采样
+///   （每一位、每一位置的字符独立均匀 → 天然乱序、天然去重，不存在
+///   「高位全是 0」这类偏斜）；采样多线程并行（线程数只由 `max_results` 决定，
+///   与机器无关，跨会话可复现）。空间 ≤ 上限时改为完整枚举 + 种子洗牌，一个不漏。
+///
+/// 采样/洗牌共用 `seed`，同配置每次生成内容与顺序一致，断点续跑游标仍然有效。
 pub fn generate(pattern: &str, opts: &GenerateOptions) -> Result<Dictionary, String> {
     let limit = opts.max_results.max(1);
     let node = parse(pattern, opts.unbounded_repeat)?;
     let total_space = count(&node);
+    let total_usize = usize::try_from(total_space).unwrap_or(usize::MAX);
 
-    let mut raw = Vec::new();
-    enumerate_into(&node, limit.saturating_mul(2), &mut raw);
-
-    // 去重（保序），并剔除含控制字符的候选（无法作为 HTTP 头的值）
-    let mut seen = std::collections::HashSet::new();
-    let mut keys = Vec::with_capacity(raw.len().min(limit));
+    let mut keys = Vec::new();
     let mut dropped = 0usize;
-    for k in raw {
-        if keys.len() >= limit {
-            break;
-        }
-        if k.chars().any(|c| c.is_control()) {
-            dropped += 1;
-            continue;
-        }
-        if seen.insert(k.clone()) {
+
+    if opts.random_sample && total_usize > limit {
+        // 空间比上限大：多线程并行采样，保证分布足够分散
+        keys = sample_dict(&node, limit, opts.seed, total_usize);
+    } else if opts.random_sample {
+        // 空间 ≤ 上限：完整枚举 + 种子洗牌，一个不漏
+        let mut raw = Vec::new();
+        enumerate_into(&node, total_usize, &mut raw);
+        for k in raw {
+            if k.chars().any(|c| c.is_control()) {
+                dropped += 1;
+                continue;
+            }
             keys.push(k);
+        }
+        if keys.len() > 1 {
+            use rand::rngs::StdRng;
+            use rand::seq::SliceRandom;
+            use rand::SeedableRng;
+            keys.shuffle(&mut StdRng::seed_from_u64(opts.seed));
+        }
+    } else {
+        // 顺序模式：按旧语义枚举 limit*2 条再截断去重
+        let mut raw = Vec::new();
+        enumerate_into(&node, limit.saturating_mul(2), &mut raw);
+        let mut seen = std::collections::HashSet::new();
+        for k in raw {
+            if keys.len() >= limit {
+                break;
+            }
+            if k.chars().any(|c| c.is_control()) {
+                dropped += 1;
+                continue;
+            }
+            if seen.insert(k.clone()) {
+                keys.push(k);
+            }
         }
     }
     let truncated = keys.len() >= limit && total_space > keys.len() as u128;
@@ -640,6 +695,127 @@ pub fn generate(pattern: &str, opts: &GenerateOptions) -> Result<Dictionary, Str
         truncated,
         dropped,
     })
+}
+
+/// 按 AST 结构逐位随机选取一个字符串：字符类里每个字符独立均匀，
+/// 所以长密钥的每一位（含最高位）都均匀分布，而不是枚举顺序导致的
+/// 「高位全是 0」。返回 false 表示该分支无法产出字符串（正常 AST 不会发生）。
+fn sample_one(node: &Node, rng: &mut rand::rngs::StdRng, out: &mut String) -> bool {
+    use rand::Rng;
+    match node {
+        Node::Literal(s) => {
+            out.push_str(s);
+            true
+        }
+        Node::Set(chars) => {
+            let i = rng.gen_range(0..chars.len());
+            out.push(chars[i]);
+            true
+        }
+        Node::Alternate(branches) => {
+            let b = rng.gen_range(0..branches.len());
+            sample_one(&branches[b], rng, out)
+        }
+        Node::Concat(parts) => {
+            for p in parts {
+                if !sample_one(p, rng, out) {
+                    return false;
+                }
+            }
+            true
+        }
+        Node::Repeat(inner, min, max) => {
+            let k = rng.gen_range(*min..=*max);
+            for _ in 0..k {
+                if !sample_one(inner, rng, out) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
+/// 单个随机流采样：固定尝试预算，重复只消耗预算不占容量。
+fn sample_chunk(node: &Node, want: usize, seed: u64, budget: usize, out: &mut Vec<String>) {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut attempts = 0usize;
+    while out.len() < want && attempts < budget {
+        attempts += 1;
+        let mut s = String::with_capacity(128);
+        if sample_one(node, &mut rng, &mut s) && !s.chars().any(|c| c.is_control()) {
+            out.push(s);
+        }
+    }
+}
+
+/// 多线程并行采样：线程数只由 `want` 决定（每 ~4096 条一个，最多 16），
+/// 与机器核数无关 → 同一种子在任何机器上都产生一致结果（断点续跑依赖）。
+/// 各线程用独立的确定性随机流；合并后用「排序去重」而非全局 HashSet 去重，
+/// 内存占用 ≈ 最终字典本身（无重复副本）；不足部分用新种子流补采；
+/// 最后再用种子洗牌恢复乱序（排序把顺序破坏了，必须洗回来）。
+fn sample_dict(node: &Node, want: usize, seed: u64, total_usize: usize) -> Vec<String> {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    let threads = want.div_ceil(4096).clamp(1, 16);
+    let budget = want.saturating_mul(8).max(4096);
+
+    let mut parts: Vec<Vec<String>> = Vec::with_capacity(threads);
+    if threads == 1 {
+        let mut v = Vec::with_capacity(want.min(total_usize));
+        sample_chunk(node, want, seed, budget, &mut v);
+        parts.push(v);
+    } else {
+        let chunk_want = want.div_ceil(threads);
+        let chunk_budget = budget.div_ceil(threads);
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(threads);
+            for i in 0..threads {
+                let seed_i = seed
+                    .wrapping_add(i as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                handles.push(s.spawn(move || {
+                    let mut v = Vec::with_capacity(chunk_want);
+                    sample_chunk(node, chunk_want, seed_i, chunk_budget, &mut v);
+                    v
+                }));
+            }
+            for h in handles {
+                parts.push(h.join().expect("字典生成线程崩溃"));
+            }
+        });
+    }
+
+    // 合并 + 排序去重（O(n log n)，比全局 HashSet 省内存）
+    let mut keys: Vec<String> = parts.into_iter().flatten().collect();
+    keys.sort_unstable();
+    keys.dedup();
+
+    // 空间略大于上限时可能差几个：用新种子流补采，直到凑够或空间耗尽
+    if keys.len() < want && keys.len() < total_usize {
+        let mut seen: std::collections::HashSet<String> = keys.iter().cloned().collect();
+        let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0xD1B5_4A32_D192_ED03));
+        let mut attempts = 0usize;
+        while keys.len() < want && keys.len() < total_usize && attempts < budget {
+            attempts += 1;
+            let mut s = String::with_capacity(128);
+            if sample_one(node, &mut rng, &mut s)
+                && !s.chars().any(|c| c.is_control())
+                && seen.insert(s.clone())
+            {
+                keys.push(s);
+            }
+        }
+    }
+
+    // 排序破坏了随机顺序，用种子洗牌恢复（跨会话可复现）
+    if keys.len() > 1 {
+        use rand::seq::SliceRandom;
+        keys.shuffle(&mut StdRng::seed_from_u64(seed));
+    }
+    keys
 }
 
 /// 只估算密钥空间大小，不做枚举（用于给「该模式有多大」的快速反馈）。
@@ -759,6 +935,7 @@ mod tests {
             &GenerateOptions {
                 max_results: 1000,
                 unbounded_repeat: 3,
+                ..GenerateOptions::default()
             },
         )
         .unwrap();
@@ -781,6 +958,7 @@ mod tests {
             &GenerateOptions {
                 max_results: 50,
                 unbounded_repeat: 1,
+                ..GenerateOptions::default()
             },
         )
         .unwrap();
@@ -822,5 +1000,171 @@ mod tests {
     #[test]
     fn braces_without_quantifier_is_literal() {
         assert_eq!(gen_keys(r"a{b}"), vec!["a{b}".to_string()]);
+    }
+
+    #[test]
+    fn shuffled_is_a_permutation_and_seed_stable() {
+        // 小空间（10_000 ≤ 上限×4）：完整枚举 + 种子洗牌，元素是原集的一个排列
+        let base = generate(
+            r"sk-[0-9]{4}",
+            &GenerateOptions {
+                max_results: 10_000,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let shuffled = |seed: u64| {
+            generate(
+                r"sk-[0-9]{4}",
+                &GenerateOptions {
+                    max_results: 10_000,
+                    random_sample: true,
+                    seed,
+                    ..GenerateOptions::default()
+                },
+            )
+            .unwrap()
+        };
+        let a = shuffled(42);
+        let b = shuffled(42);
+        let c = shuffled(7);
+        // 同一种子 → 完全相同的乱序
+        assert_eq!(a.keys, b.keys);
+        // 不同种子 → 顺序不同（空间足够大，几乎必然不同）
+        assert_ne!(a.keys, c.keys);
+        // 乱序是原集合的一个排列（元素完全相同）
+        let mut s1 = a.keys.clone();
+        let mut s2 = base.keys.clone();
+        s1.sort();
+        s2.sort();
+        assert_eq!(s1, s2);
+        // 无重复
+        let uniq: std::collections::HashSet<&String> = a.keys.iter().collect();
+        assert_eq!(uniq.len(), a.keys.len());
+    }
+
+    #[test]
+    fn random_sample_is_uniform_across_high_digits() {
+        // 大空间（16^32）：按位独立均匀采样 → 最高位不能再全是 0
+        let dict = generate(
+            r"sk-[a-f0-9]{32}",
+            &GenerateOptions {
+                max_results: 4000,
+                random_sample: true,
+                seed: 42,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(dict.keys.len(), 4000);
+        for k in &dict.keys {
+            assert_eq!(k.len(), 35);
+            assert!(k.starts_with("sk-"));
+            assert!(k[3..]
+                .chars()
+                .all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+        }
+        // 最高位在 4000 个样本里应几乎必然覆盖全部 16 个字符；宽松断言 ≥ 8 个
+        let first: std::collections::HashSet<char> = dict
+            .keys
+            .iter()
+            .filter_map(|k| k.chars().nth(3))
+            .collect();
+        assert!(first.len() >= 8, "高位分布应均匀，实际仅有 {first:?}");
+        // 同一种子 → 完全相同（断点续跑依赖这个）
+        let again = generate(
+            r"sk-[a-f0-9]{32}",
+            &GenerateOptions {
+                max_results: 4000,
+                random_sample: true,
+                seed: 42,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(dict.keys, again.keys);
+        // 不同种子 → 内容不同（几乎必然）
+        let other = generate(
+            r"sk-[a-f0-9]{32}",
+            &GenerateOptions {
+                max_results: 4000,
+                random_sample: true,
+                seed: 7,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(dict.keys, other.keys);
+    }
+
+    #[test]
+    fn parallel_sample_mid_space_is_dispersed_and_deterministic() {
+        // 中空间（1,000,000 > 上限 100,000）：走多线程并行采样路径（16 线程）
+        let dict = generate(
+            r"sk-[0-9]{6}",
+            &GenerateOptions {
+                max_results: 100_000,
+                random_sample: true,
+                seed: 2026,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(dict.keys.len(), 100_000);
+        // 无重复（排序去重 + 补采保证）
+        let uniq: std::collections::HashSet<&String> = dict.keys.iter().collect();
+        assert_eq!(uniq.len(), dict.keys.len());
+        // 第一位（十万位上的数字）不应只出现 0-5 这类前缀 —— 应覆盖全部 10 个数字
+        let first: std::collections::HashSet<char> = dict
+            .keys
+            .iter()
+            .filter_map(|k| k.chars().nth(3))
+            .collect();
+        assert_eq!(first.len(), 10, "十万位分布应覆盖全部数字，实际 {first:?}");
+        // 同一种子 → 完全相同（多线程结果也必须可复现）
+        let again = generate(
+            r"sk-[0-9]{6}",
+            &GenerateOptions {
+                max_results: 100_000,
+                random_sample: true,
+                seed: 2026,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(dict.keys, again.keys);
+    }
+
+    #[test]
+    fn small_space_within_limit_is_complete() {
+        // 空间（1000）≤ 上限（100,000）：完整枚举 + 种子洗牌，一个不漏且乱序
+        let base = generate(
+            r"sk-[0-9]{3}",
+            &GenerateOptions {
+                max_results: 100_000,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let shuf = generate(
+            r"sk-[0-9]{3}",
+            &GenerateOptions {
+                max_results: 100_000,
+                random_sample: true,
+                seed: 9,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(base.keys.len(), 1000);
+        assert_eq!(shuf.keys.len(), 1000);
+        assert!(!shuf.truncated);
+        // 内容完全一致（完整覆盖），只是顺序不同
+        let mut a = base.keys.clone();
+        let mut b = shuf.keys.clone();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+        assert_ne!(base.keys, shuf.keys);
     }
 }

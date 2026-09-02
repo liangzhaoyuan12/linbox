@@ -4,8 +4,9 @@
 //! - 自定义平台（平台名 / Base URL / 端点 / 模型 / Key 正则 / 附加请求头），持久化到本地。
 //! - 由正则批量枚举出候选 Key 字典（逻辑在 `utils::sniffer::generate`）。
 //! - 以 OpenAI 格式逐个探测，按 HTTP 状态码判定：2xx 有效 / 429 限流 / 401·403 鉴权失败 / …
-//! - 有效 Key 写入本地 JSONL 库永久保存，可复制、删除、导出 JSON / CSV。
-//! - 并发 + 限速 + 暂停 / 继续 / 停止 + 断点续跑。
+//! - 有效 Key 写入本地 SQLite 库永久保存（sqlx），可复制、删除、导出 JSON / CSV。
+//! - tokio 异步引擎：并发 + 限速 + 暂停 / 继续 / 停止 + 断点续跑；
+//!   「开始扫描」时自动按平台配置生成字典（乱序、去重）。
 //! - 「单次测试」区域：手填 Base URL 与 API Key，直接看返回的状态码与响应体。
 //!
 //! 页面不做任何计算与 IO，全部委托给 `crate::utils::sniffer`。
@@ -22,8 +23,8 @@ use std::time::{Duration, Instant};
 use adw::prelude::*;
 
 use crate::model::sniffer::{
-    fingerprint, builtin_platforms, PlatformConfig, ScanConfig, ValidKeyRecord, Verdict,
-    DEFAULT_ENDPOINT, PATTERN_TEMPLATES, CUSTOM_TEMPLATE_INDEX,
+    fingerprint, PlatformConfig, ScanConfig, ValidKeyRecord, Verdict, DEFAULT_ENDPOINT,
+    PATTERN_TEMPLATES, CUSTOM_TEMPLATE_INDEX,
 };
 use crate::utils::sniffer::{
     format_count, generate, load_checkpoint, parse_header_lines, GenerateOptions, ProbeTarget,
@@ -70,6 +71,41 @@ struct Counters {
     network: usize,
 }
 
+impl Counters {
+    fn add(&mut self, o: &Counters) {
+        self.tested += o.tested;
+        self.valid += o.valid;
+        self.unauthorized += o.unauthorized;
+        self.limited += o.limited;
+        self.server += o.server;
+        self.client += o.client;
+        self.notfound += o.notfound;
+        self.network += o.network;
+    }
+}
+
+/// 平台任务列表中的一行（勾选 = 参与本次嗅探）。
+#[derive(Clone)]
+struct TaskRow {
+    name: String,
+    check: gtk::CheckButton,
+    status: gtk::Label,
+}
+
+/// 一个平台的运行状态（每平台一个独立扫描实例）。
+struct RunState {
+    name: String,
+    base_url: String,
+    endpoint: String,
+    model: String,
+    receiver: mpsc::Receiver<ScanEvent>,
+    control: scan_util::Control,
+    total: usize,
+    start_index: usize,
+    counters: Counters,
+    finished: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Inner
 // ---------------------------------------------------------------------------
@@ -79,9 +115,17 @@ struct Inner {
 
     // 平台配置
     platforms: RefCell<Vec<PlatformConfig>>,
-    /// 当前已载入的平台名（空 = 尚未保存的新平台）。
+    /// 当前已载入编辑表单的平台名（空 = 尚未保存的新平台）。
     loaded_name: RefCell<String>,
-    platform_combo: adw::ComboRow,
+    /// 平台任务列表（每行 = 勾选 + 平台 + 状态）。
+    task_list: gtk::ListBox,
+    task_rows: RefCell<Vec<TaskRow>>,
+    /// 平台列表为空时的提示 label。
+    task_empty: gtk::Label,
+    /// 平台配置卡（默认折叠；新建/编辑时展开）。
+    config_expander: adw::ExpanderRow,
+    /// 开始扫描时等待生成字典的平台队列（逐个生成）。
+    pending_dict: RefCell<Vec<String>>,
     name_row: adw::EntryRow,
     base_row: adw::EntryRow,
     endpoint_combo: adw::ComboRow,
@@ -97,7 +141,8 @@ struct Inner {
     unbounded_row: adw::SpinRow,
     dict_info: gtk::Label,
     dict_preview: gtk::TextView,
-    dict: RefCell<Option<Arc<Vec<String>>>>,
+    /// 各平台已生成的候选字典：(pattern 指纹, keys)。键 = 平台名。
+    dicts: RefCell<std::collections::HashMap<String, (String, Arc<Vec<String>>)>>,
 
     // 扫描参数
     concurrency_row: adw::SpinRow,
@@ -137,13 +182,9 @@ struct Inner {
     t_send_btn: gtk::Button,
 
     // 运行期状态
-    receiver: RefCell<Option<mpsc::Receiver<ScanEvent>>>,
-    control: RefCell<Option<scan_util::Control>>,
+    runs: RefCell<Vec<RunState>>,
     running: Cell<bool>,
     paused: Cell<bool>,
-    counters: Cell<Counters>,
-    total: Cell<usize>,
-    start_index: Cell<usize>,
     started_at: RefCell<Option<Instant>>,
 }
 
@@ -317,32 +358,74 @@ pub fn build() -> ApiKeySnifferPage {
     notice.set_margin_top(4);
     root_box.append(&notice);
 
-    // ---------- 平台配置 ----------
-    let (platform_card, pc) = card("平台配置", "平台名 / Base URL / 端点 / 模型 / Key 正则 / 附加请求头");
+    // ---------- 嗅探任务（平台列表）----------
+    let (task_card, tc) = card(
+        "嗅探任务",
+        "勾选要同时嗅探的平台；「新建」或点击「编辑」展开平台配置，点「开始扫描」对所有勾选平台并行扫描",
+    );
+    root_box.append(&task_card);
+
+    let task_list = gtk::ListBox::new();
+    task_list.add_css_class("boxed-list");
+    let task_scroll = gtk::ScrolledWindow::new();
+    task_scroll.set_child(Some(&task_list));
+    task_scroll.set_min_content_height(120);
+    task_scroll.set_max_content_height(240);
+    tc.add(&task_scroll);
+
+    let task_empty = gtk::Label::new(Some("尚未添加平台 —— 点右上角「新建」添加"));
+    task_empty.add_css_class("dim-label");
+    task_empty.set_halign(gtk::Align::Start);
+    task_empty.set_margin_top(4);
+    tc.add(&task_empty);
+
+    let select_all_btn = gtk::Button::with_label("全选");
+    let select_none_btn = gtk::Button::with_label("全不选");
+    let new_btn = gtk::Button::with_label("新建");
+
+    // 操作栏：全选 / 全不选 靠左，新建 靠右对齐
+    let list_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    list_actions.set_margin_top(6);
+    list_actions.set_margin_bottom(6);
+    list_actions.append(&select_all_btn);
+    list_actions.append(&select_none_btn);
+    let actions_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    actions_spacer.set_hexpand(true);
+    list_actions.append(&actions_spacer);
+    list_actions.append(&new_btn);
+    tc.add(&list_actions);
+
+    // ---------- 平台配置（默认折叠；新建 / 编辑时展开）----------
+    let (platform_card, pc) = card("", "");
     root_box.append(&platform_card);
 
-    let platform_combo = combo_row("已保存平台", &["（空）"], 0);
-    pc.add(&platform_combo);
+    let config_expander = adw::ExpanderRow::new();
+    config_expander.set_title("平台配置");
+    config_expander.set_subtitle(
+        "Key 正则与字典生成参数也在这里；「开始扫描」时自动按配置生成字典（乱序、去重）",
+    );
+    config_expander.set_expanded(false);
+    pc.add(&config_expander);
 
     let name_row = entry_row("平台名");
     name_row.set_text("自建网关（本地示例）");
-    pc.add(&name_row);
+    config_expander.add_row(&name_row);
 
     let base_row = entry_row("Base URL");
     base_row.set_text("http://127.0.0.1:8000/v1");
-    pc.add(&base_row);
+    config_expander.add_row(&base_row);
 
     let endpoint_combo = combo_row("探测端点", ENDPOINTS, 0);
-    pc.add(&endpoint_combo);
+    config_expander.add_row(&endpoint_combo);
 
     let endpoint_row = entry_row("自定义端点");
     endpoint_row.set_text(DEFAULT_ENDPOINT);
     endpoint_row.set_visible(false);
-    pc.add(&endpoint_row);
+    config_expander.add_row(&endpoint_row);
 
     let model_row = entry_row("模型名");
     model_row.set_text("gpt-3.5-turbo");
-    pc.add(&model_row);
+    config_expander.add_row(&model_row);
 
     let headers_view = mono_view(64, true);
     let headers_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -355,58 +438,44 @@ pub fn build() -> ApiKeySnifferPage {
     headers_scroll.set_min_content_height(64);
     headers_scroll.set_max_content_height(140);
     headers_box.append(&headers_scroll);
-    pc.add(&headers_box);
+    config_expander.add_row(&headers_box);
 
     let note_row = entry_row("备注");
-    pc.add(&note_row);
+    config_expander.add_row(&note_row);
 
-    let new_btn = gtk::Button::with_label("新建");
-    let save_btn = gtk::Button::with_label("保存");
-    save_btn.add_css_class("suggested-action");
-    let delete_btn = gtk::Button::with_label("删除");
-    delete_btn.add_css_class("destructive-action");
-    let restore_btn = gtk::Button::with_label("恢复内置预设");
-    pc.add(&button_row(&[&new_btn, &save_btn, &delete_btn, &restore_btn]));
-
-    // ---------- 字典生成 ----------
-    let (dict_card, dc) = card(
-        "Key 字典生成",
-        "由正则枚举出候选 Key；支持 [a-z]、\\d、{n,m}、(a|b) 等语法，^ $ 锚点会被忽略",
-    );
-    root_box.append(&dict_card);
-
+    // ---- 字典生成参数（并入平台配置）----
     let template_labels: Vec<&str> = PATTERN_TEMPLATES.iter().map(|(n, _)| *n).collect();
     let template_combo = combo_row("插入模板", &template_labels, 0);
-    dc.add(&template_combo);
+    config_expander.add_row(&template_combo);
 
     let pattern_row = entry_row("API Key 正则规则");
     pattern_row.set_text(r"^sk-local-[0-9]{6}$");
     pattern_row.set_sensitive(false); // 默认选中预设模板，正则不可编辑
-    dc.add(&pattern_row);
+    config_expander.add_row(&pattern_row);
 
     let max_row = spin_row("最大生成条数（密钥空间更大时截断）", 1.0, 2_000_000.0, 10_000.0, 0, 100_000.0);
-    dc.add(&max_row);
+    config_expander.add_row(&max_row);
     let unbounded_row = spin_row("* + {n,} 等无界量词展开上限", 1.0, 8.0, 1.0, 0, 3.0);
-    dc.add(&unbounded_row);
+    config_expander.add_row(&unbounded_row);
 
-    let gen_btn = gtk::Button::with_label("生成并预览");
-    gen_btn.add_css_class("suggested-action");
-    let clear_dict_btn = gtk::Button::with_label("清空字典");
-    dc.add(&button_row(&[&gen_btn, &clear_dict_btn]));
+    let save_btn = gtk::Button::with_label("保存");
+    save_btn.add_css_class("suggested-action");
+    let cancel_btn = gtk::Button::with_label("取消");
+    config_expander.add_row(&button_row(&[&save_btn, &cancel_btn]));
 
-    let dict_info = gtk::Label::new(Some("尚未生成字典"));
+    let dict_info = gtk::Label::new(Some("尚未生成字典（点「开始扫描」时自动生成）"));
     dict_info.add_css_class("dim-label");
     dict_info.set_halign(gtk::Align::Start);
     dict_info.set_wrap(true);
     dict_info.set_selectable(true);
-    dc.add(&dict_info);
+    config_expander.add_row(&dict_info);
 
     let dict_preview = mono_view(150, false);
     let dict_scroll = gtk::ScrolledWindow::new();
     dict_scroll.set_child(Some(&dict_preview));
     dict_scroll.set_min_content_height(120);
     dict_scroll.set_max_content_height(260);
-    dc.add(&dict_scroll);
+    config_expander.add_row(&dict_scroll);
 
     // ---------- 扫描参数 ----------
     let (scan_card, sc) = card("扫描参数", "并发、限速、超时、重试与断点续跑");
@@ -461,7 +530,10 @@ pub fn build() -> ApiKeySnifferPage {
     rc_.add(&resume_hint);
 
     // ---------- 有效 Key ----------
-    let (valid_card, vc) = card("有效 Key（本地库）", "2xx 判定为有效，命中即写入本地 JSONL 文件");
+    let (valid_card, vc) = card(
+        "有效 Key（本地库）",
+        "2xx 判定为有效，命中即写入本地 SQLite 数据库（自动去重）",
+    );
     root_box.append(&valid_card);
 
     let reveal_switch = switch_row("显示完整 Key（默认打码）", "", false);
@@ -550,7 +622,11 @@ pub fn build() -> ApiKeySnifferPage {
         toast_overlay: toast_overlay.clone(),
         platforms: RefCell::new(Vec::new()),
         loaded_name: RefCell::new(String::new()),
-        platform_combo: platform_combo.clone(),
+        task_list: task_list.clone(),
+        task_rows: RefCell::new(Vec::new()),
+        task_empty: task_empty.clone(),
+        config_expander: config_expander.clone(),
+        pending_dict: RefCell::new(Vec::new()),
         name_row: name_row.clone(),
         base_row: base_row.clone(),
         endpoint_combo: endpoint_combo.clone(),
@@ -564,7 +640,7 @@ pub fn build() -> ApiKeySnifferPage {
         unbounded_row: unbounded_row.clone(),
         dict_info: dict_info.clone(),
         dict_preview: dict_preview.clone(),
-        dict: RefCell::new(None),
+        dicts: RefCell::new(std::collections::HashMap::new()),
         concurrency_row: concurrency_row.clone(),
         rate_row: rate_row.clone(),
         timeout_row: timeout_row.clone(),
@@ -592,28 +668,21 @@ pub fn build() -> ApiKeySnifferPage {
         t_result_label: t_result_label.clone(),
         t_body_view: t_body_view.clone(),
         t_send_btn: t_send_btn.clone(),
-        receiver: RefCell::new(None),
-        control: RefCell::new(None),
+        runs: RefCell::new(Vec::new()),
         running: Cell::new(false),
         paused: Cell::new(false),
-        counters: Cell::new(Counters::default()),
-        total: Cell::new(0),
-        start_index: Cell::new(0),
         started_at: RefCell::new(None),
     });
 
     // ---------- 信号连接 ----------
-    platform_combo.connect_selected_notify(|_| g_on_platform_selected());
+    select_all_btn.connect_clicked(|_| g_select_all(true));
+    select_none_btn.connect_clicked(|_| g_select_all(false));
     endpoint_combo.connect_selected_notify(|_| g_on_endpoint_changed());
     template_combo.connect_selected_notify(|_| g_on_template_selected());
 
     new_btn.connect_clicked(|_| g_new_platform());
     save_btn.connect_clicked(|_| g_save_platform());
-    delete_btn.connect_clicked(|_| g_delete_platform());
-    restore_btn.connect_clicked(|_| g_restore_builtin());
-
-    gen_btn.connect_clicked(|_| g_generate());
-    clear_dict_btn.connect_clicked(|_| g_clear_dict());
+    cancel_btn.connect_clicked(|_| g_cancel_edit());
 
     start_btn.connect_clicked(|_| g_start());
     pause_btn.connect_clicked(|_| g_toggle_pause());
@@ -631,12 +700,17 @@ pub fn build() -> ApiKeySnifferPage {
     t_send_btn.connect_clicked(|_| g_test_one());
     t_fill_btn.connect_clicked(|_| g_fill_test_from_platform());
 
+    // 注册全局强引用：signal 回调要求 Send，无法直接捕获 Rc<Inner>
+    // 必须先于 rebuild_platform_list（行回调通过 self_rc() 取 Weak，INNER 未注册会 panic）
+    INNER.with(|i| *i.borrow_mut() = Some(Rc::clone(&inner)));
+
     // ---------- 初始化 ----------
     {
+        store::init_db();
         let store_data = store::load_store();
         *inner.platforms.borrow_mut() = store_data.platforms;
         inner.apply_scan_config(&store_data.scan);
-        inner.rebuild_platform_combo(Some(&store_data.last_platform));
+        inner.rebuild_platform_list(Some(&store_data.last_platform));
         if let Some(p) = inner.current_platform() {
             inner.load_platform(&p);
         }
@@ -647,9 +721,6 @@ pub fn build() -> ApiKeySnifferPage {
 
     // 主循环里排空扫描事件队列（闭包不带捕获，满足 signal 的 Send 要求）
     glib::source::timeout_add(Duration::from_millis(100), tick);
-
-    // 注册全局强引用：signal 回调要求 Send，无法直接捕获 Rc<Inner>
-    INNER.with(|i| *i.borrow_mut() = Some(Rc::clone(&inner)));
 
     ApiKeySnifferPage { root: toast_overlay }
 }
@@ -678,12 +749,20 @@ fn with_inner<F: FnOnce(&Inner)>(f: F) {
     }
 }
 
-fn g_on_platform_selected() {
+fn g_select_platform(name: String) {
     with_inner(|i| {
-        let idx = i.platform_combo.selected() as usize;
-        if let Some(p) = i.platforms.borrow().get(idx).cloned() {
+        if let Some(p) = i.platforms.borrow().iter().find(|p| p.name == name).cloned() {
             i.load_platform(&p);
             i.persist_last_platform(&p.name);
+        }
+    });
+}
+
+fn g_select_all(enable: bool) {
+    with_inner(|i| {
+        let rows = i.task_rows.borrow().clone();
+        for row in rows {
+            row.check.set_active(enable);
         }
     });
 }
@@ -718,17 +797,8 @@ fn g_new_platform() {
 fn g_save_platform() {
     with_inner(|i| i.save_platform());
 }
-fn g_delete_platform() {
-    with_inner(|i| i.delete_platform());
-}
-fn g_restore_builtin() {
-    with_inner(|i| i.restore_builtin());
-}
-fn g_generate() {
-    with_inner(|i| i.generate_async());
-}
-fn g_clear_dict() {
-    with_inner(|i| i.clear_dict());
+fn g_cancel_edit() {
+    with_inner(|i| i.cancel_edit());
 }
 fn g_start() {
     with_inner(|i| i.start());
@@ -800,8 +870,11 @@ impl Inner {
     // ---------- 平台 ----------
 
     fn current_platform(&self) -> Option<PlatformConfig> {
-        let idx = self.platform_combo.selected() as usize;
-        self.platforms.borrow().get(idx).cloned()
+        let name = self.loaded_name.borrow().clone();
+        if name.is_empty() {
+            return None;
+        }
+        self.platforms.borrow().iter().find(|p| p.name == name).cloned()
     }
 
     /// 把一份配置填进表单。
@@ -850,10 +923,25 @@ impl Inner {
                 self.endpoint_row.set_visible(true);
             }
         }
-        // 载入新平台意味着旧断点不再适用
-        self.dict.take();
-        set_buffer_text(&self.dict_preview.buffer(), "");
-        self.dict_info.set_text("切换平台后需重新生成字典");
+        // 载入平台时展示该平台已生成的字典状态（若有）
+        let dict_state = self
+            .dicts
+            .borrow()
+            .get(&p.name)
+            .map(|(pat, keys)| (pat.clone(), keys.len()));
+        match dict_state {
+            Some((pat, len)) if pat == p.pattern => {
+                self.dict_info.set_text(&format!(
+                    "该平台已生成字典：共 {} 条（乱序 · 与当前正则一致，可直接扫描）",
+                    format_count(len as u128)
+                ));
+            }
+            _ => {
+                set_buffer_text(&self.dict_preview.buffer(), "");
+                self.dict_info
+                    .set_text("尚未为当前正则生成字典（点「开始扫描」时自动生成）");
+            }
+        }
         self.refresh_resume_hint();
     }
 
@@ -885,6 +973,13 @@ impl Inner {
     }
 
     fn new_platform(&self) {
+        self.fill_new_form();
+        self.config_expander.set_expanded(true);
+        self.toast("已切换到新平台，填好后点「保存」");
+    }
+
+    /// 把表单重置为「新平台」默认值（不展开、不提示，供取消/删除后复用）。
+    fn fill_new_form(&self) {
         let base = "新平台";
         let mut name = base.to_string();
         let mut n = 2;
@@ -907,7 +1002,21 @@ impl Inner {
         self.endpoint_combo.set_selected(0);
         self.endpoint_row.set_visible(false);
         self.endpoint_row.set_text(DEFAULT_ENDPOINT);
-        self.toast("已切换到新平台，填好后点「保存」");
+        self.dict_info
+            .set_text("尚未生成字典（点「开始扫描」时自动生成）");
+    }
+
+    /// 「取消」：放弃当前表单的新建/修改，收起平台配置卡。
+    fn cancel_edit(&self) {
+        let name = self.loaded_name.borrow().clone();
+        if name.is_empty() {
+            self.fill_new_form();
+        } else if let Some(p) = self.platforms.borrow().iter().find(|p| p.name == name).cloned() {
+            // 重新载入已保存的配置，丢弃未保存的编辑
+            self.load_platform(&p);
+        }
+        self.config_expander.set_expanded(false);
+        self.toast("已取消，未保存的修改被丢弃");
     }
 
     fn save_platform(&self) {
@@ -932,56 +1041,135 @@ impl Inner {
 
         *self.loaded_name.borrow_mut() = cfg.name.clone();
         self.persist_platforms();
-        self.rebuild_platform_combo(Some(&cfg.name));
-        self.dict.take();
-        set_buffer_text(&self.dict_preview.buffer(), "");
-        self.dict_info.set_text("配置已保存，请重新生成字典");
+        self.rebuild_platform_list(Some(&cfg.name));
+        // 字典按平台缓存：改名时迁移，否则保持
+        {
+            let mut dicts = self.dicts.borrow_mut();
+            if old_name != cfg.name {
+                if let Some(d) = dicts.remove(&old_name) {
+                    dicts.insert(cfg.name.clone(), d);
+                }
+            }
+        }
+        self.dict_info
+            .set_text("配置已保存（「开始扫描」时自动生成字典）");
+        self.config_expander.set_expanded(false);
         self.refresh_resume_hint();
         self.toast(&format!("平台「{}」已保存", cfg.name));
     }
 
-    fn delete_platform(&self) {
-        let name = self.loaded_name.borrow().clone();
-        if name.is_empty() {
-            self.toast("当前是未保存的新平台，无需删除");
-            return;
+    /// 按名字删除平台（列表行删除按钮回调）；若删除的正是正在编辑的平台则收起配置卡。
+    fn delete_platform_by_name(&self, name: &str) {
+        {
+            let mut list = self.platforms.borrow_mut();
+            list.retain(|p| p.name != name);
         }
-        self.platforms.borrow_mut().retain(|p| p.name != name);
+        self.dicts.borrow_mut().remove(name);
         self.persist_platforms();
-        *self.loaded_name.borrow_mut() = String::new();
-        self.rebuild_platform_combo(None);
-        if let Some(p) = self.current_platform() {
-            self.load_platform(&p);
-        } else {
-            self.new_platform();
+        if *self.loaded_name.borrow() == name {
+            *self.loaded_name.borrow_mut() = String::new();
+            self.config_expander.set_expanded(false);
         }
+        self.rebuild_platform_list(None);
         self.toast(&format!("已删除平台「{name}」"));
     }
 
-    fn restore_builtin(&self) {
-        *self.platforms.borrow_mut() = builtin_platforms();
-        self.persist_platforms();
-        self.rebuild_platform_combo(None);
-        if let Some(p) = self.current_platform() {
+    /// 按名字载入平台（列表行点击 / 编辑按钮回调），展开配置卡。
+    fn load_platform_by_name(&self, name: &str) {
+        if let Some(p) = self.platforms.borrow().iter().find(|p| p.name == name).cloned() {
             self.load_platform(&p);
+            self.config_expander.set_expanded(true);
         }
-        self.toast("已恢复内置预设平台");
     }
 
-    /// 重建平台下拉，并尽量选中 `select` 指定的平台。
-    fn rebuild_platform_combo(&self, select: Option<&str>) {
-        let names: Vec<String> = self.platforms.borrow().iter().map(|p| p.name.clone()).collect();
-        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        let model = gtk::StringList::new(if refs.is_empty() { &["（空）"] } else { &refs });
-        self.platform_combo.set_model(Some(&model));
-        let target = select
-            .and_then(|s| names.iter().position(|n| n == s))
-            .unwrap_or(0) as u32;
-        self.platform_combo.set_selected(target);
-        // set_selected 到同一索引不会触发 notify，这里手动同步一次
-        if let Some(p) = self.platforms.borrow().get(target as usize).cloned() {
-            *self.loaded_name.borrow_mut() = p.name.clone();
+    /// 重建平台任务列表（勾选 + 平台 + 状态 + 删除），`select` 指定的平台会载入表单。
+    fn rebuild_platform_list(&self, select: Option<&str>) {
+        // 清空列表
+        while let Some(child) = self.task_list.first_child() {
+            self.task_list.remove(&child);
         }
+        self.task_rows.borrow_mut().clear();
+
+        let rows: Vec<(PlatformConfig, gtk::CheckButton, gtk::Label)> = {
+            let list = self.platforms.borrow();
+            list.iter()
+                .map(|p| {
+                    let check = gtk::CheckButton::new();
+                    check.set_active(true); // 默认全部勾选参与嗅探
+                    let status = gtk::Label::new(Some("待机"));
+                    status.add_css_class("dim-label");
+                    status.set_halign(gtk::Align::End);
+                    (p.clone(), check, status)
+                })
+                .collect()
+        };
+
+        for (p, check, status) in rows {
+            // 用 ActionRow 作为行主体：自带点击高亮与 activated 信号，点击即载入编辑
+            let row = adw::ActionRow::new();
+            row.set_title(&p.name);
+            row.set_subtitle(&format!("{} · {}", p.base_url, p.model));
+            row.set_activatable(true);
+            row.set_subtitle_selectable(false);
+
+            row.add_prefix(&check);
+            row.add_suffix(&status);
+            let edit_btn = gtk::Button::from_icon_name("document-edit-symbolic");
+            edit_btn.set_tooltip_text(Some("编辑该平台"));
+            edit_btn.add_css_class("flat");
+            edit_btn.add_css_class("circular");
+            edit_btn.set_valign(gtk::Align::Center);
+            row.add_suffix(&edit_btn);
+            let del_btn = gtk::Button::from_icon_name("user-trash-symbolic");
+            del_btn.set_tooltip_text(Some("删除该平台"));
+            del_btn.add_css_class("flat");
+            del_btn.add_css_class("circular");
+            del_btn.set_valign(gtk::Align::Center);
+            row.add_suffix(&del_btn);
+
+            self.task_list.append(&row);
+            self.task_rows.borrow_mut().push(TaskRow {
+                name: p.name.clone(),
+                check: check.clone(),
+                status: status.clone(),
+            });
+
+            let name_for_edit = p.name.clone();
+            let name_for_edit_btn = p.name.clone();
+            let name_for_del = p.name.clone();
+            let self_ref_edit = Rc::downgrade(&self.self_rc());
+            let self_ref_edit_btn = Rc::downgrade(&self.self_rc());
+            let self_ref_del = Rc::downgrade(&self.self_rc());
+            row.connect_activated(move |_| {
+                if let Some(inner) = self_ref_edit.upgrade() {
+                    inner.load_platform_by_name(&name_for_edit);
+                    inner.persist_last_platform(&name_for_edit);
+                }
+            });
+            edit_btn.connect_clicked(move |_| {
+                if let Some(inner) = self_ref_edit_btn.upgrade() {
+                    inner.load_platform_by_name(&name_for_edit_btn);
+                    inner.persist_last_platform(&name_for_edit_btn);
+                }
+            });
+            del_btn.connect_clicked(move |_| {
+                if let Some(inner) = self_ref_del.upgrade() {
+                    inner.delete_platform_by_name(&name_for_del);
+                }
+            });
+        }
+
+        self.task_empty.set_visible(self.platforms.borrow().is_empty());
+        if let Some(name) = select {
+            if let Some(p) = self.platforms.borrow().iter().find(|p| p.name == name).cloned() {
+                *self.loaded_name.borrow_mut() = p.name.clone();
+            }
+        }
+    }
+
+    /// 内部方法：Rc 自身，供列表行回调使用。
+    fn self_rc(&self) -> Rc<Inner> {
+        INNER.with(|i| i.borrow().clone().unwrap_or_else(|| unreachable!("页面未注册")))
     }
 
     fn persist_platforms(&self) {
@@ -1028,91 +1216,141 @@ impl Inner {
 
     // ---------- 字典 ----------
 
-    fn generate_options(&self) -> GenerateOptions {
-        GenerateOptions {
-            max_results: self.max_row.value().max(1.0) as usize,
-            unbounded_repeat: self.unbounded_row.value().max(1.0) as usize,
-        }
-    }
-
-    /// 在后台线程生成字典（大字典也不卡界面）。
-    fn generate_async(&self) {
-        let pattern = self.pattern_row.text().to_string();
-        let opts = self.generate_options();
-        self.dict_info.set_text("正在生成字典…");
-        // `Arc<Mutex<..>>` 才能跨线程搬运（`Rc` 不是 Send）
-        let slot: Arc<Mutex<Option<Result<crate::utils::sniffer::Dictionary, String>>>> =
-            Arc::new(Mutex::new(None));
-        GENERATE_SLOT.with(|s| *s.borrow_mut() = Some(Arc::clone(&slot)));
-        std::thread::spawn(move || {
-            let result = generate(&pattern, &opts);
-            if let Ok(mut guard) = slot.lock() {
-                *guard = Some(result);
+    /// 依次为 `pending_dict` 队列里的平台生成字典。
+    ///
+    /// tokio 异步：CPU 密集部分走 `spawn_blocking` 不卡 UI；网络与回调经
+    /// 全局运行时调度。生成始终乱序（洗牌种子取自平台正则 + 生成参数，
+    /// 同一配置多次运行顺序一致，「断点续跑」游标跨会话依然有效）。
+    fn gen_next_dict(&self) {
+        let name = match self.pending_dict.borrow().first().cloned() {
+            Some(n) => n,
+            None => {
+                self.after_dict_all_done();
+                return;
             }
-            glib::source::idle_add(tick_generate_done);
+        };
+        self.pending_dict.borrow_mut().remove(0);
+        let Some(p) = self.platforms.borrow().iter().find(|p| p.name == name).cloned() else {
+            self.log(&format!("「{name}」配置缺失，跳过字典生成"));
+            self.set_task_status(&name, "配置缺失");
+            return self.gen_next_dict();
+        };
+        let max = self.max_row.value().max(1.0) as usize;
+        let unbounded = self.unbounded_row.value().max(1.0) as usize;
+        let opts = GenerateOptions {
+            max_results: max,
+            unbounded_repeat: unbounded,
+            random_sample: true,
+            seed: crate::utils::sniffer::sample_seed_for(&[
+                &p.pattern,
+                &max.to_string(),
+                &unbounded.to_string(),
+            ]),
+        };
+        self.set_task_status(&name, "生成字典中…");
+        self.dict_info
+            .set_text(&format!("正在为「{name}」生成字典（乱序、去重）…"));
+        self.log(&format!("「{name}」正在生成字典…"));
+
+        // `Arc<Mutex<..>>` 才能跨线程搬运（`Rc` 不是 Send）；结果附带生成时所属的平台名
+        let slot: Arc<
+            Mutex<Option<(String, Result<crate::utils::sniffer::Dictionary, String>)>>,
+        > = Arc::new(Mutex::new(None));
+        GENERATE_SLOT.with(|s| *s.borrow_mut() = Some(Arc::clone(&slot)));
+        let pattern = p.pattern.clone();
+        let task_name = name.clone();
+        crate::utils::sniffer::runtime().spawn(async move {
+            let result = match tokio::task::spawn_blocking(move || generate(&pattern, &opts)).await
+            {
+                Ok(r) => r,
+                Err(e) => Err(format!("生成任务异常：{e}")),
+            };
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some((task_name, result));
+            }
+            let _ = glib::source::idle_add(tick_generate_done);
         });
     }
 
-    /// 后台生成完成后回到主线程：把结果填进 `dict`。
+    /// 一个平台的字典生成完毕：缓存结果，继续队列里下一个平台；全部完成后开始扫描。
     fn generate_done(&self) {
         let result = GENERATE_SLOT
             .with(|s| s.borrow_mut().take())
             .and_then(|slot| slot.lock().ok().and_then(|mut g| g.take()));
         match result {
-            Some(Ok(dict)) => {
-                let preview: Vec<&str> = dict.keys.iter().take(PREVIEW_LIMIT).map(|s| s.as_str()).collect();
-                let mut text = preview.join("\n");
-                if dict.keys.len() > PREVIEW_LIMIT {
-                    text.push_str(&format!(
-                        "\n… 其余 {} 条未展示",
-                        format_count((dict.keys.len() - PREVIEW_LIMIT) as u128)
-                    ));
-                }
-                set_buffer_text(&self.dict_preview.buffer(), &text);
-
-                let mut info = format!(
-                    "密钥空间 {} · 已生成 {} 条",
-                    format_count(dict.total_space),
-                    format_count(dict.keys.len() as u128)
-                );
-                if dict.truncated {
-                    info.push_str("（已达上限，被截断）");
-                }
-                if dict.dropped > 0 {
-                    info.push_str(&format!(
-                        " · 剔除 {} 条含控制字符的候选",
-                        format_count(dict.dropped as u128)
-                    ));
-                }
-                self.dict_info.set_text(&info);
-
+            Some((name, Ok(dict))) => {
                 let len = dict.keys.len();
-                *self.dict.borrow_mut() = Some(Arc::new(dict.keys));
-                self.log(&format!("字典生成完成：{len} 条候选"));
+                let keys = Arc::new(dict.keys.clone());
+                let pattern = self
+                    .platforms
+                    .borrow()
+                    .iter()
+                    .find(|p| p.name == name)
+                    .map(|p| p.pattern.clone())
+                    .unwrap_or_default();
+                {
+                    let mut dicts = self.dicts.borrow_mut();
+                    dicts.insert(name.clone(), (pattern, Arc::clone(&keys)));
+                }
+                self.set_task_status(&name, "字典就绪");
+                self.log(&format!("「{name}」字典生成完成：{len} 条候选（乱序）"));
+                // 只更新「当前正在编辑那个平台」的预览
+                if *self.loaded_name.borrow() == name {
+                    let preview: Vec<&str> = keys.iter().take(PREVIEW_LIMIT).map(|s| s.as_str()).collect();
+                    let mut text = preview.join("\n");
+                    if len > PREVIEW_LIMIT {
+                        text.push_str(&format!(
+                            "\n… 其余 {} 条未展示",
+                            format_count((len - PREVIEW_LIMIT) as u128)
+                        ));
+                    }
+                    set_buffer_text(&self.dict_preview.buffer(), &text);
+                    let mut info = format!(
+                        "「{name}」密钥空间 {} · 已生成 {} 条（乱序）",
+                        format_count(dict.total_space),
+                        format_count(len as u128)
+                    );
+                    if dict.truncated {
+                        info.push_str("（已达上限，被截断）");
+                    }
+                    if dict.dropped > 0 {
+                        info.push_str(&format!(
+                            " · 剔除 {} 条含控制字符的候选",
+                            format_count(dict.dropped as u128)
+                        ));
+                    }
+                    self.dict_info.set_text(&info);
+                }
                 self.refresh_resume_hint();
             }
-            Some(Err(e)) => {
-                self.dict_info.set_text(&format!("生成失败：{e}"));
-                self.toast(&format!("正则解析失败：{e}"));
+            Some((name, Err(e))) => {
+                self.set_task_status(&name, "生成失败");
+                self.log(&format!("「{name}」字典生成失败：{e}"));
             }
             None => self.dict_info.set_text("生成失败：内部状态丢失"),
         }
+        // 队列里还有平台就继续生成，否则进入扫描
+        if self.pending_dict.borrow().is_empty() {
+            self.after_dict_all_done();
+        } else {
+            self.gen_next_dict();
+        }
     }
 
-    fn clear_dict(&self) {
-        self.dict.take();
-        set_buffer_text(&self.dict_preview.buffer(), "");
-        self.dict_info.set_text("尚未生成字典");
-        self.refresh_resume_hint();
-    }
-
-    fn dict_len(&self) -> usize {
-        self.dict.borrow().as_ref().map(|d| d.len()).unwrap_or(0)
+    /// 所有待生成平台的字典都处理完：交给扫描启动流程（生成失败的平台会被跳过）。
+    fn after_dict_all_done(&self) {
+        self.start_btn.set_sensitive(true);
+        self.begin_scan();
     }
 
     /// 当前配置对应的字典指纹（配置一变，断点即失效）。
     fn current_fingerprint(&self) -> String {
         let cfg = self.collect_platform();
+        self.fingerprint_for(&cfg)
+    }
+
+    /// 按具体平台配置计算指纹（多平台各自独立断点）。
+    fn fingerprint_for(&self, cfg: &PlatformConfig) -> String {
         let scan = self.collect_scan_config();
         fingerprint(&[
             &cfg.name,
@@ -1127,17 +1365,23 @@ impl Inner {
 
     // ---------- 断点 ----------
 
+    /// 每个平台的断点独立存放（store::checkpoint_path 按平台分文件）。
     fn refresh_resume_hint(&self) {
         if !self.resume_switch.is_active() {
             self.resume_hint.set_text("断点续跑已关闭");
             return;
         }
-        match load_checkpoint() {
-            None => self.resume_hint.set_text("当前无断点，将从头开始"),
+        let name = self.loaded_name.borrow().clone();
+        if name.is_empty() {
+            self.resume_hint.set_text("当前平台未保存，断点按平台名区分");
+            return;
+        }
+        match load_checkpoint(&name) {
+            None => self.resume_hint.set_text("当前平台无断点，将从头开始"),
             Some(cp) => {
-                if cp.fingerprint == self.current_fingerprint() && self.name_row.text().trim() == cp.platform {
+                if cp.fingerprint == self.current_fingerprint() {
                     self.resume_hint.set_text(&format!(
-                        "发现断点（{}）：上次测到 {}/{}，命中 {} 条；开始时将从第 {} 条继续",
+                        "「{name}」发现断点（{}）：上次测到 {}/{}，命中 {} 条；开始时会从第 {} 条继续",
                         time_text(cp.updated_at),
                         format_count(cp.cursor as u128),
                         format_count(cp.total as u128),
@@ -1145,101 +1389,185 @@ impl Inner {
                         format_count((cp.cursor + 1) as u128),
                     ));
                 } else {
-                    self.resume_hint.set_text("已存在的断点与当前配置不匹配，开始时会自动忽略");
+                    self.resume_hint
+                        .set_text("已存在的断点与当前配置不匹配，开始时会自动忽略");
                 }
             }
         }
     }
 
     fn reset_checkpoint(&self) {
-        store::clear_checkpoint();
+        let name = self.loaded_name.borrow().clone();
+        if name.is_empty() {
+            self.toast("当前平台未保存，暂无断点可清除");
+            return;
+        }
+        store::clear_checkpoint(&name);
         self.refresh_resume_hint();
-        self.toast("断点已清除");
+        self.toast(&format!("「{name}」断点已清除"));
     }
 
     // ---------- 扫描 ----------
 
+    /// 收集勾选的平台（参与本次嗅探的任务列表）。
+    fn enabled_platforms(&self) -> Vec<PlatformConfig> {
+        let rows = self.task_rows.borrow();
+        self.platforms
+            .borrow()
+            .iter()
+            .filter(|p| rows.iter().any(|r| r.name == p.name && r.check.is_active()))
+            .cloned()
+            .collect()
+    }
+
+    /// 对勾选的多个平台启动扫描。
+    ///
+    /// 缺少缓存字典的平台会先异步生成（乱序、去重），全部就绪后进入
+    /// [`begin_scan`]；已有字典的平台直接开扫。
     fn start(&self) {
         if self.running.get() {
             self.toast("扫描正在进行中");
             return;
         }
-        let cfg = self.collect_platform();
-        if let Err(e) = cfg.validate() {
-            self.toast(&format!("无法开始：{e}"));
+        let enabled = self.enabled_platforms();
+        if enabled.is_empty() {
+            self.toast("请先在「嗅探任务」列表中勾选至少一个平台");
             return;
         }
-        if self.dict_len() == 0 {
-            self.toast("请先点「生成并预览」生成 Key 字典");
+        // 找出缺少「与当前正则匹配」的缓存字典的平台，先异步生成
+        let need: Vec<String> = enabled
+            .iter()
+            .filter(|p| {
+                !matches!(
+                    self.dicts.borrow().get(&p.name),
+                    Some((pat, _)) if pat == &p.pattern
+                )
+            })
+            .map(|p| p.name.clone())
+            .collect();
+        if !need.is_empty() {
+            self.start_btn.set_sensitive(false);
+            self.stat_label
+                .set_text(&format!("正在为 {} 个平台生成字典…", need.len()));
+            self.log(&format!(
+                "开始扫描前先为 {} 个平台生成字典（乱序、去重）",
+                need.len()
+            ));
+            *self.pending_dict.borrow_mut() = need.clone();
+            for name in &need {
+                self.set_task_status(name, "待生成字典");
+            }
+            // 展开配置卡，生成进度可见
+            self.config_expander.set_expanded(true);
+            self.gen_next_dict();
+            return;
+        }
+        self.begin_scan();
+    }
+
+    /// 字典就绪后的扫描启动主体：逐平台校验 + 断点 + 启动扫描实例。
+    fn begin_scan(&self) {
+        if self.running.get() {
             return;
         }
         let scan = self.collect_scan_config();
-        let keys = match self.dict.borrow().clone() {
-            Some(k) => k,
-            None => {
-                self.toast("字典为空");
-                return;
+        let enabled = self.enabled_platforms();
+        if enabled.is_empty() {
+            self.start_btn.set_sensitive(true);
+            self.toast("请先在「嗅探任务」列表中勾选至少一个平台");
+            return;
+        }
+        // 逐平台校验 + 准备字典
+        let mut runs: Vec<RunState> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        for p in &enabled {
+            if let Err(e) = p.validate() {
+                skipped.push(format!("{}（{e}）", p.name));
+                continue;
             }
-        };
-        let fp = self.current_fingerprint();
-
-        // 断点续跑
-        let mut start_index = 0usize;
-        if scan.resume {
-            if let Some(cp) = load_checkpoint() {
-                if cp.platform == cfg.name && cp.fingerprint == fp {
-                    if cp.cursor >= keys.len() {
-                        self.toast("该字典已跑完，请清除断点或修改生成规则");
-                        return;
-                    }
-                    start_index = cp.cursor;
-                    self.log(&format!(
-                        "断点续跑：从第 {} 条继续（上次命中 {} 条）",
-                        format_count((cp.cursor + 1) as u128),
-                        cp.valid
-                    ));
-                } else {
-                    self.log("断点与当前配置不匹配，已忽略并从头开始");
-                    store::clear_checkpoint();
+            let keys = match self.dicts.borrow().get(&p.name).cloned() {
+                Some((pat, keys)) if pat == p.pattern => keys,
+                _ => {
+                    skipped.push(format!("{}（未生成与该平台正则匹配的字典）", p.name));
+                    continue;
                 }
+            };
+            let fp = self.fingerprint_for(p);
+
+            // 断点续跑（每个平台独立断点文件）
+            let mut start_index = 0usize;
+            if scan.resume {
+                if let Some(cp) = load_checkpoint(&p.name) {
+                    if cp.fingerprint == fp {
+                        if cp.cursor >= keys.len() {
+                            skipped.push(format!(
+                                "{}（该字典已跑完，请清除断点或修改生成规则）",
+                                p.name
+                            ));
+                            continue;
+                        }
+                        start_index = cp.cursor;
+                        self.log(&format!(
+                            "「{}」断点续跑：从第 {} 条继续（上次命中 {} 条）",
+                            p.name,
+                            format_count((cp.cursor + 1) as u128),
+                            cp.valid
+                        ));
+                    } else {
+                        self.log(&format!("「{}」断点与当前配置不匹配，已忽略并从头开始", p.name));
+                        store::clear_checkpoint(&p.name);
+                    }
+                }
+            } else {
+                store::clear_checkpoint(&p.name);
             }
-        } else {
-            store::clear_checkpoint();
+
+            let target = ProbeTarget {
+                base_url: p.base_url.clone(),
+                endpoint: p.endpoint.clone(),
+                model: p.model.clone(),
+                headers: p.headers.clone(),
+                timeout: Duration::from_secs(scan.timeout_secs.max(1)),
+            };
+            let params = ScanParams {
+                platform: p.name.clone(),
+                fingerprint: fp,
+                target,
+                keys: Arc::clone(&keys),
+                start_index,
+                concurrency: scan.concurrency.max(1),
+                rate_per_sec: scan.rate_per_sec,
+                retries: scan.retries,
+                persist_valid: scan.persist_valid,
+                write_checkpoint: scan.resume,
+            };
+            let (tx, rx) = mpsc::channel();
+            let control = scan_util::start(params, tx);
+            runs.push(RunState {
+                name: p.name.clone(),
+                base_url: p.base_url.clone(),
+                endpoint: p.endpoint.clone(),
+                model: p.model.clone(),
+                receiver: rx,
+                control,
+                total: keys.len(),
+                start_index,
+                counters: Counters::default(),
+                finished: false,
+            });
+            self.set_task_status(&p.name, &format!("启动中 · {} 条", format_count(keys.len() as u128)));
+        }
+
+        if runs.is_empty() {
+            self.start_btn.set_sensitive(true);
+            self.toast(&format!("没有可扫描的平台：{}", skipped.join("；")));
+            return;
         }
 
         self.persist_platforms();
-
-        let target = ProbeTarget {
-            base_url: cfg.base_url.clone(),
-            endpoint: cfg.endpoint.clone(),
-            model: cfg.model.clone(),
-            headers: cfg.headers.clone(),
-            timeout: Duration::from_secs(scan.timeout_secs.max(1)),
-        };
-
-        let params = ScanParams {
-            platform: cfg.name.clone(),
-            fingerprint: fp,
-            target,
-            keys: Arc::clone(&keys),
-            start_index,
-            concurrency: scan.concurrency.max(1),
-            rate_per_sec: scan.rate_per_sec,
-            retries: scan.retries,
-            persist_valid: scan.persist_valid,
-            write_checkpoint: scan.resume,
-        };
-
-        let (tx, rx) = mpsc::channel();
-        *self.receiver.borrow_mut() = Some(rx);
-        let control = scan_util::start(params, tx);
-        *self.control.borrow_mut() = Some(control);
-
+        *self.runs.borrow_mut() = runs;
         self.running.set(true);
         self.paused.set(false);
-        self.counters.set(Counters::default());
-        self.total.set(keys.len());
-        self.start_index.set(start_index);
         *self.started_at.borrow_mut() = Some(Instant::now());
 
         self.start_btn.set_sensitive(false);
@@ -1247,19 +1575,28 @@ impl Inner {
         self.pause_btn.set_label("暂停");
         self.stop_btn.set_sensitive(true);
         self.progress.set_fraction(0.0);
+        self.stat_label.set_text("正在启动…");
 
-        self.log(&format!(
-            "开始扫描：平台「{}」，字典 {} 条，从第 {} 条开始，并发 {}，限速 {} 次/秒",
-            cfg.name,
-            format_count(keys.len() as u128),
-            format_count((start_index + 1) as u128),
-            scan.concurrency.max(1),
-            if scan.rate_per_sec > 0.0 {
-                scan.rate_per_sec.to_string()
-            } else {
-                "不限".to_string()
-            }
-        ));
+        let total_runs = self.runs.borrow().len();
+        for run in self.runs.borrow().iter() {
+            self.log(&format!(
+                "开始扫描「{}」：字典 {} 条，从第 {} 条开始，并发 {}，限速 {} 次/秒",
+                run.name,
+                format_count(run.total as u128),
+                format_count((run.start_index + 1) as u128),
+                scan.concurrency.max(1),
+                if scan.rate_per_sec > 0.0 {
+                    scan.rate_per_sec.to_string()
+                } else {
+                    "不限".to_string()
+                }
+            ));
+        }
+        if !skipped.is_empty() {
+            self.log(&format!("跳过 {} 个平台：{}", skipped.len(), skipped.join("；")));
+            self.toast(&format!("已跳过 {} 个平台（详见日志）", skipped.len()));
+        }
+        self.log(&format!("共启动 {} 个平台的扫描，并行进行中", total_runs));
         self.update_stats();
     }
 
@@ -1269,11 +1606,11 @@ impl Inner {
         }
         let next = !self.paused.get();
         self.paused.set(next);
-        if let Some(c) = self.control.borrow().as_ref() {
-            c.set_paused(next);
+        for run in self.runs.borrow().iter() {
+            run.control.set_paused(next);
         }
         self.pause_btn.set_label(if next { "继续" } else { "暂停" });
-        self.log(if next { "已暂停" } else { "已继续" });
+        self.log(if next { "已暂停全部扫描" } else { "已继续全部扫描" });
     }
 
     fn stop(&self) {
@@ -1283,27 +1620,42 @@ impl Inner {
         if self.paused.get() {
             // 暂停中先恢复，否则工作线程卡在暂停轮询里看不到停止信号
             self.paused.set(false);
-            if let Some(c) = self.control.borrow().as_ref() {
-                c.set_paused(false);
+            for run in self.runs.borrow().iter() {
+                run.control.set_paused(false);
             }
         }
-        if let Some(c) = self.control.borrow().as_ref() {
-            c.stop();
+        for run in self.runs.borrow().iter() {
+            run.control.stop();
         }
-        self.log("正在停止…（等待在途请求结束）");
+        self.log("正在停止全部扫描…（等待在途请求结束）");
     }
 
-    /// 主循环定时调用：排空事件队列并更新界面。
+    /// 更新任务列表里某平台行的状态文字。
+    fn set_task_status(&self, name: &str, text: &str) {
+        let rows = self.task_rows.borrow();
+        if let Some(row) = rows.iter().find(|r| r.name == name) {
+            row.status.set_text(text);
+        }
+    }
+
+    /// 主循环定时调用：排空所有平台的扫描事件队列并更新界面。
     fn drain_events(&self) {
         if !self.running.get() {
             return;
         }
-        let mut batch: Vec<ScanEvent> = Vec::new();
-        if let Some(rx) = self.receiver.borrow().as_ref() {
-            while let Ok(ev) = rx.try_recv() {
-                batch.push(ev);
-                if batch.len() >= 2000 {
-                    break;
+        // 1) 排空每个 run 的队列（只碰 runs 内部）
+        let mut batch: Vec<(usize, ScanEvent)> = Vec::new();
+        {
+            let runs = self.runs.borrow();
+            for (i, run) in runs.iter().enumerate() {
+                if run.finished {
+                    continue;
+                }
+                while let Ok(ev) = run.receiver.try_recv() {
+                    batch.push((i, ev));
+                    if batch.len() >= 4000 {
+                        break;
+                    }
                 }
             }
         }
@@ -1312,113 +1664,169 @@ impl Inner {
             return;
         }
 
-        let mut counters = self.counters.get();
+        // 2) 处理事件（此时不持有 runs 借用）：只做日志与有效 Key 收集，计数统一在第 3 步应用
         let verbose = self.verbose_switch.is_active();
         let mut new_records: Vec<ValidKeyRecord> = Vec::new();
-
-        for ev in batch {
-            match ev {
-                ScanEvent::Started { total, start_index } => {
-                    self.log(&format!(
-                        "引擎已启动：共 {} 条，起点 #{}",
-                        format_count(total as u128),
-                        start_index
-                    ));
-                }
-                ScanEvent::Result {
-                    index,
-                    key,
-                    outcome,
-                    elapsed_ms,
-                    attempts,
-                } => {
-                    counters.tested += 1;
-                    match outcome.verdict {
-                        Verdict::Valid => counters.valid += 1,
-                        Verdict::Unauthorized => counters.unauthorized += 1,
-                        Verdict::RateLimited => counters.limited += 1,
-                        Verdict::NotFound => counters.notfound += 1,
-                        Verdict::ServerError => counters.server += 1,
-                        Verdict::ClientError => counters.client += 1,
-                        Verdict::NetworkError => counters.network += 1,
+        let mut finished_notes: Vec<String> = Vec::new();
+        // 收集：run 索引 → 本批累计的计数；以及已结束的 run 索引
+        let mut counters_updates: Vec<(usize, Counters)> = Vec::new();
+        let mut finished_ids: Vec<usize> = Vec::new();
+        {
+            let runs = self.runs.borrow();
+            for (i, ev) in batch {
+                let Some(run) = runs.get(i) else {
+                    continue;
+                };
+                match ev {
+                    ScanEvent::Started { total, start_index } => {
+                        self.log(&format!(
+                            "「{}」引擎已启动：共 {} 条，起点 #{}",
+                            run.name,
+                            format_count(total as u128),
+                            start_index
+                        ));
                     }
-                    if outcome.verdict.is_valid() {
-                        let record = ValidKeyRecord {
-                            platform: self.name_row.text().to_string(),
-                            base_url: self.base_row.text().to_string(),
-                            endpoint: self.current_endpoint(),
-                            model: self.model_row.text().to_string(),
-                            key: key.clone(),
-                            status: outcome.status,
-                            latency_ms: outcome.latency_ms,
-                            found_at: probe_util::now_unix(),
-                            snippet: outcome.body.clone(),
+                    ScanEvent::Result {
+                        index,
+                        key,
+                        outcome,
+                        elapsed_ms,
+                        attempts,
+                    } => {
+                        // 累加该 run 的本批计数
+                        let entry = match counters_updates.iter_mut().find(|(idx, _)| *idx == i) {
+                            Some(entry) => entry,
+                            None => {
+                                counters_updates.push((i, run.counters));
+                                counters_updates.last_mut().unwrap()
+                            }
                         };
-                        new_records.push(record);
-                        self.log(&format!(
-                            "✔ 命中 #{}：{} → HTTP {} · {} ms · {}",
-                            index,
-                            mask_key(&key),
-                            outcome.status,
-                            outcome.latency_ms,
-                            outcome.detail
-                        ));
-                    } else if verbose {
-                        self.log(&format!(
-                            "#{} {} → {} {}（{} ms{}）· {}",
-                            index,
-                            mask_key(&key),
-                            outcome.status,
-                            outcome.verdict.label(),
-                            elapsed_ms,
-                            if attempts > 0 {
-                                format!("，重试 {} 次", attempts)
-                            } else {
-                                String::new()
-                            },
-                            outcome.detail
-                        ));
-                    } else if outcome.verdict == Verdict::NetworkError {
-                        self.log(&format!(
-                            "网络错误 #{}：{}（请检查 Base URL / 网络 / 超时设置）",
-                            index, outcome.detail
-                        ));
-                    } else if counters.tested % SUMMARY_EVERY == 0 {
-                        self.log(&format!(
-                            "进度：已测 {} 条 · 有效 {} · 鉴权失败 {} · 限流 {} · 网络错误 {}",
-                            format_count(counters.tested as u128),
-                            counters.valid,
-                            counters.unauthorized,
-                            counters.limited,
-                            counters.network
-                        ));
+                        entry.1.tested += 1;
+                        match outcome.verdict {
+                            Verdict::Valid => entry.1.valid += 1,
+                            Verdict::Unauthorized => entry.1.unauthorized += 1,
+                            Verdict::RateLimited => entry.1.limited += 1,
+                            Verdict::NotFound => entry.1.notfound += 1,
+                            Verdict::ServerError => entry.1.server += 1,
+                            Verdict::ClientError => entry.1.client += 1,
+                            Verdict::NetworkError => entry.1.network += 1,
+                        }
+                        if outcome.verdict.is_valid() {
+                            let record = ValidKeyRecord {
+                                platform: run.name.clone(),
+                                base_url: run.base_url.clone(),
+                                endpoint: run.endpoint.clone(),
+                                model: run.model.clone(),
+                                key: key.clone(),
+                                status: outcome.status,
+                                latency_ms: outcome.latency_ms,
+                                found_at: probe_util::now_unix(),
+                                snippet: outcome.body.clone(),
+                            };
+                            new_records.push(record);
+                            self.log(&format!(
+                                "✔ 「{}」命中 #{}：{} → HTTP {} · {} ms · {}",
+                                run.name,
+                                index,
+                                mask_key(&key),
+                                outcome.status,
+                                outcome.latency_ms,
+                                outcome.detail
+                            ));
+                        } else if verbose {
+                            self.log(&format!(
+                                "「{}」#{} {} → {} {}（{} ms{}）· {}",
+                                run.name,
+                                index,
+                                mask_key(&key),
+                                outcome.status,
+                                outcome.verdict.label(),
+                                elapsed_ms,
+                                if attempts > 0 {
+                                    format!("，重试 {} 次", attempts)
+                                } else {
+                                    String::new()
+                                },
+                                outcome.detail
+                            ));
+                        } else if outcome.verdict == Verdict::NetworkError {
+                            self.log(&format!(
+                                "「{}」网络错误 #{}：{}（请检查 Base URL / 网络 / 超时设置）",
+                                run.name, index, outcome.detail
+                            ));
+                        } else if entry.1.tested % SUMMARY_EVERY == 0 {
+                            self.log(&format!(
+                                "「{}」进度：已测 {} 条 · 有效 {} · 鉴权失败 {} · 限流 {} · 网络错误 {}",
+                                run.name,
+                                format_count(entry.1.tested as u128),
+                                entry.1.valid,
+                                entry.1.unauthorized,
+                                entry.1.limited,
+                                entry.1.network
+                            ));
+                        }
                     }
-                }
-                ScanEvent::Log(text) => self.log(&text),
-                ScanEvent::Finished {
-                    reason,
-                    tested,
-                    valid,
-                } => {
-                    self.log(&format!(
-                        "扫描{}：本次测 {} 条，命中 {} 条",
-                        reason.label(),
-                        format_count(tested as u128),
-                        valid
-                    ));
-                    if reason == StopReason::Completed {
-                        store::clear_checkpoint();
-                        self.toast(&format!("扫描完成，命中 {valid} 条有效 Key"));
-                    } else {
-                        self.toast(&format!("已停止，本次命中 {valid} 条"));
+                    ScanEvent::Log(text) => self.log(&format!("「{}」{text}", run.name)),
+                    ScanEvent::Finished {
+                        reason,
+                        tested,
+                        valid,
+                    } => {
+                        self.log(&format!(
+                            "「{}」扫描{}：本次测 {} 条，命中 {} 条",
+                            run.name,
+                            reason.label(),
+                            format_count(tested as u128),
+                            valid
+                        ));
+                        if reason == StopReason::Completed {
+                            store::clear_checkpoint(&run.name);
+                        }
+                        finished_ids.push(i);
+                        finished_notes.push(if reason == StopReason::Completed {
+                            format!("{} 已完成，命中 {valid} 条", run.name)
+                        } else {
+                            format!("{} 已停止，命中 {valid} 条", run.name)
+                        });
                     }
-                    self.finish_run();
-                    self.refresh_resume_hint();
                 }
             }
         }
 
-        self.counters.set(counters);
+        // 3) 应用本批计数与结束标记（需要可变借用 runs）
+        {
+            let mut runs = self.runs.borrow_mut();
+            for (i, counters) in counters_updates {
+                if let Some(run) = runs.get_mut(i) {
+                    run.counters = counters;
+                }
+            }
+            for i in finished_ids {
+                if let Some(run) = runs.get_mut(i) {
+                    run.finished = true;
+                    self.set_task_status(&run.name, "已完成");
+                }
+            }
+        }
+
+        for note in &finished_notes {
+            self.toast(note);
+        }
+        let all_done = {
+            let runs = self.runs.borrow();
+            runs.iter().all(|r| r.finished)
+        };
+        if all_done {
+            let total_valid = {
+                let runs = self.runs.borrow();
+                runs.iter().map(|r| r.counters.valid).sum::<usize>()
+            };
+            self.log("全部平台的扫描均已结束");
+            self.toast(&format!("全部扫描结束，共命中 {total_valid} 条有效 Key"));
+            self.finish_run();
+            self.refresh_resume_hint();
+        }
+
         for rec in new_records {
             let index = {
                 let mut records = self.valid_records.borrow_mut();
@@ -1435,36 +1843,67 @@ impl Inner {
     fn finish_run(&self) {
         self.running.set(false);
         self.paused.set(false);
-        *self.control.borrow_mut() = None;
-        *self.receiver.borrow_mut() = None;
+        self.runs.borrow_mut().clear();
         self.start_btn.set_sensitive(true);
         self.pause_btn.set_sensitive(false);
         self.pause_btn.set_label("暂停");
         self.stop_btn.set_sensitive(false);
     }
 
+    /// 汇总所有平台的进度。
     fn update_progress(&self) {
-        let total = self.total.get();
+        let runs = self.runs.borrow();
+        let total: usize = runs.iter().map(|r| r.total).sum();
+        let done: usize = runs
+            .iter()
+            .map(|r| (r.start_index + r.counters.tested).min(r.total))
+            .sum();
         if total == 0 {
             self.progress.set_fraction(0.0);
             self.progress.set_text(Some("0 / 0"));
             return;
         }
-        let done = (self.start_index.get() + self.counters.get().tested).min(total);
         let frac = done as f64 / total as f64;
         self.progress.set_fraction(frac);
         self.progress
             .set_text(Some(&format!("{:.1}% · {} / {}", frac * 100.0, format_count(done as u128), format_count(total as u128))));
+        // 同步每行状态
+        drop(runs);
+        let runs = self.runs.borrow();
+        for run in runs.iter() {
+            if run.finished {
+                continue;
+            }
+            let p = if run.total > 0 {
+                (run.start_index + run.counters.tested) as f64 / run.total as f64 * 100.0
+            } else {
+                100.0
+            };
+            self.set_task_status(
+                &run.name,
+                &format!("{:.0}% · {} / {}", p, format_count(run.counters.tested as u128), format_count(run.total as u128)),
+            );
+        }
     }
 
+    /// 汇总所有平台的统计。
     fn update_stats(&self) {
-        if !self.running.get() && self.counters.get().tested == 0 {
+        let runs = self.runs.borrow();
+        if runs.is_empty() {
             self.stat_label.set_text("尚未开始");
             return;
         }
-        let c = self.counters.get();
+        let mut c = Counters::default();
+        let mut total = 0usize;
+        let mut done = 0usize;
+        for run in runs.iter() {
+            c.add(&run.counters);
+            total += run.total;
+            done += (run.start_index + run.counters.tested).min(run.total);
+        }
         let mut text = format!(
-            "已测 {} · 有效 {} · 鉴权失败 {} · 限流 {} · 端点 404 {} · 服务端错误 {} · 其它 4xx {} · 网络错误 {}",
+            "{} 个平台 · 已测 {} · 有效 {} · 鉴权失败 {} · 限流 {} · 端点 404 {} · 服务端错误 {} · 其它 4xx {} · 网络错误 {}",
+            runs.len(),
             format_count(c.tested as u128),
             c.valid,
             c.unauthorized,
@@ -1478,7 +1917,7 @@ impl Inner {
             let secs = started.elapsed().as_secs();
             if secs > 0 && c.tested > 0 {
                 let rate = c.tested as f64 / secs as f64;
-                let remaining = (self.total.get().saturating_sub(self.start_index.get() + c.tested)) as f64;
+                let remaining = (total.saturating_sub(done)) as f64;
                 let eta = if rate > 0.0 {
                     duration_text((remaining / rate).ceil() as u64)
                 } else {
@@ -1557,7 +1996,7 @@ impl Inner {
     fn update_valid_count(&self) {
         let n = self.valid_records.borrow().len();
         self.valid_count
-            .set_text(&format!("共 {} 条 · 本地库：{:?}", n, store::valid_keys_path()));
+            .set_text(&format!("共 {} 条 · 本地库：{:?}", n, store::db_path()));
         self.valid_empty.set_visible(n == 0);
         self.valid_list.set_visible(n > 0);
     }
@@ -1655,20 +2094,33 @@ impl Inner {
             headers: Vec::new(),
             timeout: Duration::from_secs(self.timeout_row.value().max(1.0) as u64),
         };
+        let url = probe_util::join_url(&target.base_url, &target.endpoint);
+        let method = target.method().as_str();
 
         let slot: Arc<Mutex<Option<(crate::model::sniffer::ProbeOutcome, String, &'static str)>>> =
             Arc::new(Mutex::new(None));
         TEST_SLOT.with(|s| *s.borrow_mut() = Some(Arc::clone(&slot)));
 
-        std::thread::spawn(move || {
-            let agent = ureq::AgentBuilder::new().build();
-            let url = probe_util::join_url(&target.base_url, &target.endpoint);
-            let method = target.method().as_str();
-            let outcome = probe_util::probe(&agent, &target, &key);
+        // tokio 异步探测：不阻塞 UI，完成后回主线程更新结果
+        crate::utils::sniffer::runtime().spawn(async move {
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .build();
+            let outcome = match client {
+                Ok(c) => probe_util::probe(&c, &target, &key).await,
+                Err(e) => crate::model::sniffer::ProbeOutcome {
+                    verdict: Verdict::NetworkError,
+                    status: 0,
+                    status_text: String::new(),
+                    latency_ms: 0,
+                    body: String::new(),
+                    detail: format!("构建 HTTP 客户端失败：{e}"),
+                },
+            };
             if let Ok(mut guard) = slot.lock() {
                 *guard = Some((outcome, url, method));
             }
-            glib::source::idle_add(tick_test_done);
+            let _ = glib::source::idle_add(tick_test_done);
         });
     }
 
@@ -1698,9 +2150,10 @@ impl Inner {
 }
 
 thread_local! {
-    /// 后台字典生成的结果中转槽（放在 `Arc<Mutex<..>>` 里才能跨线程搬运）。
-    static GENERATE_SLOT: RefCell<Option<Arc<Mutex<Option<Result<crate::utils::sniffer::Dictionary, String>>>>>> =
-        RefCell::new(None);
+    /// 后台字典生成的结果中转槽（结果附带所属平台名；放在 `Arc<Mutex<..>>` 里才能跨线程搬运）。
+    static GENERATE_SLOT: RefCell<
+        Option<Arc<Mutex<Option<(String, Result<crate::utils::sniffer::Dictionary, String>)>>>>,
+    > = RefCell::new(None);
     /// 单次测试的结果中转槽：(探测结果, 实际请求的 URL, 请求方法)。
     static TEST_SLOT: RefCell<Option<Arc<Mutex<Option<(crate::model::sniffer::ProbeOutcome, String, &'static str)>>>>> =
         RefCell::new(None);

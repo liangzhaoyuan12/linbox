@@ -1,7 +1,8 @@
 //! OpenAI 兼容端点的探测（纯逻辑，无 GTK，可 `cargo test`）。
 //!
 //! 只做三件事：拼 URL、发一次 OpenAI 格式请求、按 HTTP 状态码给出判定。
-//! 网络 IO 使用阻塞式 `ureq`，因此**必须在后台线程调用**。
+//! 网络 IO 使用异步 `reqwest`，**必须在 tokio 运行时内调用**（页面与扫描引擎
+//! 共用 `utils::sniffer::runtime()` 提供的多线程运行时）。
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -148,40 +149,69 @@ fn detail_of(body: &str, fallback: &str) -> String {
 
 /// 对单个候选 Key 发起一次探测。
 ///
-/// `agent` 由调用方持有（每线程一个，复用连接）。
-pub fn probe(agent: &ureq::Agent, target: &ProbeTarget, key: &str) -> ProbeOutcome {
+/// `client` 由调用方持有（一次扫描共用一个连接池），reqwest 对 4xx/5xx
+/// 不会视为错误，因此任何 HTTP 状态都在 `Ok` 分支拿到响应。
+pub async fn probe(client: &reqwest::Client, target: &ProbeTarget, key: &str) -> ProbeOutcome {
     let url = join_url(&target.base_url, &target.endpoint);
     let body = chat_body(&target.model);
+    let method = target.method();
+    let req_method: reqwest::Method = match method {
+        ProbeMethod::Get => reqwest::Method::GET,
+        ProbeMethod::Post => reqwest::Method::POST,
+    };
 
-    let mut request = agent
-        .request(target.method().as_str(), &url)
+    let mut request = client
+        .request(req_method, &url)
         .timeout(target.timeout)
-        .set("Authorization", &format!("Bearer {key}"))
-        .set("Accept", "application/json");
-
-    if target.method() == ProbeMethod::Post {
-        request = request.set("Content-Type", "application/json");
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Accept", "application/json");
+    if method == ProbeMethod::Post {
+        request = request.header("Content-Type", "application/json");
     }
     for (k, v) in &target.headers {
         let k = k.trim();
         if k.is_empty() || k.eq_ignore_ascii_case("authorization") {
             continue; // 不允许覆盖鉴权头
         }
-        request = request.set(k, v.trim());
+        request = request.header(k, v.trim());
     }
 
     let started = Instant::now();
-    let outcome = if target.method() == ProbeMethod::Post {
-        request.send_string(&body)
+    let result = if method == ProbeMethod::Post {
+        request.body(body).send().await
     } else {
-        request.call()
+        request.send().await
     };
     let latency_ms = started.elapsed().as_millis() as u64;
 
-    match outcome {
-        Ok(response) => finish(response.status(), response.status_text().to_string(), response, latency_ms),
-        Err(ureq::Error::Status(code, response)) => {
-            finish(code, response.status_text().to_string(), response, latency_ms)
+    match result {
+        Ok(response) => {
+            let status = response.status();
+            let status_text = status
+                .canonical_reason()
+                .unwrap_or_default()
+                .to_string();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let body = response.text().await.unwrap_or_default();
+            let verdict = Verdict::from_status(status.as_u16());
+            let mut detail = detail_of(&body, &status_text);
+            if let Some(ra) = retry_after {
+                if !ra.trim().is_empty() {
+                    detail = format!("{detail}（Retry-After: {ra}）");
+                }
+            }
+            ProbeOutcome {
+                verdict,
+                status: status.as_u16(),
+                status_text,
+                latency_ms,
+                body: snippet_of(&body),
+                detail,
+            }
         }
         Err(other) => ProbeOutcome {
             verdict: Verdict::NetworkError,
@@ -191,31 +221,6 @@ pub fn probe(agent: &ureq::Agent, target: &ProbeTarget, key: &str) -> ProbeOutco
             body: String::new(),
             detail: format!("网络请求失败：{other}"),
         },
-    }
-}
-
-fn finish(
-    status: u16,
-    status_text: String,
-    response: ureq::Response,
-    latency_ms: u64,
-) -> ProbeOutcome {
-    let retry_after = response.header("retry-after").map(|s| s.to_string());
-    let body = response.into_string().unwrap_or_default();
-    let verdict = Verdict::from_status(status);
-    let mut detail = detail_of(&body, &status_text);
-    if let Some(ra) = retry_after {
-        if !ra.trim().is_empty() {
-            detail = format!("{detail}（Retry-After: {ra}）");
-        }
-    }
-    ProbeOutcome {
-        verdict,
-        status,
-        status_text,
-        latency_ms,
-        body: snippet_of(&body),
-        detail,
     }
 }
 

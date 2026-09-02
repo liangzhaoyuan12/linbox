@@ -1,12 +1,18 @@
 //! 并发扫描引擎（纯逻辑，无 GTK）。
 //!
-//! 职责：把候选 Key 字典分给 N 个工作线程，按限速逐个探测，把每条结果与
-//! 生命周期事件通过 `std::sync::mpsc` 送回调用方（页面层在主循环里排空队列）。
+//! 职责：把候选 Key 字典分给 N 个 tokio 工作任务，按限速逐个异步探测，
+//! 把每条结果与生命周期事件通过 `std::sync::mpsc` 送回调用方（页面层在
+//! 主循环里排空队列）。
 //!
 //! ## 并发模型
 //! - `cursor` 是无锁原子下标，谁抢到谁处理，天然负载均衡。
 //! - 限速用一把 `Mutex<Instant>` 做「令牌桶」：拿到锁后睡到下一个可发送时刻，
-//!   因此速率上限是**全局**的，而不是每线程各自一份。
+//!   因此速率上限是**全局**的，而不是每任务各自一份。
+//! - 网络 IO 是异步 `reqwest`，所有任务共享一个连接池（`reqwest::Client`）。
+//!
+//! ## 运行时
+//! 任务通过 [`super::runtime()`] 提供的全局多线程 tokio 运行时调度，
+//! 由页面（GTK 主线程）发起 `start()`，事件经 mpsc 异步回流。
 //!
 //! ## 断点续跑
 //! 并发会让完成顺序乱序，所以游标本身不能直接当断点。这里额外维护
@@ -87,23 +93,23 @@ pub struct ScanParams {
     pub fingerprint: String,
     /// 探测目标（不含 Key）。
     pub target: ProbeTarget,
-    /// 候选 Key 字典（生成一次后由所有线程共享）。
+    /// 候选 Key 字典（生成一次后由所有任务共享）。
     pub keys: Arc<Vec<String>>,
     /// 起始下标（断点续跑时 > 0）。
     pub start_index: usize,
-    /// 并发线程数。
+    /// 并发任务数。
     pub concurrency: usize,
     /// 每秒请求数；<= 0 表示不限速。
     pub rate_per_sec: f64,
     /// 网络错误 / 5xx / 429 的自动重试次数。
     pub retries: usize,
-    /// 命中即写入本地有效 Key 库。
+    /// 命中即写入本地有效 Key 库（SQLite）。
     pub persist_valid: bool,
     /// 是否写断点（关闭「断点续跑」时为 false）。
     pub write_checkpoint: bool,
 }
 
-/// 扫描控制句柄（发给工作线程的信号）。
+/// 扫描控制句柄（发给工作任务的信号）。
 pub struct Control {
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
@@ -121,7 +127,7 @@ impl Control {
     }
 }
 
-/// 工作线程共享的状态。
+/// 工作任务共享的状态。
 struct Shared {
     /// 下一个待分发下标。
     cursor: AtomicUsize,
@@ -133,7 +139,7 @@ struct Shared {
     valid: AtomicUsize,
     /// 上次写断点时的 completed 值。
     last_checkpoint: AtomicUsize,
-    /// 存活线程数，最后一个退出的线程负责收尾。
+    /// 存活任务数，最后一个退出的任务负责收尾。
     alive: AtomicUsize,
     /// 限速器：下一次允许发送请求的时刻。
     limiter: Mutex<Instant>,
@@ -141,12 +147,14 @@ struct Shared {
     pause: Arc<AtomicBool>,
 }
 
-/// 线程间传递的只读上下文。
+/// 异步任务间传递的只读上下文。
 struct Ctx {
     params: ScanParams,
     shared: Arc<Shared>,
     /// 两次请求之间至少间隔多久（0 表示不限速）。
     interval: Duration,
+    /// 共享的 HTTP 连接池（所有任务复用）。
+    client: reqwest::Client,
 }
 
 /// 启动扫描，立即返回控制句柄。
@@ -181,24 +189,29 @@ pub fn start(params: ScanParams, tx: Sender<ScanEvent>) -> Control {
 
     let _ = tx.send(ScanEvent::Started { total, start_index });
 
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .expect("构建异步 HTTP 客户端失败");
     let ctx = Arc::new(Ctx {
         params: ScanParams { start_index, ..params },
         shared: Arc::clone(&shared),
         interval,
+        client,
     });
 
     for _ in 0..concurrency {
         let ctx = Arc::clone(&ctx);
         let tx = tx.clone();
-        std::thread::spawn(move || worker(&ctx, &tx));
+        super::runtime().spawn(async move {
+            worker(ctx, tx).await;
+        });
     }
 
     control
 }
 
-fn worker(ctx: &Arc<Ctx>, tx: &Sender<ScanEvent>) {
-    // 每个线程一个 Agent，复用连接；避免在线程间共享 ureq 客户端
-    let agent = ureq::AgentBuilder::new().build();
+async fn worker(ctx: Arc<Ctx>, tx: Sender<ScanEvent>) {
     let keys = &ctx.params.keys;
 
     loop {
@@ -206,8 +219,9 @@ fn worker(ctx: &Arc<Ctx>, tx: &Sender<ScanEvent>) {
             break;
         }
         // 暂停：轮询等待，期间仍可被 stop 打断
-        while ctx.shared.pause.load(Ordering::Relaxed) && !ctx.shared.stop.load(Ordering::Relaxed) {
-            std::thread::sleep(PAUSE_POLL);
+        while ctx.shared.pause.load(Ordering::Relaxed) && !ctx.shared.stop.load(Ordering::Relaxed)
+        {
+            tokio::time::sleep(PAUSE_POLL).await;
         }
         if ctx.shared.stop.load(Ordering::Relaxed) {
             break;
@@ -222,11 +236,11 @@ fn worker(ctx: &Arc<Ctx>, tx: &Sender<ScanEvent>) {
             inflight.push(index);
         }
 
-        throttle(&ctx.shared.limiter, ctx.interval);
+        throttle(&ctx.shared.limiter, ctx.interval).await;
 
         let key = keys[index].clone();
         let started = Instant::now();
-        let mut outcome = probe::probe(&agent, &ctx.params.target, &key);
+        let mut outcome = probe::probe(&ctx.client, &ctx.params.target, &key).await;
         let mut attempts = 0usize;
         while attempts < ctx.params.retries && outcome.verdict.retryable() {
             attempts += 1;
@@ -243,8 +257,8 @@ fn worker(ctx: &Arc<Ctx>, tx: &Sender<ScanEvent>) {
                 backoff.as_millis(),
                 attempts
             )));
-            std::thread::sleep(backoff);
-            outcome = probe::probe(&agent, &ctx.params.target, &key);
+            tokio::time::sleep(backoff).await;
+            outcome = probe::probe(&ctx.client, &ctx.params.target, &key).await;
         }
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
@@ -262,8 +276,9 @@ fn worker(ctx: &Arc<Ctx>, tx: &Sender<ScanEvent>) {
                     found_at: probe::now_unix(),
                     snippet: outcome.body.clone(),
                 };
-                if let Err(e) = store::append_valid(&record) {
-                    let _ = tx.send(ScanEvent::Log(format!("命中记录落盘失败：{e}")));
+                // 异步写 SQLite（UNIQUE 约束天然去重）
+                if let Err(e) = store::append_valid(&record).await {
+                    let _ = tx.send(ScanEvent::Log(format!("命中记录落库失败：{e}")));
                 }
             }
         }
@@ -285,13 +300,13 @@ fn worker(ctx: &Arc<Ctx>, tx: &Sender<ScanEvent>) {
         if ctx.params.write_checkpoint
             && completed - ctx.shared.last_checkpoint.load(Ordering::Relaxed) >= CHECKPOINT_EVERY
         {
-            write_checkpoint(ctx);
+            write_checkpoint(&ctx).await;
         }
     }
 
-    // 最后一个退出的线程负责收尾
+    // 最后一个退出的任务负责收尾
     if ctx.shared.alive.fetch_sub(1, Ordering::AcqRel) == 1 {
-        write_checkpoint(ctx);
+        write_checkpoint(&ctx).await;
         let reason = if ctx.shared.stop.load(Ordering::Relaxed) {
             StopReason::Stopped
         } else {
@@ -306,20 +321,25 @@ fn worker(ctx: &Arc<Ctx>, tx: &Sender<ScanEvent>) {
 }
 
 /// 全局限速：保证任意两次请求之间至少间隔 `interval`。
-fn throttle(limiter: &Mutex<Instant>, interval: Duration) {
+async fn throttle(limiter: &Mutex<Instant>, interval: Duration) {
     if interval.is_zero() {
         return;
     }
-    let mut next = limiter.lock().unwrap();
-    let now = Instant::now();
-    if *next > now {
-        std::thread::sleep(*next - now);
+    // 锁的作用域在 await 前结束，避免 MutexGuard 越过 .await（非 Send）
+    let sleep_for;
+    {
+        let mut next = limiter.lock().unwrap();
+        let now = Instant::now();
+        sleep_for = if *next > now { Some(*next - now) } else { None };
+        *next = std::cmp::max(now, *next) + interval;
     }
-    *next = std::cmp::max(now, *next) + interval;
+    if let Some(d) = sleep_for {
+        tokio::time::sleep(d).await;
+    }
 }
 
 /// 写入断点：位置取「在途下标的最小值」，保证之前的候选都已处理。
-fn write_checkpoint(ctx: &Ctx) {
+async fn write_checkpoint(ctx: &Ctx) {
     let cursor = {
         let inflight = ctx.shared.inflight.lock().unwrap();
         inflight
@@ -356,40 +376,26 @@ pub fn is_retryable(v: Verdict) -> bool {
 mod tests {
     use super::*;
 
-    fn ctx_for_test(interval_ms: u64) -> (Arc<Mutex<Instant>>, Duration) {
-        (
-            Arc::new(Mutex::new(Instant::now())),
-            Duration::from_millis(interval_ms),
-        )
-    }
-
-    #[test]
-    fn throttle_spaces_requests() {
+    #[tokio::test]
+    async fn throttle_spaces_requests() {
         let limiter = Mutex::new(Instant::now());
         let interval = Duration::from_millis(30);
         let start = Instant::now();
         for _ in 0..4 {
-            throttle(&limiter, interval);
+            throttle(&limiter, interval).await;
         }
         // 4 次请求 → 至少 3 个间隔
         assert!(start.elapsed() >= Duration::from_millis(90));
     }
 
-    #[test]
-    fn zero_interval_does_not_sleep() {
+    #[tokio::test]
+    async fn zero_interval_does_not_sleep() {
         let limiter = Mutex::new(Instant::now());
         let start = Instant::now();
         for _ in 0..200 {
-            throttle(&limiter, Duration::ZERO);
+            throttle(&limiter, Duration::ZERO).await;
         }
         assert!(start.elapsed() < Duration::from_millis(200));
-    }
-
-    #[test]
-    fn helper_ctx_shape() {
-        let (limiter, interval) = ctx_for_test(10);
-        assert_eq!(interval, Duration::from_millis(10));
-        assert!(limiter.lock().unwrap().elapsed() < Duration::from_secs(5));
     }
 
     /// 起一个极简 HTTP 服务器：只有 `sk-good` 返回 200，其余返回 401。
