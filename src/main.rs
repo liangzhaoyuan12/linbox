@@ -17,6 +17,7 @@ const PAGE_APIKEY: &str = "apikey";
 const PAGE_FCITX: &str = "fcitx";
 const PAGE_PATHSCANNER: &str = "pathscanner";
 const PAGE_ARCHCRACKER: &str = "archivecracker";
+const PAGE_PORTSCANNER: &str = "portscanner";
 const PAGE_SETTINGS: &str = "settings";
 
 fn main() -> glib::ExitCode {
@@ -31,6 +32,7 @@ fn main() -> glib::ExitCode {
         page::fcitx_fix::shutdown();
         page::path_scanner::shutdown();
         page::archive_cracker::shutdown();
+        page::port_scanner::shutdown();
     });
     app.run()
 }
@@ -105,19 +107,24 @@ fn build_ui(app: &adw::Application) {
     // 灰色占位。改用 ListBox 的 header 机制：header 不是行，没有背景、悬停和选中态，
     // 只画一条真正的分隔线。
     sidebar.set_header_func(|row, before| {
-        let needs_separator = before.map(|b| b.widget_name() == PAGE_HOME).unwrap_or(false);
-        if !needs_separator {
+        // 首页后面画分隔线
+        let after_home = before
+            .map(|b| b.widget_name() == PAGE_HOME)
+            .unwrap_or(false);
+        // 设置项前面画分隔线
+        let before_settings = row.widget_name() == PAGE_SETTINGS;
+
+        if after_home || before_settings {
+            if row.header().is_none() {
+                let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+                separator.set_margin_top(6);
+                separator.set_margin_bottom(6);
+                separator.set_margin_start(12);
+                separator.set_margin_end(12);
+                row.set_header(Some(&separator));
+            }
+        } else {
             row.set_header(None::<&gtk::Widget>);
-            return;
-        }
-        // header_func 会被反复调用，已设置过就不要再建新的
-        if row.header().is_none() {
-            let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
-            separator.set_margin_top(6);
-            separator.set_margin_bottom(6);
-            separator.set_margin_start(12);
-            separator.set_margin_end(12);
-            row.set_header(Some(&separator));
         }
     });
 
@@ -179,6 +186,16 @@ fn build_ui(app: &adw::Application) {
         "changes-prevent-symbolic",
         "压缩包爆破",
         page::archive_cracker::build().widget(),
+    );
+
+    // 端口扫描与服务识别页面（真实功能页）
+    add_nav_item(
+        &sidebar,
+        &stack,
+        PAGE_PORTSCANNER,
+        "network-transmit-receive-symbolic",
+        "端口扫描",
+        page::port_scanner::build().widget(),
     );
 
     let settings_page = adw::StatusPage::new();
