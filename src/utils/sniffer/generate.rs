@@ -1032,6 +1032,38 @@ mod tests {
         assert!(long < keys);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn release_unused_memory_returns_rss_after_big_dict() {
+        // 验证：生成 100 万条字典 → drop → malloc_trim 后 RSS 明显回落
+        fn rss_mb() -> u64 {
+            let text = std::fs::read_to_string("/proc/self/status").unwrap();
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    return rest.trim().trim_end_matches("kB").trim().parse().unwrap();
+                }
+            }
+            0
+        }
+        let opts = GenerateOptions {
+            max_results: 1_000_000,
+            random_sample: true,
+            seed: 7,
+            ..GenerateOptions::default()
+        };
+        let dict = generate(r"sk-[a-f0-9]{12}", &opts).unwrap();
+        assert_eq!(dict.keys.len(), 1_000_000);
+        let peak = rss_mb();
+        drop(dict);
+        crate::utils::sniffer::release_unused_memory();
+        let after = rss_mb();
+        // 1M 条字典约 80-100 MB；trim 后应明显回落（宽松断言 ≥ 30 MB 差）
+        assert!(
+            peak.saturating_sub(after) >= 30,
+            "peak={peak} MB, after={after} MB（回落不足）"
+        );
+    }
+
     #[test]
     fn huge_max_results_refused_instead_of_oom() {
         // 复现崩溃场景：150 万亿的「最大生成条数」曾导致一次性申请

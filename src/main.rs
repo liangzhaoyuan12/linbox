@@ -21,6 +21,13 @@ fn main() -> glib::ExitCode {
     // adw::Application 会自动初始化 libadwaita；主题默认「跟随系统」
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
+    // 退出前清空各页全局 TLS 句柄：窗口销毁期的 GTK 回调会反查这些句柄，
+    // 拖到线程 TLS 析构阶段再碰会 panic（AccessError），并可能让退出不干净。
+    app.connect_shutdown(|_| {
+        page::api_key_sniffer::shutdown();
+        page::media_converter::shutdown();
+        page::fcitx_fix::shutdown();
+    });
     app.run()
 }
 

@@ -36,6 +36,25 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// 把进程内已释放的空闲内存归还给操作系统（Linux glibc `malloc_trim`）。
+///
+/// Rust 默认用 glibc malloc：数百万条 String 的小块分配在 `free` 之后仍留在
+/// arena 里供复用，进程的 RSS 不会下降（`htop`/`free` 看着"内存没释放"）。
+/// 一轮扫描结束（字典已 drop）后调用一次，可把空闲 arena 块还给内核。
+#[cfg(target_os = "linux")]
+pub fn release_unused_memory() {
+    // malloc_trim 只在 glibc 可用；musl / 非 Linux 直接跳过。
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn release_unused_memory() {}
+
 // 统一在本模块重导出，页面层只需 `use crate::utils::sniffer::{...}`。
 // 作为本模块对外的完整 API 面，部分符号暂未被当前页面用到，故关掉未使用告警。
 #[allow(unused_imports)]

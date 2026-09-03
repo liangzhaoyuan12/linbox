@@ -970,11 +970,23 @@ thread_local! {
     static INNER: std::cell::RefCell<Option<Rc<Inner>>> = std::cell::RefCell::new(None);
 }
 
+/// 应用退出前调用：清空全局句柄，避免窗口销毁期的 GTK 回调访问正在析构的 TLS。
+pub fn shutdown() {
+    INNER.with(|i| {
+        if let Ok(mut b) = i.try_borrow_mut() {
+            *b = None;
+        }
+    });
+}
+
 /// 在闭包无法安全捕获 `Rc<Inner>`（signal 回调要求 `Send`）时，从全局句柄读取页面实例。
 fn with_inner<F: FnOnce(&Inner)>(f: F) {
-    if let Some(inner) = INNER.with(|i| i.borrow().clone()) {
-        f(&*inner);
-    }
+    // try_borrow：窗口销毁期控件 notify 会重入本函数（INNER 正被 shutdown
+    // 的可变借用持有），此时静默跳过而不是 RefCell 重入 panic。
+    let Some(inner) = INNER.with(|i| i.try_borrow().ok().and_then(|b| b.clone())) else {
+        return;
+    };
+    f(&*inner);
 }
 
 /// 把 gio::File 列表（ListModel）解析为路径字符串列表。

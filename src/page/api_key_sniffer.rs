@@ -766,9 +766,12 @@ thread_local! {
 }
 
 fn with_inner<F: FnOnce(&Inner)>(f: F) {
-    if let Some(inner) = INNER.with(|i| i.borrow().clone()) {
-        f(&*inner);
-    }
+    // try_borrow：窗口销毁期控件 notify 会重入本函数（INNER 正被 shutdown
+    // 的可变借用持有），此时静默跳过而不是 RefCell 重入 panic。
+    let Some(inner) = INNER.with(|i| i.try_borrow().ok().and_then(|b| b.clone())) else {
+        return;
+    };
+    f(&*inner);
 }
 
 fn g_select_platform(name: String) {
@@ -1979,6 +1982,12 @@ impl Inner {
         self.progress.set_fraction(0.0);
         self.progress.set_text(Some("0 / 0"));
         self.stat_label.set_text("就绪");
+        // 引擎 worker 全部退出后字典 Arc 才真正 drop；延迟一拍再把空闲内存
+        // 归还给操作系统（否则 RSS 看着"内存没释放"，实际是 glibc arena 保留）
+        glib::source::timeout_add(Duration::from_millis(300), || {
+            crate::utils::sniffer::release_unused_memory();
+            glib::ControlFlow::Break
+        });
     }
 
     /// 汇总所有平台的进度。
@@ -2278,6 +2287,25 @@ impl Inner {
         ));
         set_buffer_text(&self.t_body_view.buffer(), &outcome.body);
     }
+}
+
+/// 应用退出前调用：清空全局句柄，避免窗口销毁期的 GTK 回调访问正在析构的 TLS。
+pub fn shutdown() {
+    INNER.with(|i| {
+        if let Ok(mut b) = i.try_borrow_mut() {
+            *b = None;
+        }
+    });
+    GENERATE_SLOT.with(|s| {
+        if let Ok(mut b) = s.try_borrow_mut() {
+            *b = None;
+        }
+    });
+    TEST_SLOT.with(|s| {
+        if let Ok(mut b) = s.try_borrow_mut() {
+            *b = None;
+        }
+    });
 }
 
 thread_local! {
