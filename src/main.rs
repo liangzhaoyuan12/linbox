@@ -15,6 +15,8 @@ const PAGE_JSON: &str = "json";
 const PAGE_MEDIA: &str = "media";
 const PAGE_APIKEY: &str = "apikey";
 const PAGE_FCITX: &str = "fcitx";
+const PAGE_PATHSCANNER: &str = "pathscanner";
+const PAGE_ARCHCRACKER: &str = "archivecracker";
 const PAGE_SETTINGS: &str = "settings";
 
 fn main() -> glib::ExitCode {
@@ -27,6 +29,8 @@ fn main() -> glib::ExitCode {
         page::api_key_sniffer::shutdown();
         page::media_converter::shutdown();
         page::fcitx_fix::shutdown();
+        page::path_scanner::shutdown();
+        page::archive_cracker::shutdown();
     });
     app.run()
 }
@@ -122,7 +126,7 @@ fn build_ui(app: &adw::Application) {
         &sidebar,
         &stack,
         PAGE_JSON,
-        "code-symbolic",
+        "accessories-text-editor-symbolic",
         "JSON 解析",
         page::json_parser::build().widget(),
     );
@@ -155,6 +159,26 @@ fn build_ui(app: &adw::Application) {
         "input-keyboard-symbolic",
         "输入法修复",
         page::fcitx_fix::build().widget(),
+    );
+
+    // 路径扫描页面（真实功能页）
+    add_nav_item(
+        &sidebar,
+        &stack,
+        PAGE_PATHSCANNER,
+        "system-search-symbolic",
+        "域名/IP 路径扫描",
+        page::path_scanner::build().widget(),
+    );
+
+    // 压缩包密码爆破页面（真实功能页）
+    add_nav_item(
+        &sidebar,
+        &stack,
+        PAGE_ARCHCRACKER,
+        "changes-prevent-symbolic",
+        "压缩包爆破",
+        page::archive_cracker::build().widget(),
     );
 
     let settings_page = adw::StatusPage::new();
