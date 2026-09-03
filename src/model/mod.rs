@@ -7,10 +7,12 @@ pub mod archive_cracker;
 pub mod imfix;
 pub mod media;
 pub mod path_scanner;
+pub mod port_scanner;
 pub mod sniffer;
 
 pub use archive_cracker::*;
 pub use imfix::*;
 pub use media::*;
 pub use path_scanner::*;
+pub use port_scanner::*;
 pub use sniffer::*;
