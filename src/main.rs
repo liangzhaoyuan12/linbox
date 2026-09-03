@@ -81,16 +81,53 @@ fn build_ui(app: &adw::Application) {
     toolbar.add_top_bar(&header);
 
     // ---------- 左侧主菜单（侧边栏） ----------
-    let sidebar = gtk::ListBox::new();
-    sidebar.set_selection_mode(gtk::SelectionMode::Single);
-    sidebar.set_activate_on_single_click(true); // 单击即触发导航
+    // 结构：Box = [固定首页] + [分隔线] + [可滚动功能页] + [分隔线] + [固定设置]
+    let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar.set_margin_top(8);
     sidebar.set_margin_bottom(8);
     sidebar.add_css_class("navigation-sidebar");
 
+    // 顶部：固定首页
+    let home_list = gtk::ListBox::new();
+    home_list.set_selection_mode(gtk::SelectionMode::Single);
+    home_list.set_activate_on_single_click(true);
+    home_list.add_css_class("navigation-sidebar");
+    sidebar.append(&home_list);
+
+    // 分隔线
+    let sep_top = gtk::Separator::new(gtk::Orientation::Horizontal);
+    sep_top.set_margin_start(12);
+    sep_top.set_margin_end(12);
+    sidebar.append(&sep_top);
+
+    // 中部：可滚动功能页
+    let nav_list = gtk::ListBox::new();
+    nav_list.set_selection_mode(gtk::SelectionMode::Single);
+    nav_list.set_activate_on_single_click(true);
+    nav_list.add_css_class("navigation-sidebar");
+
+    let nav_scroll = gtk::ScrolledWindow::new();
+    nav_scroll.set_child(Some(&nav_list));
+    nav_scroll.set_vexpand(true);
+    nav_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    sidebar.append(&nav_scroll);
+
+    // 分隔线
+    let sep_bottom = gtk::Separator::new(gtk::Orientation::Horizontal);
+    sep_bottom.set_margin_start(12);
+    sep_bottom.set_margin_end(12);
+    sidebar.append(&sep_bottom);
+
+    // 底部：固定设置
+    let settings_list = gtk::ListBox::new();
+    settings_list.set_selection_mode(gtk::SelectionMode::Single);
+    settings_list.set_activate_on_single_click(true);
+    settings_list.add_css_class("navigation-sidebar");
+    sidebar.append(&settings_list);
+
     // ---------- 右侧内容区 ----------
     let stack = gtk::Stack::new();
-    stack.set_transition_type(gtk::StackTransitionType::Crossfade); // 规范 §6.2：250ms 淡入淡出
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
     stack.set_transition_duration(250);
 
     // 注册页面 + 侧边栏条目
@@ -98,39 +135,11 @@ fn build_ui(app: &adw::Application) {
     home_page.set_title("首页");
     home_page.set_icon_name(Some("user-home-symbolic"));
     home_page.set_description(Some("欢迎使用 linbox"));
-    add_nav_item(&sidebar, &stack, PAGE_HOME, "user-home-symbolic", "首页", &home_page);
-
-    // 分组分隔线：在「首页」之后画一条细线。
-    //
-    // 之前是在 ListBox 里追加一个装着 Separator 的 ListBoxRow，但 navigation-sidebar
-    // 样式的行自带最小高度与背景，那条 Separator 只占 1px，剩下的行高就露出一块
-    // 灰色占位。改用 ListBox 的 header 机制：header 不是行，没有背景、悬停和选中态，
-    // 只画一条真正的分隔线。
-    sidebar.set_header_func(|row, before| {
-        // 首页后面画分隔线
-        let after_home = before
-            .map(|b| b.widget_name() == PAGE_HOME)
-            .unwrap_or(false);
-        // 设置项前面画分隔线
-        let before_settings = row.widget_name() == PAGE_SETTINGS;
-
-        if after_home || before_settings {
-            if row.header().is_none() {
-                let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
-                separator.set_margin_top(6);
-                separator.set_margin_bottom(6);
-                separator.set_margin_start(12);
-                separator.set_margin_end(12);
-                row.set_header(Some(&separator));
-            }
-        } else {
-            row.set_header(None::<&gtk::Widget>);
-        }
-    });
+    add_nav_item(&home_list, &stack, PAGE_HOME, "user-home-symbolic", "首页", &home_page);
 
     // JSON 解析页面（真实功能页）
     add_nav_item(
-        &sidebar,
+        &nav_list,
         &stack,
         PAGE_JSON,
         "accessories-text-editor-symbolic",
@@ -140,7 +149,7 @@ fn build_ui(app: &adw::Application) {
 
     // 音视频 / 图片转换页面（真实功能页）
     add_nav_item(
-        &sidebar,
+        &nav_list,
         &stack,
         PAGE_MEDIA,
         "video-x-generic-symbolic",
@@ -150,7 +159,7 @@ fn build_ui(app: &adw::Application) {
 
     // API Key 嗅探页面（真实功能页）
     add_nav_item(
-        &sidebar,
+        &nav_list,
         &stack,
         PAGE_APIKEY,
         "dialog-password-symbolic",
@@ -160,7 +169,7 @@ fn build_ui(app: &adw::Application) {
 
     // 输入法修复页面（fcitx5 / Wayland）（真实功能页）
     add_nav_item(
-        &sidebar,
+        &nav_list,
         &stack,
         PAGE_FCITX,
         "input-keyboard-symbolic",
@@ -170,7 +179,7 @@ fn build_ui(app: &adw::Application) {
 
     // 路径扫描页面（真实功能页）
     add_nav_item(
-        &sidebar,
+        &nav_list,
         &stack,
         PAGE_PATHSCANNER,
         "system-search-symbolic",
@@ -180,7 +189,7 @@ fn build_ui(app: &adw::Application) {
 
     // 压缩包密码爆破页面（真实功能页）
     add_nav_item(
-        &sidebar,
+        &nav_list,
         &stack,
         PAGE_ARCHCRACKER,
         "changes-prevent-symbolic",
@@ -190,7 +199,7 @@ fn build_ui(app: &adw::Application) {
 
     // 端口扫描与服务识别页面（真实功能页）
     add_nav_item(
-        &sidebar,
+        &nav_list,
         &stack,
         PAGE_PORTSCANNER,
         "network-transmit-receive-symbolic",
@@ -198,27 +207,63 @@ fn build_ui(app: &adw::Application) {
         page::port_scanner::build().widget(),
     );
 
+    // 设置项：固定在底部
     let settings_page = adw::StatusPage::new();
     settings_page.set_title("设置");
     settings_page.set_icon_name(Some("preferences-system-symbolic"));
     settings_page.set_description(Some("此页面尚未实现"));
-    add_nav_item(&sidebar, &stack, PAGE_SETTINGS, "preferences-system-symbolic", "设置", &settings_page);
+    add_nav_item(
+        &settings_list,
+        &stack,
+        PAGE_SETTINGS,
+        "preferences-system-symbolic",
+        "设置",
+        &settings_page,
+    );
 
-    // 条目被激活（鼠标单击 或 键盘 Enter/Space）→ 切换到对应内容页。
-    //
-    // 注意：这里必须连接 GtkListBox 的 `row-activated`，而不是 GtkListBoxRow 的
-    // `activate`。后者是键盘绑定信号（keybinding signal），只有按 Enter/Space 时
-    // 才会发射；鼠标单击只会触发 `row-activated`，因此原来点击菜单没有任何反应。
-    sidebar.connect_row_activated(clone!(#[weak] stack, move |_, row| {
+    // 三个 ListBox 互斥选中：选中一行时取消另外两个 ListBox 的选中
+    let home_list_c = home_list.clone();
+    let nav_list_c = nav_list.clone();
+    let settings_list_c = settings_list.clone();
+    home_list.connect_row_selected(move |_, row| {
+        if row.is_some() {
+            nav_list_c.unselect_all();
+            settings_list_c.unselect_all();
+        }
+    });
+    let home_list_c2 = home_list.clone();
+    let nav_list_c2 = nav_list.clone();
+    let settings_list_c2 = settings_list.clone();
+    nav_list.connect_row_selected(move |_, row| {
+        if row.is_some() {
+            home_list_c2.unselect_all();
+            settings_list_c2.unselect_all();
+        }
+    });
+    let home_list_c3 = home_list.clone();
+    let nav_list_c3 = nav_list.clone();
+    settings_list.connect_row_selected(move |_, row| {
+        if row.is_some() {
+            home_list_c3.unselect_all();
+            nav_list_c3.unselect_all();
+        }
+    });
+
+    // 条目被激活 → 切换到对应内容页
+    let stack_clone = stack.clone();
+    let handler = move |_: &gtk::ListBox, row: &gtk::ListBoxRow| {
         let name = row.widget_name();
         if !name.is_empty() {
-            stack.set_visible_child_name(&name);
+            stack_clone.set_visible_child_name(&name);
         }
-    }));
+    };
+    home_list.connect_row_activated(handler.clone());
+    nav_list.connect_row_activated(handler.clone());
+    settings_list.connect_row_activated(handler);
 
     // 默认选中首页
-    if let Some(first) = sidebar.row_at_index(0) {
-        sidebar.select_row(Some(&first));
+    if let Some(first) = home_list.row_at_index(0) {
+        home_list.select_row(Some(&first));
         stack.set_visible_child_name(PAGE_HOME);
     }
 
