@@ -135,3 +135,29 @@ pub fn apply(report: &ImfixReport) -> Result<usize, String> {
     write_env_as_root(&new_content)?;
     Ok(report.missing.len())
 }
+
+/// 重启 fcitx5（`fcitx5 -rd`：`-r` 重启 / 启动、`-d` 作为守护进程运行）。
+///
+/// 不需要 root 权限。
+///
+/// 关键：**不能**用 `.output()` / 捕获 stdout/stderr —— `fcitx5 -rd` 守护化后
+/// 新实例会继承管道 fd，导致等待 EOF 永远不返回（UI 冻结）。因此直接丢弃
+/// 输出、仅 `status()` 等待父进程退出（守护化后父进程立即退出）。
+pub fn restart_fcitx5() -> Result<String, String> {
+    use std::process::{Command, Stdio};
+
+    let status = Command::new("fcitx5")
+        .arg("-rd")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("无法启动 fcitx5：{e}（请确认已安装）"))?;
+
+    if !status.success() {
+        return Err(format!(
+            "fcitx5 -rd 退出码 {}",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok("fcitx5 -rd 已执行，输入法进程已重启。".to_string())
+}

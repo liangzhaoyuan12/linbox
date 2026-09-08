@@ -71,14 +71,6 @@ pub fn build() -> FcitxFixPage {
     title.set_halign(gtk::Align::Start);
     root_box.append(&title);
 
-    let subtitle = gtk::Label::new(Some(
-        "修复 fcitx5 在 Wayland 下因 /etc/environment 缺少输入法环境变量，导致部分窗口（GTK / Qt / SDL / GLFW 等）无法使用输入法的问题。",
-    ));
-    subtitle.add_css_class("dim-label");
-    subtitle.set_halign(gtk::Align::Start);
-    subtitle.set_wrap(true);
-    root_box.append(&subtitle);
-
     // ---------- 检测状态卡片 ----------
     let (status_card, status_content) = card();
     root_box.append(&status_card);
@@ -88,13 +80,6 @@ pub fn build() -> FcitxFixPage {
     fcitx_label.set_selectable(true);
     fcitx_label.set_wrap(true);
     status_content.append(&fcitx_label);
-
-    let env_label = gtk::Label::new(Some("/etc/environment 配置：检测中…"));
-    env_label.set_halign(gtk::Align::Start);
-    env_label.set_selectable(true);
-    env_label.set_wrap(true);
-    env_label.set_margin_top(6);
-    status_content.append(&env_label);
 
     let detail_label = gtk::Label::new(Some(""));
     detail_label.add_css_class("dim-label");
@@ -112,10 +97,26 @@ pub fn build() -> FcitxFixPage {
     let (fix_card, fix_content) = card();
     root_box.append(&fix_card);
 
-    let fix_title = gtk::Label::new(Some("修复"));
+    let fix_title = gtk::Label::new(Some("修复环境变量"));
     fix_title.add_css_class("title-4");
     fix_title.set_halign(gtk::Align::Start);
     fix_content.append(&fix_title);
+
+    let subtitle = gtk::Label::new(Some(
+        "修复 fcitx5 在 Wayland 下因 /etc/environment 缺少输入法环境变量，导致部分窗口（GTK / Qt / SDL / GLFW 等）无法使用输入法的问题。",
+    ));
+    subtitle.add_css_class("dim-label");
+    subtitle.set_halign(gtk::Align::Start);
+    subtitle.set_wrap(true);
+    subtitle.set_margin_top(2);
+    fix_content.append(&subtitle);
+
+    let env_label = gtk::Label::new(Some("/etc/environment 配置：检测中…"));
+    env_label.set_halign(gtk::Align::Start);
+    env_label.set_selectable(true);
+    env_label.set_wrap(true);
+    env_label.set_margin_top(6);
+    fix_content.append(&env_label);
 
     let fix_hint = gtk::Label::new(Some(
         "需要 root 权限，通过 pkexec 提权写入 /etc/environment（不会删除文件原有内容）。",
@@ -138,6 +139,36 @@ pub fn build() -> FcitxFixPage {
     fix_button.set_margin_top(6);
     fix_content.append(&fix_button);
 
+    // ---------- 重启卡片 ----------
+    let (restart_card, restart_content) = card();
+    root_box.append(&restart_card);
+
+    let restart_title = gtk::Label::new(Some("重启 fcitx5"));
+    restart_title.add_css_class("title-4");
+    restart_title.set_halign(gtk::Align::Start);
+    restart_content.append(&restart_title);
+
+    let restart_hint = gtk::Label::new(Some(
+        "环境变量写入后需重启输入法进程才生效。点击下方按钮执行「fcitx5 -rd」（-r 重启、-d 后台运行），无需 root 权限。",
+    ));
+    restart_hint.add_css_class("dim-label");
+    restart_hint.set_halign(gtk::Align::Start);
+    restart_hint.set_wrap(true);
+    restart_hint.set_margin_top(2);
+    restart_content.append(&restart_hint);
+
+    let restart_result_label = gtk::Label::new(Some("尚未执行重启。"));
+    restart_result_label.set_halign(gtk::Align::Start);
+    restart_result_label.set_wrap(true);
+    restart_result_label.set_selectable(true);
+    restart_result_label.set_margin_top(6);
+    restart_content.append(&restart_result_label);
+
+    let restart_button = gtk::Button::with_label("重启 fcitx5（fcitx5 -rd）");
+    restart_button.set_halign(gtk::Align::Start);
+    restart_button.set_margin_top(6);
+    restart_content.append(&restart_button);
+
     // ---------- 组装内部状态 ----------
     let inner = Rc::new(Inner {
         toast_overlay: toast_overlay.clone(),
@@ -147,6 +178,8 @@ pub fn build() -> FcitxFixPage {
         status_label,
         fix_button,
         detect_button,
+        restart_button,
+        restart_result_label,
         report: RefCell::new(ImfixReport::default()),
     });
 
@@ -163,6 +196,13 @@ pub fn build() -> FcitxFixPage {
         inner
             .fix_button
             .connect_clicked(clone!(#[strong] inner, move |_| apply_fix(&inner)));
+    }
+    // 重启按钮
+    {
+        let inner = Rc::clone(&inner);
+        inner
+            .restart_button
+            .connect_clicked(clone!(#[strong] inner, move |_| restart_fcitx(&inner)));
     }
 
     // 注册全局强引用：子线程的 idle 回调通过它回主线程刷新 UI。
@@ -186,6 +226,8 @@ struct Inner {
     status_label: gtk::Label,
     fix_button: gtk::Button,
     detect_button: gtk::Button,
+    restart_button: gtk::Button,
+    restart_result_label: gtk::Label,
     /// 最近一次检测结论（数据来自 `model::imfix`）。
     report: RefCell<ImfixReport>,
 }
@@ -231,6 +273,9 @@ impl Inner {
             ));
             self.fix_button.set_sensitive(true);
         }
+
+        // 重启按钮仅在有 fcitx5 时可用（检测完成前保持禁用）。
+        self.restart_button.set_sensitive(det.fcitx_installed);
     }
 }
 
@@ -316,11 +361,51 @@ fn apply_fix(inner: &Rc<Inner>) {
     });
 }
 
+/// 在后台线程调用 `utils::imfix::restart_fcitx5()`（`fcitx5 -rd`），再回主线程刷新。
+fn restart_fcitx(inner: &Rc<Inner>) {
+    let installed = inner.report.borrow().fcitx_installed;
+    if !installed {
+        inner.toast("未检测到 fcitx5，无法重启");
+        return;
+    }
+
+    inner.restart_button.set_sensitive(false);
+    inner.restart_result_label.set_text("正在重启 fcitx5…");
+
+    std::thread::spawn(move || {
+        let result = imfix::restart_fcitx5();
+        let result = std::cell::Cell::new(Some(result));
+        glib::source::idle_add(move || {
+            if let Some(result) = result.take() {
+                with_inner(|i| i.finish_restart(result));
+            }
+            glib::ControlFlow::Break
+        });
+    });
+}
+
 impl Inner {
     /// 写入检测结论并刷新界面。
     fn apply_report(&self, report: ImfixReport) {
         *self.report.borrow_mut() = report;
         self.update_labels();
+    }
+
+    /// 主线程中处理重启结果：提示、刷新状态。
+    fn finish_restart(&self, result: Result<String, String>) {
+        self.restart_button
+            .set_sensitive(self.report.borrow().fcitx_installed);
+
+        match result {
+            Ok(msg) => {
+                self.restart_result_label.set_text(&msg);
+                self.toast("fcitx5 已重启");
+            }
+            Err(e) => {
+                self.restart_result_label.set_text(&format!("重启失败：{e}"));
+                self.toast(&format!("重启失败：{e}"));
+            }
+        }
     }
 
     /// 主线程中处理写入结果：提示、刷新状态。

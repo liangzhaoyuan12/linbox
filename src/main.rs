@@ -18,6 +18,7 @@ const PAGE_FCITX: &str = "fcitx";
 const PAGE_PATHSCANNER: &str = "pathscanner";
 const PAGE_ARCHCRACKER: &str = "archivecracker";
 const PAGE_PORTSCANNER: &str = "portscanner";
+const PAGE_ENVEDITOR: &str = "enveditor";
 const PAGE_SETTINGS: &str = "settings";
 
 fn main() -> glib::ExitCode {
@@ -33,6 +34,7 @@ fn main() -> glib::ExitCode {
         page::path_scanner::shutdown();
         page::archive_cracker::shutdown();
         page::port_scanner::shutdown();
+        page::env_editor::shutdown();
     });
     app.run()
 }
@@ -205,6 +207,16 @@ fn build_ui(app: &adw::Application) {
         "network-transmit-receive-symbolic",
         "端口扫描",
         page::port_scanner::build().widget(),
+    );
+
+    // 环境变量编辑器页面（真实功能页）
+    add_nav_item(
+        &nav_list,
+        &stack,
+        PAGE_ENVEDITOR,
+        "system-run-symbolic",
+        "环境变量编辑",
+        page::env_editor::build().widget(),
     );
 
     // 设置项：固定在底部

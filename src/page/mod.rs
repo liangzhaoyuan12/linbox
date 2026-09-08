@@ -1,5 +1,6 @@
 pub mod api_key_sniffer;
 pub mod archive_cracker;
+pub mod env_editor;
 pub mod fcitx_fix;
 pub mod json_parser;
 pub mod media_converter;
