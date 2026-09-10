@@ -4,6 +4,7 @@
 //! 不依赖任何 UI 框架；`utils` 读写 `model`，`page` 展示 `model`。
 
 pub mod archive_cracker;
+pub mod download;
 pub mod env_editor;
 pub mod imfix;
 pub mod media;
@@ -12,6 +13,7 @@ pub mod port_scanner;
 pub mod sniffer;
 
 pub use archive_cracker::*;
+pub use download::*;
 pub use env_editor::*;
 pub use imfix::*;
 pub use media::*;

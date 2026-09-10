@@ -1,4 +1,5 @@
 pub mod archive_cracker;
+pub mod download;
 pub mod env_editor;
 pub mod http;
 pub mod imfix;

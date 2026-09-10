@@ -19,6 +19,7 @@ const PAGE_PATHSCANNER: &str = "pathscanner";
 const PAGE_ARCHCRACKER: &str = "archivecracker";
 const PAGE_PORTSCANNER: &str = "portscanner";
 const PAGE_ENVEDITOR: &str = "enveditor";
+const PAGE_DOWNLOAD: &str = "download";
 const PAGE_SETTINGS: &str = "settings";
 
 fn main() -> glib::ExitCode {
@@ -35,6 +36,7 @@ fn main() -> glib::ExitCode {
         page::archive_cracker::shutdown();
         page::port_scanner::shutdown();
         page::env_editor::shutdown();
+        page::download::shutdown();
     });
     app.run()
 }
@@ -207,6 +209,17 @@ fn build_ui(app: &adw::Application) {
         "network-transmit-receive-symbolic",
         "端口扫描",
         page::port_scanner::build().widget(),
+    );
+
+    // 下载页面（HTTP(S) 多线程下载）
+    let download_page = page::download::build();
+    add_nav_item(
+        &nav_list,
+        &stack,
+        PAGE_DOWNLOAD,
+        "folder-download-symbolic",
+        "下载",
+        &download_page,
     );
 
     // 环境变量编辑器页面（真实功能页）
