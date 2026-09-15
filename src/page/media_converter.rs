@@ -527,16 +527,19 @@ pub fn build() -> MediaConverterPage {
 
     let crop_row = switch_row("裁剪 (crop)", "");
     adv_inner.add(&crop_row);
+    // 宽/高 与 X/Y 分成两行：4 个 SpinRow 横排会把最小宽度撑到 678px
     let crop_dims = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let crop_dims2 = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let adv_crop_w = spin_row("宽", 0.0, 7680.0, 2.0, 0, 1280.0);
     let adv_crop_h = spin_row("高", 0.0, 4320.0, 2.0, 0, 720.0);
     let adv_crop_x = spin_row("X", 0.0, 7680.0, 2.0, 0, 0.0);
     let adv_crop_y = spin_row("Y", 0.0, 4320.0, 2.0, 0, 0.0);
     crop_dims.append(&adv_crop_w);
     crop_dims.append(&adv_crop_h);
-    crop_dims.append(&adv_crop_x);
-    crop_dims.append(&adv_crop_y);
+    crop_dims2.append(&adv_crop_x);
+    crop_dims2.append(&adv_crop_y);
     adv_inner.add(&crop_dims);
+    adv_inner.add(&crop_dims2);
 
     let pad_row = switch_row("填充 (pad)", "");
     adv_inner.add(&pad_row);

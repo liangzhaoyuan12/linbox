@@ -20,6 +20,8 @@ const PAGE_ARCHCRACKER: &str = "archivecracker";
 const PAGE_PORTSCANNER: &str = "portscanner";
 const PAGE_ENVEDITOR: &str = "enveditor";
 const PAGE_DOWNLOAD: &str = "download";
+const PAGE_SYSTEMD: &str = "systemd";
+const PAGE_MONITOR: &str = "monitor";
 const PAGE_SETTINGS: &str = "settings";
 
 fn main() -> glib::ExitCode {
@@ -37,6 +39,8 @@ fn main() -> glib::ExitCode {
         page::port_scanner::shutdown();
         page::env_editor::shutdown();
         page::download::shutdown();
+        page::systemd::shutdown();
+        page::monitor::shutdown();
     });
     app.run()
 }
@@ -47,6 +51,21 @@ fn build_ui(app: &adw::Application) {
     let title = gtk::Label::new(Some("linbox"));
     title.add_css_class("title");
     header.set_title_widget(Some(&title));
+
+    // 页签栏（GtkStackSwitcher）的按钮被 Adwaita 样式强制了较大的 min-width，
+    // 5 个页签光是按钮就撑到 666px，是窗口缩不窄的主因之一；这里只针对
+    // 页签栏解除该限制（按钮按文字自适应，仍保留正常内边距）。
+    {
+        let css = gtk::CssProvider::new();
+        css.load_from_string("stackswitcher > button { min-width: 0; }");
+        if let Some(d) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &d,
+                &css,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    }
 
     // 侧边栏切换按钮：显示 libadwaita/GTK4 自带的「显示侧边栏」图标
     let sidebar_toggle = gtk::ToggleButton::new();
@@ -133,6 +152,9 @@ fn build_ui(app: &adw::Application) {
     let stack = gtk::Stack::new();
     stack.set_transition_type(gtk::StackTransitionType::Crossfade);
     stack.set_transition_duration(250);
+    // 关闭横向 homogeneous：GtkStack 默认按「所有页面」里最宽的那个算最小宽度，
+    // 哪怕该页面当时并没显示；关掉后只按当前显示的页面算，窗口才能真正缩窄。
+    stack.set_hhomogeneous(false);
 
     // 注册页面 + 侧边栏条目
     let home_page = adw::StatusPage::new();
@@ -222,12 +244,32 @@ fn build_ui(app: &adw::Application) {
         &download_page,
     );
 
+    // systemd 管理页面（展示 systemd 能力清单）
+    add_nav_item(
+        &nav_list,
+        &stack,
+        PAGE_SYSTEMD,
+        "system-run-symbolic",
+        "systemd 管理",
+        page::systemd::build().widget(),
+    );
+
+    // 系统监视器页面（CPU / 内存 / 进程 / 传感器 / 磁盘 / 网络）
+    add_nav_item(
+        &nav_list,
+        &stack,
+        PAGE_MONITOR,
+        "power-profile-performance-symbolic",
+        "系统监视器",
+        page::monitor::build().widget(),
+    );
+
     // 环境变量编辑器页面（真实功能页）
     add_nav_item(
         &nav_list,
         &stack,
         PAGE_ENVEDITOR,
-        "system-run-symbolic",
+        "preferences-system-symbolic",
         "环境变量编辑",
         page::env_editor::build().widget(),
     );
@@ -315,8 +357,8 @@ fn build_ui(app: &adw::Application) {
     // ---------- 窗口 ----------
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .default_width(1080)
-        .default_height(720)
+        .default_width(800)
+        .default_height(640)
         .title("linbox")
         .content(&toolbar)
         .build();

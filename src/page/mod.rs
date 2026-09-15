@@ -5,5 +5,7 @@ pub mod env_editor;
 pub mod fcitx_fix;
 pub mod json_parser;
 pub mod media_converter;
+pub mod monitor;
 pub mod path_scanner;
 pub mod port_scanner;
+pub mod systemd;

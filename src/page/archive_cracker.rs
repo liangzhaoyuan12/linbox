@@ -758,7 +758,7 @@ pub fn build() -> ArchiveCrackerPage {
     let type_combo = combo_row("字符集", DICT_TYPE_LABELS, 0);
     dc.add(&type_combo);
 
-    let min_len = spin_row("最小密码长度", 1.0, 16.0, 1.0, 0, 1.0);
+    let min_len = spin_row("最小密码长度", 0.0, 16.0, 1.0, 0, 1.0);
     dc.add(&min_len);
     let max_len = spin_row("最大密码长度", 1.0, 16.0, 1.0, 0, 6.0);
     dc.add(&max_len);
