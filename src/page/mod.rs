@@ -8,4 +8,5 @@ pub mod media_converter;
 pub mod monitor;
 pub mod path_scanner;
 pub mod port_scanner;
+pub mod notepad;
 pub mod systemd;

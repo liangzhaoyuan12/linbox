@@ -20,6 +20,7 @@ const PAGE_ARCHCRACKER: &str = "archivecracker";
 const PAGE_PORTSCANNER: &str = "portscanner";
 const PAGE_ENVEDITOR: &str = "enveditor";
 const PAGE_DOWNLOAD: &str = "download";
+const PAGE_NOTEPAD: &str = "notepad";
 const PAGE_SYSTEMD: &str = "systemd";
 const PAGE_MONITOR: &str = "monitor";
 const PAGE_SETTINGS: &str = "settings";
@@ -39,6 +40,7 @@ fn main() -> glib::ExitCode {
         page::port_scanner::shutdown();
         page::env_editor::shutdown();
         page::download::shutdown();
+        page::notepad::shutdown();
         page::systemd::shutdown();
         page::monitor::shutdown();
     });
@@ -242,6 +244,16 @@ fn build_ui(app: &adw::Application) {
         "folder-download-symbolic",
         "下载",
         &download_page,
+    );
+
+    // 备忘录页面（文本 + 图片 + ZIP 导入/导出）
+    add_nav_item(
+        &nav_list,
+        &stack,
+        PAGE_NOTEPAD,
+        "edit-paste-symbolic",
+        "备忘录",
+        page::notepad::build().widget(),
     );
 
     // systemd 管理页面（展示 systemd 能力清单）
