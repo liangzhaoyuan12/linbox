@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/com/github/liangzhaoyuan12/linbox">
+    <!-- 系统 Adwaita 图标不再需要打包，此处仅保留结构 -->
+  </gresource>
+</gresources>

@@ -10,6 +10,8 @@
 //! （详见 `storage` 模块头注释）
 
 pub mod storage;
+pub mod sync;
+pub mod git_store;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -54,7 +56,11 @@ struct Inner {
     inline_fp: RefCell<Vec<u64>>,
     /// 程序化加载期间置位：挡住 set_text 触发的 changed，避免把内容写回错的条目。
     loading: Cell<bool>,
+    /// 内容是否有未同步的改动。
+    dirty: Cell<bool>,
     toast: adw::ToastOverlay,
+    /// 主窗口引用（用于给子对话框设置 transient_for）。
+    window: RefCell<Option<gtk::Window>>,
 }
 
 impl Inner {
@@ -83,6 +89,18 @@ thread_local! {
     /// 只存弱引用的话所有回调 upgrade 全部失败 —— 症状就是「点了完全没反应」
     ///（新建 / 保存 / 粘贴图片 / 选中条目一起失效）。
     static INNER: RefCell<Option<Rc<Inner>>> = const { RefCell::new(None) };
+
+    /// 上次 `save_current` 实际写盘的时刻（毫秒级 Unix 时间戳）。
+    /// 用于节流：正文改动 < 200 ms 时跳过写盘，避免逐键重写整个 ZIP。
+    static LAST_SAVE_MS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// 返回当前时刻的毫秒级 Unix 时间戳。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 fn with_inner<F: FnOnce(&Inner)>(f: F) {
@@ -99,6 +117,23 @@ pub fn shutdown() {
             *b = None;
         }
     });
+}
+
+/// 设置主窗口引用（供子对话框设置 transient_for）。
+pub fn set_window(w: &impl IsA<gtk::Window>) {
+    with_inner(|i| {
+        *i.window.borrow_mut() = Some(w.clone().upcast());
+    });
+}
+
+/// 备忘录内容是否有未同步的改动。
+pub fn is_dirty() -> bool {
+    INNER.with(|i| i.try_borrow().ok().and_then(|b| b.as_ref().map(|inner| inner.dirty.get())).unwrap_or(false))
+}
+
+/// 标记内容已同步（清除脏标记）。
+pub fn mark_clean() {
+    with_inner(|i| i.dirty.set(false));
 }
 
 pub fn build() -> NotepadPage {
@@ -129,11 +164,37 @@ pub fn build() -> NotepadPage {
     export_btn.set_tooltip_text(Some("全部条目导出到 ZIP"));
     export_btn.add_css_class("flat");
 
+    let sep2 = gtk::Separator::new(gtk::Orientation::Vertical);
+    sep2.set_margin_start(4);
+    sep2.set_margin_end(4);
+    let cloud_cfg_btn = gtk::Button::from_icon_name("preferences-system-symbolic");
+    cloud_cfg_btn.set_tooltip_text(Some("云同步设置"));
+    cloud_cfg_btn.add_css_class("flat");
+    let cloud_sync_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
+    cloud_sync_btn.set_tooltip_text(Some("同步到云端"));
+    cloud_sync_btn.add_css_class("flat");
+    // 未配置时灰掉同步按钮
+    cloud_sync_btn.set_sensitive(sync::is_configured());
+
+    let pull_btn = gtk::Button::from_icon_name("go-down-symbolic");
+    pull_btn.set_tooltip_text(Some("刷新（从云端拉取）"));
+    pull_btn.add_css_class("flat");
+    pull_btn.set_sensitive(sync::is_configured());
+    let push_btn = gtk::Button::from_icon_name("go-up-symbolic");
+    push_btn.set_tooltip_text(Some("推送到云端"));
+    push_btn.add_css_class("flat");
+    push_btn.set_sensitive(sync::is_configured());
+
     toolbar.append(&add_btn);
     toolbar.append(&del_btn);
     toolbar.append(&sep);
     toolbar.append(&import_btn);
     toolbar.append(&export_btn);
+    toolbar.append(&sep2);
+    toolbar.append(&cloud_cfg_btn);
+    toolbar.append(&cloud_sync_btn);
+    toolbar.append(&pull_btn);
+    toolbar.append(&push_btn);
     outer.append(&toolbar);
 
     // ── 主体：左列表 + 右编辑器 ───────────────────────────────────────────
@@ -281,7 +342,9 @@ pub fn build() -> NotepadPage {
         current_id: RefCell::new(None),
         inline_fp: RefCell::new(Vec::new()),
         loading: Cell::new(false),
+        dirty: Cell::new(false),
         toast: toast.clone(),
+        window: RefCell::new(None),
     });
 
     // 强引用必须在接信号之前落进 TLS：否则 build() 一返回 `inner` 就没了，
@@ -310,9 +373,25 @@ pub fn build() -> NotepadPage {
     export_btn.connect_clicked(move |_| with_inner(|i| export_dialog(i)));
     import_btn.connect_clicked(move |_| with_inner(|i| import_dialog(i)));
 
+    // 云同步
+    cloud_cfg_btn.connect_clicked(move |_| with_inner(|i| cloud_config_dialog(i)));
+    cloud_sync_btn.connect_clicked(move |_| with_inner(|i| start_cloud_sync(i)));
+    pull_btn.connect_clicked(move |_| with_inner(|i| start_pull(i)));
+    push_btn.connect_clicked(move |_| with_inner(|i| start_push(i)));
+
     // 剪贴板粘贴图片：正文和标题两处输入框都挂上，谁有焦点谁生效
     attach_paste_controller(&text_view);
     attach_paste_controller(&title_entry);
+
+    // ── 启动时自动刷新（pull） ──────────────────────────────────────────────
+    if sync::is_configured() {
+        std::thread::spawn(|| {
+            let configs = sync::load_configs();
+            if !configs.is_empty() {
+                let _ = sync::pull_only(&configs);
+            }
+        });
+    }
 
     NotepadPage { root: toast }
 }
@@ -475,6 +554,614 @@ fn import_dialog(inner: &Inner) {
         d.destroy();
     });
     dialog.show();
+}
+
+// ── 云同步 ────────────────────────────────────────────────────────────────
+
+/// 云同步设置对话框：支持 HTTP 服务器 + Git 仓库。
+#[allow(deprecated)]
+fn cloud_config_dialog(inner: &Inner) {
+    let configs = sync::load_configs();
+
+    // 直接用 Inner 存储的主窗口引用
+    let parent_win = inner.window.borrow().clone();
+    let parent_app = parent_win.as_ref().and_then(|w| w.application());
+    let mut builder = gtk::Window::builder()
+        .title("云同步设置")
+        .modal(true)
+        .default_width(520)
+        .default_height(520);
+    if let Some(ref app) = parent_app {
+        builder = builder.application(app);
+    }
+    let dialog = builder.build();
+    if let Some(ref w) = parent_win {
+        dialog.set_transient_for(Some(w));
+    }
+
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+    dialog.set_child(Some(&vbox));
+
+    // ── 已配置的后端列表 ──
+    let title_label = gtk::Label::new(Some("已配置的同步后端"));
+    title_label.set_halign(gtk::Align::Start);
+    title_label.add_css_class("heading");
+    vbox.append(&title_label);
+
+    let server_list = gtk::ListBox::new();
+    server_list.add_css_class("boxed-list");
+    let server_scroll = gtk::ScrolledWindow::new();
+    server_scroll.set_child(Some(&server_list));
+    server_scroll.set_vexpand(true);
+    server_scroll.set_min_content_height(100);
+    vbox.append(&server_scroll);
+
+    rebuild_backend_list(&server_list);
+
+    // ── 添加 HTTP 服务器 ──
+    let http_label = gtk::Label::new(Some("添加 HTTP 服务器"));
+    http_label.set_halign(gtk::Align::Start);
+    http_label.add_css_class("heading");
+    http_label.set_margin_top(4);
+    vbox.append(&http_label);
+
+    let url_row = adw::EntryRow::new();
+    url_row.set_title("服务器地址");
+    url_row.set_show_apply_button(false);
+    vbox.append(&url_row);
+
+    let user_row = adw::EntryRow::new();
+    user_row.set_title("用户名");
+    user_row.set_show_apply_button(false);
+    vbox.append(&user_row);
+
+    let pass_row = adw::PasswordEntryRow::new();
+    pass_row.set_title("密码");
+    pass_row.set_show_apply_button(false);
+    vbox.append(&pass_row);
+
+    let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    btn_box.set_halign(gtk::Align::End);
+    btn_box.set_margin_top(4);
+
+    let status_label = gtk::Label::new(None);
+    status_label.add_css_class("dim-label");
+    status_label.set_halign(gtk::Align::Start);
+    status_label.set_vexpand(true);
+    btn_box.append(&status_label);
+
+    let test_btn = gtk::Button::with_label("测试连接");
+    let status_ref = status_label.clone();
+    let url_ref = url_row.clone();
+    let user_ref = user_row.clone();
+    let pass_ref = pass_row.clone();
+    test_btn.connect_clicked(move |_| {
+        let cfg = sync::CloudConfig {
+            url: url_ref.text().to_string(),
+            username: user_ref.text().to_string(),
+            password: pass_ref.text().to_string(),
+        };
+        status_ref.set_text("连接中…");
+        match sync::test_connection(&cfg) {
+            Ok(()) => status_ref.set_text("✓ 连接成功"),
+            Err(e) => status_ref.set_text(&format!("✗ {e}")),
+        }
+    });
+    btn_box.append(&test_btn);
+
+    let add_http_btn = gtk::Button::with_label("添加服务器");
+    add_http_btn.add_css_class("suggested-action");
+    let url_ref2 = url_row.clone();
+    let user_ref2 = user_row.clone();
+    let pass_ref2 = pass_row.clone();
+    let list_ref = server_list.clone();
+    let status_ref2 = status_label.clone();
+    add_http_btn.connect_clicked(move |_| {
+        let cfg = sync::CloudConfig {
+            url: url_ref2.text().to_string(),
+            username: user_ref2.text().to_string(),
+            password: pass_ref2.text().to_string(),
+        };
+        if cfg.url.is_empty() || cfg.username.is_empty() {
+            status_ref2.set_text("请填写地址和用户名");
+            return;
+        }
+        match sync::add_http_config(cfg) {
+            Ok(()) => {
+                rebuild_backend_list(&list_ref);
+                url_ref2.set_text("");
+                user_ref2.set_text("");
+                pass_ref2.set_text("");
+                status_ref2.set_text("✓ 已添加");
+            }
+            Err(e) => status_ref2.set_text(&format!("✗ {e}")),
+        }
+    });
+    btn_box.append(&add_http_btn);
+    vbox.append(&btn_box);
+
+    // ── 添加 Git 仓库 ──
+    let git_label = gtk::Label::new(Some("添加 Git 仓库"));
+    git_label.set_halign(gtk::Align::Start);
+    git_label.add_css_class("heading");
+    git_label.set_margin_top(8);
+    vbox.append(&git_label);
+
+    let git_url_row = adw::EntryRow::new();
+    git_url_row.set_title("仓库地址");
+    git_url_row.set_show_apply_button(false);
+    vbox.append(&git_url_row);
+
+    let git_user_row = adw::EntryRow::new();
+    git_user_row.set_title("用户名（可选，SSH 可不填）");
+    git_user_row.set_show_apply_button(false);
+    vbox.append(&git_user_row);
+
+    let git_pass_row = adw::PasswordEntryRow::new();
+    git_pass_row.set_title("密码 / Token（可选，SSH 可不填）");
+    git_pass_row.set_show_apply_button(false);
+    vbox.append(&git_pass_row);
+
+    let git_name_row = adw::EntryRow::new();
+    git_name_row.set_title("Git 用户名（可选，默认 linbox）");
+    git_name_row.set_show_apply_button(false);
+    vbox.append(&git_name_row);
+
+    let git_email_row = adw::EntryRow::new();
+    git_email_row.set_title("Git 邮箱（可选，默认 linbox@notepad.local）");
+    git_email_row.set_show_apply_button(false);
+    vbox.append(&git_email_row);
+
+    let git_hint = gtk::Label::new(Some("支持 SSH（git@…）和 HTTPS（https://…），优先尝试 SSH 密钥"));
+    git_hint.add_css_class("dim-label");
+    git_hint.set_halign(gtk::Align::Start);
+    git_hint.set_margin_bottom(4);
+    vbox.append(&git_hint);
+
+    let git_btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    git_btn_box.set_halign(gtk::Align::End);
+
+    let git_status = gtk::Label::new(None);
+    git_status.add_css_class("dim-label");
+    git_status.set_halign(gtk::Align::Start);
+    git_status.set_vexpand(true);
+    git_btn_box.append(&git_status);
+
+    let git_test_btn = gtk::Button::with_label("验证仓库");
+    let git_status_ref = git_status.clone();
+    let git_url_ref = git_url_row.clone();
+    let git_user_ref = git_user_row.clone();
+    let git_pass_ref = git_pass_row.clone();
+    let git_name_ref = git_name_row.clone();
+    let git_email_ref = git_email_row.clone();
+    git_test_btn.connect_clicked(move |_| {
+        let cfg = git_store::GitConfig {
+            url: git_url_ref.text().to_string(),
+            branch: "main".to_string(),
+            user_name: git_name_ref.text().to_string(),
+            user_email: git_email_ref.text().to_string(),
+            username: git_user_ref.text().to_string(),
+            password: git_pass_ref.text().to_string(),
+        };
+        if cfg.url.is_empty() {
+            git_status_ref.set_text("请填写仓库地址");
+            return;
+        }
+        git_status_ref.set_text("验证中…");
+        match sync::test_git_connection(&cfg) {
+            Ok(()) => git_status_ref.set_text("✓ 仓库可访问"),
+            Err(e) => git_status_ref.set_text(&format!("✗ {e}")),
+        }
+    });
+    git_btn_box.append(&git_test_btn);
+
+    let add_git_btn = gtk::Button::with_label("添加仓库");
+    add_git_btn.add_css_class("suggested-action");
+    let git_url_ref2 = git_url_row.clone();
+    let git_user_ref2 = git_user_row.clone();
+    let git_pass_ref2 = git_pass_row.clone();
+    let git_name_ref2 = git_name_row.clone();
+    let git_email_ref2 = git_email_row.clone();
+    let list_ref2 = server_list.clone();
+    let git_status_ref2 = git_status.clone();
+    add_git_btn.connect_clicked(move |_| {
+        let cfg = git_store::GitConfig {
+            url: git_url_ref2.text().to_string(),
+            branch: "main".to_string(),
+            user_name: git_name_ref2.text().to_string(),
+            user_email: git_email_ref2.text().to_string(),
+            username: git_user_ref2.text().to_string(),
+            password: git_pass_ref2.text().to_string(),
+        };
+        if cfg.url.is_empty() {
+            git_status_ref2.set_text("请填写仓库地址");
+            return;
+        }
+        // 先验证可访问性
+        git_status_ref2.set_text("验证仓库可访问性…");
+        match sync::test_git_connection(&cfg) {
+            Ok(()) => {
+                match sync::add_git_config(cfg) {
+                    Ok(()) => {
+                        rebuild_backend_list(&list_ref2);
+                        git_url_ref2.set_text("");
+                        git_user_ref2.set_text("");
+                        git_pass_ref2.set_text("");
+                        git_name_ref2.set_text("");
+                        git_email_ref2.set_text("");
+                        git_status_ref2.set_text("✓ 仓库已添加");
+                    }
+                    Err(e) => git_status_ref2.set_text(&format!("✗ {e}")),
+                }
+            }
+            Err(e) => git_status_ref2.set_text(&format!("✗ 无法访问：{e}")),
+        }
+    });
+    git_btn_box.append(&add_git_btn);
+    vbox.append(&git_btn_box);
+
+    dialog.present();
+}
+
+/// 重建后端列表 UI（支持 HTTP 和 Git）。
+fn rebuild_backend_list(list: &gtk::ListBox) {
+    list.remove_all();
+    let configs = sync::load_configs();
+    for cfg in &configs {
+        let row = adw::ActionRow::new();
+        match cfg {
+            sync::BackendConfig::Http(c) => {
+                row.set_title(&c.url);
+                row.set_subtitle(&format!("HTTP · 用户：{}", c.username));
+            }
+            sync::BackendConfig::Git(c) => {
+                let repo = c.url.rsplit('/').next().unwrap_or(&c.url);
+                row.set_title(repo);
+                let proto = if c.url.starts_with("git@") {
+                    "Git/SSH"
+                } else {
+                    "Git/HTTPS"
+                };
+                let auth = if c.username.is_empty() {
+                    "密钥认证".to_string()
+                } else {
+                    format!("用户：{}", c.username)
+                };
+                row.set_subtitle(&format!("{proto} · {auth}"));
+            }
+        }
+        // 编辑按钮
+        let edit_btn = gtk::Button::from_icon_name("document-edit-symbolic");
+        edit_btn.set_tooltip_text(Some("编辑"));
+        let cfg_for_edit = cfg.clone();
+        let list_ref = list.clone();
+        edit_btn.connect_clicked(move |_| {
+            edit_backend_dialog(&cfg_for_edit, &list_ref);
+        });
+        row.add_suffix(&edit_btn);
+        // 删除按钮
+        let del_btn = gtk::Button::from_icon_name("user-trash-symbolic");
+        del_btn.add_css_class("destructive-action");
+        del_btn.set_tooltip_text(Some("删除"));
+        let key_for_delete = cfg.unique_key();
+        let list_ref2 = list.clone();
+        del_btn.connect_clicked(move |_| {
+            let _ = sync::remove_backend(&key_for_delete);
+            rebuild_backend_list(&list_ref2);
+        });
+        row.add_suffix(&del_btn);
+        row.set_activatable(false);
+        list.append(&row);
+    }
+    if configs.is_empty() {
+        let empty_label = gtk::Label::new(Some("还没有配置同步后端"));
+        empty_label.add_css_class("dim-label");
+        empty_label.set_margin_top(12);
+        empty_label.set_margin_bottom(12);
+        list.append(&empty_label);
+    }
+}
+
+/// 编辑已有后端的对话框。
+#[allow(deprecated)]
+fn edit_backend_dialog(cfg: &sync::BackendConfig, list_ref: &gtk::ListBox) {
+    let mut parent_win: Option<gtk::Window> = None;
+    with_inner(|i| {
+        parent_win = i.window.borrow().clone();
+    });
+    let parent_app = parent_win.as_ref().and_then(|w| w.application());
+    let mut builder = gtk::Window::builder()
+        .title("编辑同步后端")
+        .modal(true)
+        .default_width(480)
+        .default_height(350);
+    if let Some(ref app) = parent_app {
+        builder = builder.application(app);
+    }
+    let dialog = builder.build();
+    if let Some(ref w) = parent_win {
+        dialog.set_transient_for(Some(w));
+    }
+
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+    dialog.set_child(Some(&vbox));
+
+    match cfg {
+        sync::BackendConfig::Http(c) => {
+            let url_row = adw::EntryRow::new();
+            url_row.set_title("服务器地址");
+            url_row.set_text(&c.url);
+            url_row.set_show_apply_button(false);
+            vbox.append(&url_row);
+
+            let user_row = adw::EntryRow::new();
+            user_row.set_title("用户名");
+            user_row.set_text(&c.username);
+            user_row.set_show_apply_button(false);
+            vbox.append(&user_row);
+
+            let pass_row = adw::PasswordEntryRow::new();
+            pass_row.set_title("密码");
+            pass_row.set_text(&c.password);
+            pass_row.set_show_apply_button(false);
+            vbox.append(&pass_row);
+
+            let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            btn_box.set_halign(gtk::Align::End);
+            btn_box.set_margin_top(8);
+
+            let save_btn = gtk::Button::with_label("保存");
+            save_btn.add_css_class("suggested-action");
+            let dialog_ref = dialog.clone();
+            let list_ref2 = list_ref.clone();
+            let url_ref = url_row.clone();
+            let user_ref = user_row.clone();
+            let pass_ref = pass_row.clone();
+            let old_key = cfg.unique_key();
+            save_btn.connect_clicked(move |_| {
+                let new_cfg = sync::BackendConfig::Http(sync::CloudConfig {
+                    url: url_ref.text().to_string(),
+                    username: user_ref.text().to_string(),
+                    password: pass_ref.text().to_string(),
+                });
+                let _ = sync::remove_backend(&old_key);
+                let _ = save_configs_append(&new_cfg);
+                rebuild_backend_list(&list_ref2);
+                dialog_ref.close();
+            });
+            btn_box.append(&save_btn);
+            vbox.append(&btn_box);
+        }
+        sync::BackendConfig::Git(c) => {
+            let url_row = adw::EntryRow::new();
+            url_row.set_title("仓库地址");
+            url_row.set_text(&c.url);
+            url_row.set_show_apply_button(false);
+            vbox.append(&url_row);
+
+            let user_row = adw::EntryRow::new();
+            user_row.set_title("HTTPS 用户名（可选）");
+            user_row.set_text(&c.username);
+            user_row.set_show_apply_button(false);
+            vbox.append(&user_row);
+
+            let pass_row = adw::PasswordEntryRow::new();
+            pass_row.set_title("密码 / Token（可选）");
+            pass_row.set_text(&c.password);
+            pass_row.set_show_apply_button(false);
+            vbox.append(&pass_row);
+
+            let name_row = adw::EntryRow::new();
+            name_row.set_title("Git 用户名（可选）");
+            name_row.set_text(&c.user_name);
+            name_row.set_show_apply_button(false);
+            vbox.append(&name_row);
+
+            let email_row = adw::EntryRow::new();
+            email_row.set_title("Git 邮箱（可选）");
+            email_row.set_text(&c.user_email);
+            email_row.set_show_apply_button(false);
+            vbox.append(&email_row);
+
+            let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            btn_box.set_halign(gtk::Align::End);
+            btn_box.set_margin_top(8);
+
+            let save_btn = gtk::Button::with_label("保存");
+            save_btn.add_css_class("suggested-action");
+            let dialog_ref = dialog.clone();
+            let list_ref2 = list_ref.clone();
+            let url_ref = url_row.clone();
+            let user_ref = user_row.clone();
+            let pass_ref = pass_row.clone();
+            let name_ref = name_row.clone();
+            let email_ref = email_row.clone();
+            let old_key = cfg.unique_key();
+            let branch = c.branch.clone();
+            save_btn.connect_clicked(move |_| {
+                let new_cfg = sync::BackendConfig::Git(git_store::GitConfig {
+                    url: url_ref.text().to_string(),
+                    branch: branch.clone(),
+                    user_name: name_ref.text().to_string(),
+                    user_email: email_ref.text().to_string(),
+                    username: user_ref.text().to_string(),
+                    password: pass_ref.text().to_string(),
+                });
+                let _ = sync::remove_backend(&old_key);
+                let _ = save_configs_append(&new_cfg);
+                rebuild_backend_list(&list_ref2);
+                dialog_ref.close();
+            });
+            btn_box.append(&save_btn);
+            vbox.append(&btn_box);
+        }
+    }
+
+    dialog.present();
+}
+
+/// 在已有配置列表末尾追加一个后端。
+fn save_configs_append(cfg: &sync::BackendConfig) -> Result<(), String> {
+    let mut configs = sync::load_configs();
+    configs.push(cfg.clone());
+    sync::save_configs(&configs)
+}
+
+/// 在后台线程执行云同步，完成后在主线程显示结果。
+fn start_cloud_sync(inner: &Inner) {
+    let configs = sync::load_configs();
+    if configs.is_empty() {
+        inner.toast("请先配置同步后端");
+        return;
+    }
+    // 先把当前编辑保存到磁盘
+    save_current(inner, true);
+    inner.toast(&format!("正在同步（{} 个后端）…", configs.len()));
+    // 后台线程执行同步
+    std::thread::spawn(move || {
+        let result = sync::do_sync(&configs);
+        glib::idle_add_once(move || {
+            with_inner(|i| match result {
+                Ok(summary) => {
+                    let mut parts = Vec::new();
+                    if summary.uploaded > 0 {
+                        parts.push(format!("上传 {} 条", summary.uploaded));
+                    }
+                    if summary.downloaded > 0 {
+                        parts.push(format!("下载 {} 条", summary.downloaded));
+                    }
+                    if summary.deleted_local > 0 {
+                        parts.push(format!("删除本地 {} 条", summary.deleted_local));
+                    }
+                    if summary.deleted_remote > 0 {
+                        parts.push(format!("通知云端删除 {} 条", summary.deleted_remote));
+                    }
+                    // 每台服务器的状态
+                    for (name, result) in &summary.per_server {
+                        match result {
+                            Ok(()) => parts.push(format!("✓ {name}")),
+                            Err(e) => parts.push(format!("✗ {name}: {e}")),
+                        }
+                    }
+                    if parts.is_empty() {
+                        i.toast("同步完成，无需更新");
+                        mark_clean();
+                    } else {
+                        i.toast(&format!("同步完成：{}", parts.join("，")));
+                        mark_clean();
+                    }
+                    if !summary.errors.is_empty() {
+                        i.toast(&format!("部分错误：{}", summary.errors.join("；")));
+                    }
+                    // 同步完成后刷新列表并重新加载当前条目（P0 #2 + P1 #10）
+                    refresh_list(i);
+                    if let Some(id) = i.current_id.borrow().clone() {
+                        i.inline_fp.borrow_mut().clear();
+                        load_entry(i, &id);
+                    }
+                }
+                Err(e) => {
+                    i.toast(&format!("同步失败：{e}"));
+                }
+            });
+        });
+    });
+}
+
+/// 手动 Pull（刷新）：后台从所有后端拉取，不推送。
+fn start_pull(inner: &Inner) {
+    let configs = sync::load_configs();
+    if configs.is_empty() {
+        inner.toast("请先配置同步后端");
+        return;
+    }
+    save_current(inner, true);
+    inner.toast(&format!("正在刷新（{} 个后端）…", configs.len()));
+    std::thread::spawn(move || {
+        let result = sync::pull_only(&configs);
+        glib::idle_add_once(move || {
+            with_inner(|i| match result {
+                Ok(summary) => {
+                    let mut parts = Vec::new();
+                    if summary.downloaded > 0 {
+                        parts.push(format!("下载 {} 条", summary.downloaded));
+                    }
+                    for (name, result) in &summary.per_server {
+                        match result {
+                            Ok(()) => parts.push(format!("✓ {name}")),
+                            Err(e) => parts.push(format!("✗ {name}: {e}")),
+                        }
+                    }
+                    if parts.is_empty() {
+                        i.toast("刷新完成，已是最新"); mark_clean();
+                    } else {
+                        i.toast(&format!("刷新完成：{}", parts.join("，"))); mark_clean();
+                    }
+                    if !summary.errors.is_empty() {
+                        i.toast(&format!("部分错误：{}", summary.errors.join("；")));
+                    }
+                    // 刷新后重新加载列表并重新加载当前条目（P0 #2）
+                    refresh_list(i);
+                    if let Some(id) = i.current_id.borrow().clone() {
+                        i.inline_fp.borrow_mut().clear();
+                        load_entry(i, &id);
+                    }
+                }
+                Err(e) => {
+                    i.toast(&format!("刷新失败：{e}"));
+                }
+            });
+        });
+    });
+}
+
+/// 手动 Push：后台推送到所有后端，不拉取。
+fn start_push(inner: &Inner) {
+    let configs = sync::load_configs();
+    if configs.is_empty() {
+        inner.toast("请先配置同步后端");
+        return;
+    }
+    save_current(inner, true);
+    inner.toast(&format!("正在推送（{} 个后端）…", configs.len()));
+    std::thread::spawn(move || {
+        let result = sync::push_only(&configs);
+        glib::idle_add_once(move || {
+            with_inner(|i| match result {
+                Ok(summary) => {
+                    let mut parts = Vec::new();
+                    if summary.uploaded > 0 {
+                        parts.push(format!("上传 {} 条", summary.uploaded));
+                    }
+                    for (name, result) in &summary.per_server {
+                        match result {
+                            Ok(()) => parts.push(format!("✓ {name}")),
+                            Err(e) => parts.push(format!("✗ {name}: {e}")),
+                        }
+                    }
+                    if parts.is_empty() {
+                        i.toast("推送完成，无需更新"); mark_clean();
+                    } else {
+                        i.toast(&format!("推送完成：{}", parts.join("，"))); mark_clean();
+                    }
+                    if !summary.errors.is_empty() {
+                        i.toast(&format!("部分错误：{}", summary.errors.join("；")));
+                    }
+                }
+                Err(e) => {
+                    i.toast(&format!("推送失败：{e}"));
+                }
+            });
+        });
+    });
 }
 
 // ── 正文内嵌图片 ──────────────────────────────────────────────────────────
@@ -788,11 +1475,11 @@ fn wire() {
             with_inner(|i| load_entry(i, &id));
         });
 
-        // 内容改变 → 自动保存
-        inner.buffer.connect_changed(|_| with_inner(|i| save_current(i)));
+        // 内容改变 → 自动保存（节流：正文逐键 < 200 ms 跳过写盘）
+        inner.buffer.connect_changed(|_| with_inner(|i| save_current(i, false)));
 
-        // 标题改变 → 自动保存
-        inner.title_entry.connect_changed(|_| with_inner(|i| save_current(i)));
+        // 标题改变 → 自动保存（立即写盘）
+        inner.title_entry.connect_changed(|_| with_inner(|i| save_current(i, true)));
     });
 }
 
@@ -811,6 +1498,7 @@ fn delete_current(inner: &Inner) {
         return;
     };
     storage::delete(&id);
+    sync::record_deletion(&id);
     clear_editor(inner);
     refresh_list(inner);
 }
@@ -909,10 +1597,24 @@ fn format_time(ts: &str) -> String {
 }
 
 /// 保存当前编辑的内容到本地。
-fn save_current(inner: &Inner) {
+///
+/// `force = true` 时跳过节流立即写盘（标题修改 / 手动保存前调用）；
+/// `force = false` 时若距上次写盘 < 200 ms 则跳过（正文逐键输入节流）。
+fn save_current(inner: &Inner, force: bool) {
     // 程序化加载内容（选中条目/清空右栏）期间不写盘。
     if inner.loading.get() {
         return;
+    }
+    inner.dirty.set(true);
+    if !force {
+        let now = now_ms();
+        let last = LAST_SAVE_MS.with(|c| c.get());
+        if now.saturating_sub(last) < 200 {
+            return;
+        }
+        LAST_SAVE_MS.with(|c| c.set(now));
+    } else {
+        LAST_SAVE_MS.with(|c| c.set(now_ms()));
     }
     let Some(id) = inner.current_id.borrow().clone() else {
         return;
@@ -1001,7 +1703,9 @@ mod tests {
             current_id: RefCell::new(None),
             inline_fp: RefCell::new(Vec::new()),
             loading: Cell::new(false),
+        dirty: Cell::new(false),
             toast: adw::ToastOverlay::new(),
+            window: RefCell::new(None),
         });
         // 单测也要走全局句柄：wire 的闭包是从 INNER 里取 Inner 的。
         INNER.with(|i| *i.borrow_mut() = Some(Rc::clone(&inner)));
@@ -1147,7 +1851,7 @@ mod tests {
         inner
             .buffer
             .insert(&mut inner.buffer.end_iter(), "后");
-        save_current(&inner);
+        save_current(&inner, true);
 
         let saved = storage::read_content(&a);
         assert_eq!(saved, format!("前{}后", OBJ), "正文里的图片位置存丢了");

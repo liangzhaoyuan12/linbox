@@ -25,7 +25,16 @@ const PAGE_SYSTEMD: &str = "systemd";
 const PAGE_MONITOR: &str = "monitor";
 const PAGE_SETTINGS: &str = "settings";
 
+/// 嵌入自定义图标 GResource
+static ICONS_GRESOURCE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/icons.gresource"));
+
 fn main() -> glib::ExitCode {
+    // 注册自定义图标资源
+    let resource = gtk::gio::Resource::from_data(&glib::Bytes::from(ICONS_GRESOURCE))
+        .expect("加载自定义图标资源失败");
+    gtk::gio::resources_register(&resource);
+
     // adw::Application 会自动初始化 libadwaita；主题默认「跟随系统」
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
@@ -374,6 +383,50 @@ fn build_ui(app: &adw::Application) {
         .title("linbox")
         .content(&toolbar)
         .build();
+    // 让备忘录页的子对话框能引用主窗口
+    page::notepad::set_window(&window);
+
+    // 关闭窗体：询问是否保存并同步
+    window.connect_close_request(|win| {
+        if !page::notepad::sync::is_configured() || !page::notepad::is_dirty() {
+            // 没配云端，直接关
+            return gtk::glib::Propagation::Proceed;
+        }
+        let dialog = adw::MessageDialog::builder()
+            .heading("关闭前同步？")
+            .body("是否先拉取再推送到云端，然后关闭？")
+            .build();
+        dialog.add_response("cancel", "取消");
+        dialog.add_response("no", "直接关闭");
+        dialog.add_response("yes", "保存并同步");
+        dialog.set_response_appearance("yes", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("yes"));
+        let win_weak = win.downgrade();
+        dialog.connect_response(None, move |_, response| {
+            let Some(w) = win_weak.upgrade() else { return; };
+            match response {
+                "yes" => {
+                    // 先 pull 再 push，完成后关窗
+                    let configs = page::notepad::sync::load_configs();
+                    if !configs.is_empty() {
+                        let _ = page::notepad::sync::pull_only(&configs);
+                        let _ = page::notepad::sync::push_only(&configs);
+                    }
+                    page::notepad::mark_clean();
+                    w.close();
+                }
+                "no" => {
+                    // 直接关
+                    w.close();
+                }
+                _ => {} // cancel: 不关
+            }
+        });
+        dialog.present();
+        // 阻止默认关闭，等对话框处理完
+        gtk::glib::Propagation::Stop
+    });
+
     window.present();
 
     // 主题切换：用 TimedAnimation 做淡出→切换→淡入，保证有可见过渡
