@@ -433,6 +433,20 @@ pub fn read_inline(id: &str, index: usize) -> Option<Vec<u8>> {
     map_get(&map, &key).cloned()
 }
 
+/// 第 `index` 张内嵌图片落成磁盘上的真实文件，返回它的路径。
+///
+/// 内嵌图片在磁盘上只存在于条目的 ZIP 里（`inline/N.png`），没有「所在文件夹」可言，
+/// 所以和附件（`file_path`）一样解压到 `<base_dir>/tmp/` 下再返回
+/// —— 这样「打开」和「在文件夹中显示」都有真文件可用，而且两者落在同一个目录。
+pub fn inline_image_path(id: &str, index: usize) -> Option<PathBuf> {
+    let data = read_inline(id, index)?;
+    let tmp_dir = base_dir().join("tmp");
+    fs::create_dir_all(&tmp_dir).ok()?;
+    let tmp_file = tmp_dir.join(format!("{id}_inline{index}.png"));
+    fs::write(&tmp_file, &data).ok()?;
+    Some(tmp_file)
+}
+
 /// 按文件名写入内嵌图片（ZIP 导入用）。
 pub fn write_inline_named(id: &str, filename: &str, data: &[u8]) {
     let Some(name) = safe_filename(filename) else {

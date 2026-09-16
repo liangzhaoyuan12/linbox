@@ -406,11 +406,19 @@ fn build_ui(app: &adw::Application) {
             let Some(w) = win_weak.upgrade() else { return; };
             match response {
                 "yes" => {
+                    // 先把编辑区里可能还在节流窗口内的内容强行写盘，否则
+                    // 最后几个字根本不在磁盘上，也就不会被推上远端。
+                    page::notepad::flush();
                     // 先 pull 再 push，完成后关窗
                     let configs = page::notepad::sync::load_configs();
                     if !configs.is_empty() {
-                        let _ = page::notepad::sync::pull_only(&configs);
-                        let _ = page::notepad::sync::push_only(&configs);
+                        // 关窗过程没法弹 toast，但至少别把失败吞掉（stderr 留痕）
+                        if let Err(e) = page::notepad::sync::pull_only(&configs) {
+                            eprintln!("关窗前拉取失败：{e}");
+                        }
+                        if let Err(e) = page::notepad::sync::push_only(&configs) {
+                            eprintln!("关窗前推送失败：{e}");
+                        }
                     }
                     page::notepad::mark_clean();
                     w.close();
