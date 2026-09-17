@@ -3,6 +3,7 @@ pub mod download;
 pub mod env_editor;
 pub mod http;
 pub mod imfix;
+pub mod inotify_tune;
 pub mod json;
 pub mod media;
 pub mod monitor;

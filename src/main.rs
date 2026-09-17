@@ -22,6 +22,7 @@ const PAGE_ENVEDITOR: &str = "enveditor";
 const PAGE_DOWNLOAD: &str = "download";
 const PAGE_NOTEPAD: &str = "notepad";
 const PAGE_SYSTEMD: &str = "systemd";
+const PAGE_INOTIFY: &str = "inotify";
 const PAGE_MONITOR: &str = "monitor";
 const PAGE_SETTINGS: &str = "settings";
 
@@ -50,6 +51,7 @@ fn main() -> glib::ExitCode {
         page::env_editor::shutdown();
         page::download::shutdown();
         page::notepad::shutdown();
+        page::inotify_tune::shutdown();
         page::systemd::shutdown();
         page::monitor::shutdown();
     });
@@ -293,6 +295,16 @@ fn build_ui(app: &adw::Application) {
         "preferences-system-symbolic",
         "环境变量编辑",
         page::env_editor::build().widget(),
+    );
+
+    // inotify 监视数提升页面（真实功能页）
+    add_nav_item(
+        &nav_list,
+        &stack,
+        PAGE_INOTIFY,
+        "preferences-desktop-symbolic",
+        "inotify 调优",
+        page::inotify_tune::build().widget(),
     );
 
     // 设置项：固定在底部

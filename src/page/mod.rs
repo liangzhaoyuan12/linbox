@@ -3,6 +3,7 @@ pub mod archive_cracker;
 pub mod download;
 pub mod env_editor;
 pub mod fcitx_fix;
+pub mod inotify_tune;
 pub mod json_parser;
 pub mod media_converter;
 pub mod monitor;
