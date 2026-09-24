@@ -85,7 +85,7 @@ impl Graph {
             hist2: VecDeque::with_capacity(capacity),
             capacity: capacity.max(2),
             fixed_max: if percent { Some(100.0) } else { None },
-            cap: Some(100.0).filter(|_| percent),
+            cap: if percent { Some(100.0) } else { None },
             floor_max: if percent { 100.0 } else { 1024.0 },
             c1,
             c2,
@@ -295,4 +295,113 @@ fn rounded_rect(ctx: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f6
         3.0 * std::f64::consts::FRAC_PI_2,
     );
     ctx.close_path();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 直接构造 State，绕开 GTK（Graph::new 走 build() 会创建控件，
+    // 控件测试必须挂进 notepad::tests::gtk_scenarios —— 见 GOAL 教训）。
+    fn state(hist: &[f64]) -> State {
+        State {
+            hist: hist.iter().copied().collect(),
+            hist2: VecDeque::new(),
+            capacity: hist.len().max(2),
+            fixed_max: None,
+            cap: None,
+            floor_max: 1024.0,
+            c1: Graph::BLUE,
+            c2: None,
+            percent: false,
+            unit: String::new(),
+        }
+    }
+
+    #[test]
+    fn push_hist_appends_under_capacity() {
+        let mut h: VecDeque<f64> = VecDeque::new();
+        push_hist(&mut h, 5, 1.0);
+        push_hist(&mut h, 5, 2.0);
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.make_contiguous(), &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn push_hist_evicts_fifo_at_capacity() {
+        let mut h: VecDeque<f64> = VecDeque::new();
+        for v in [1.0, 2.0, 3.0, 4.0] {
+            push_hist(&mut h, 3, v);
+        }
+        let v: Vec<f64> = h.iter().copied().collect();
+        assert_eq!(v, vec![2.0, 3.0, 4.0], "丢最旧的 1.0");
+    }
+
+    #[test]
+    fn push_hist_sanitizes_values() {
+        let mut h: VecDeque<f64> = VecDeque::new();
+        push_hist(&mut h, 10, -5.0);
+        push_hist(&mut h, 10, f64::NAN);
+        push_hist(&mut h, 10, f64::INFINITY);
+        push_hist(&mut h, 10, 7.5);
+        let v: Vec<f64> = h.iter().copied().collect();
+        assert_eq!(v, vec![0.0, 0.0, 0.0, 7.5], "负数/NaN/Inf 一律归 0");
+    }
+
+    #[test]
+    fn push_hist_capacity_zero_no_panic() {
+        let mut h: VecDeque<f64> = VecDeque::new();
+        push_hist(&mut h, 0, 1.0);
+        push_hist(&mut h, 0, 2.0);
+        assert!(h.len() <= 1, "cap=0 时不得无界增长");
+    }
+
+    #[test]
+    fn auto_max_empty_uses_floor_rounded_up() {
+        let st = state(&[]);
+        // floor 1024 → 取整到 1/2/5*10^n：n=1.024 → 步长 2 → 2000
+        assert_eq!(auto_max(&st), 2000.0);
+    }
+
+    #[test]
+    fn auto_max_scales_with_headroom() {
+        let mut st = state(&[50.0]);
+        st.floor_max = 0.0;
+        // 50*1.15=57.5 → 取整 n=5.75 → 步长10 → 100
+        assert_eq!(auto_max(&st), 100.0);
+    }
+
+    #[test]
+    fn auto_max_floor_dominates_small_data() {
+        // 数据再小，floor 也压住（防止小流量刷屏）
+        let mut st = state(&[1.0]);
+        st.floor_max = 1024.0;
+        assert_eq!(auto_max(&st), 2000.0, "floor 1024 → 取整 2000");
+    }
+
+    #[test]
+    fn auto_max_floor_zero_small_value() {
+        let mut st = state(&[1.0]);
+        st.floor_max = 0.0;
+        // 1*1.15=1.15 → n=1.15 → 步长2 → 2.0
+        assert_eq!(auto_max(&st), 2.0);
+    }
+
+    #[test]
+    fn auto_max_capped() {
+        let mut st = state(&[1000.0]);
+        st.floor_max = 0.0;
+        st.cap = Some(100.0);
+        // 1000*1.15=1150 → cap 100 → 取整 100
+        assert_eq!(auto_max(&st), 100.0);
+    }
+
+    #[test]
+    fn auto_max_considers_second_series() {
+        let mut st = state(&[10.0]);
+        st.floor_max = 0.0;
+        st.hist2 = VecDeque::from([30.0]);
+        // 取两路最大 30*1.15=34.5 → n=3.45 → 步长5 → 50
+        assert_eq!(auto_max(&st), 50.0);
+    }
 }

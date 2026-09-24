@@ -78,13 +78,13 @@ pub struct FilterEntry {
     pub enabled: bool,
 }
 
-impl FilterEntry {
+impl std::fmt::Display for FilterEntry {
     /// 渲染为滤镜图中的一个节点，如 `name=params`。
-    pub fn to_string(&self) -> String {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.params.trim().is_empty() {
-            self.name.clone()
+            f.write_str(&self.name)
         } else {
-            format!("{}={}", self.name, self.params)
+            write!(f, "{}={}", self.name, self.params)
         }
     }
 }
@@ -375,12 +375,17 @@ impl Command {
 
 /// 将整个计划渲染为可保存的 Shell 脚本。
 pub fn to_shell_script(plan: &CommandPlan, with_log: bool) -> String {
-    let mut out = String::from("#!/usr/bin/env bash\n# 由 linbox 生成的 ffmpeg 批处理脚本\nset -euo pipefail\n\n");
+    let mut out = String::from(
+        "#!/usr/bin/env bash\n# 由 linbox 生成的 ffmpeg 批处理脚本\nset -euo pipefail\n\n",
+    );
     for w in &plan.warnings {
         out.push_str(&format!("# ⚠ {w}\n"));
     }
     if let Some(list) = &plan.concat_list {
-        out.push_str(&format!("# ---- concat 列表文件 (ffconcat)：{} ----\n", plan.concat_path));
+        out.push_str(&format!(
+            "# ---- concat 列表文件 (ffconcat)：{} ----\n",
+            plan.concat_path
+        ));
         out.push_str(&format!("cat > {} <<'EOF'\n", plan.concat_path));
         out.push_str(list);
         out.push_str("EOF\n\n");
@@ -474,7 +479,12 @@ fn build_video_filters(spec: &ConversionSpec) -> Option<String> {
     {
         // 百分比缩放：用 iw/ih 表达式（此时 target_dimensions 返回 None）
         let f = spec.image.scale_percent as f64 / 100.0;
-        parts.push(format!("scale=iw*{:.3}:ih*{:.3}:flags={}", f, f, spec.video.scale_algo.ffmpeg_name()));
+        parts.push(format!(
+            "scale=iw*{:.3}:ih*{:.3}:flags={}",
+            f,
+            f,
+            spec.video.scale_algo.ffmpeg_name()
+        ));
         geometric = true;
     }
 
@@ -519,27 +529,40 @@ fn build_video_filters(spec: &ConversionSpec) -> Option<String> {
     }
     // HDR → SDR 色调映射
     if spec.advanced.tonemap && !spec.video.hdr_passthrough {
-        parts.push("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=bt2390,format=yuv420p".to_string());
+        parts.push(
+            "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=bt2390,format=yuv420p"
+                .to_string(),
+        );
     }
     // 色彩空间/范围修正（仅非默认时）
     if spec.video.colorspace != ColorSpace::Bt709 || spec.video.color_range != ColorRange::Tv {
         parts.push(format!(
             "scale=in_color_matrix={sm}:out_color_matrix={sm},format={rng}",
             sm = spec.video.colorspace.label(),
-            rng = if spec.video.color_range == ColorRange::Pc { "yuvj420p" } else { "yuv420p" }
+            rng = if spec.video.color_range == ColorRange::Pc {
+                "yuvj420p"
+            } else {
+                "yuv420p"
+            }
         ));
     }
 
     // 水印
     if spec.advanced.watermark_enabled && !spec.advanced.watermark_path.is_empty() {
         let opacity = if spec.advanced.watermark_opacity < 1.0 {
-            format!(",format=rgba,colorchannelmixer=aa={}", spec.advanced.watermark_opacity)
+            format!(
+                ",format=rgba,colorchannelmixer=aa={}",
+                spec.advanced.watermark_opacity
+            )
         } else {
             String::new()
         };
         parts.push(format!(
             "movie='{}'{opacity}[wm];[in][wm]overlay={}",
-            spec.advanced.watermark_path.replace('\\', "\\\\").replace(':', "\\:"),
+            spec.advanced
+                .watermark_path
+                .replace('\\', "\\\\")
+                .replace(':', "\\:"),
             spec.advanced.watermark_pos.overlay()
         ));
     }
@@ -605,7 +628,9 @@ fn build_audio_filters(spec: &ConversionSpec) -> (Option<String>, Vec<String>) {
         // 总时长取 ffprobe 探测值，或片段截取的结束时间；两者都未知时
         // 无法生成正确命令（旧的 st=0 会让整段音频从一开始就淡出）。
         let d = spec.audio.fade_out_sec;
-        let total = spec.duration_sec.or_else(|| parse_time_spec(&spec.clip.end));
+        let total = spec
+            .duration_sec
+            .or_else(|| parse_time_spec(&spec.clip.end));
         match total {
             Some(t) if t > d => {
                 parts.push(format!("afade=t=out:st={:.2}:d={:.2}", t - d, d));
@@ -888,9 +913,8 @@ fn build_single(spec: &ConversionSpec, _is_second_pass: bool) -> Result<CommandP
             | HwAccelPreference::Videotoolbox
     );
     let eff_hw = if two_pass && hw_enc_backend {
-        plan.warnings.push(
-            "2-Pass 编码不支持硬件编码器，已自动回退到软件编码（如 libx264）".to_string(),
-        );
+        plan.warnings
+            .push("2-Pass 编码不支持硬件编码器，已自动回退到软件编码（如 libx264）".to_string());
         HwAccelPreference::Software
     } else {
         spec.hw
@@ -1038,11 +1062,11 @@ fn build_single(spec: &ConversionSpec, _is_second_pass: bool) -> Result<CommandP
         }
 
         // 音频滤镜（视频 / 纯音频输出都适用；图片输出无音轨）
-        if spec.output_category != OutputCategory::Image {
-            if let Some(af) = &audio_filter {
-                args.push("-af".into());
-                args.push(af.clone());
-            }
+        if spec.output_category != OutputCategory::Image
+            && let Some(af) = &audio_filter
+        {
+            args.push("-af".into());
+            args.push(af.clone());
         }
 
         // 图片专属
@@ -1054,7 +1078,10 @@ fn build_single(spec: &ConversionSpec, _is_second_pass: bool) -> Result<CommandP
                 args.push("-frames:v".into());
                 args.push("1".into());
                 // 质量 / 压缩
-                if matches!(spec.output_format, ContainerFormat::Jpg | ContainerFormat::Webp | ContainerFormat::Avif) {
+                if matches!(
+                    spec.output_format,
+                    ContainerFormat::Jpg | ContainerFormat::Webp | ContainerFormat::Avif
+                ) {
                     args.push("-q:v".into());
                     args.push(spec.image.quality.to_string());
                 }
@@ -1105,7 +1132,11 @@ fn build_single(spec: &ConversionSpec, _is_second_pass: bool) -> Result<CommandP
             program: program.clone(),
             args: args[1..].to_vec(),
             display,
-            output: if pass == Some(1) { String::new() } else { out.clone() },
+            output: if pass == Some(1) {
+                String::new()
+            } else {
+                out.clone()
+            },
         });
     }
 
@@ -1121,7 +1152,10 @@ fn build_concat(spec: &ConversionSpec) -> Result<CommandPlan, String> {
 
     let mut list = String::from("ffconcat version 1.0\n");
     for inp in &spec.inputs {
-        list.push_str(&format!("file '{}'\n", inp.path.replace('\\', "\\\\").replace('\'', "\\'")));
+        list.push_str(&format!(
+            "file '{}'\n",
+            inp.path.replace('\\', "\\\\").replace('\'', "\\'")
+        ));
     }
 
     // 列表文件放在输出目录（未指定输出目录时放当前目录），
@@ -1129,7 +1163,10 @@ fn build_concat(spec: &ConversionSpec) -> Result<CommandPlan, String> {
     let concat_path = if spec.output_dir.trim().is_empty() {
         "_linbox_concat.txt".to_string()
     } else {
-        format!("{}/_linbox_concat.txt", spec.output_dir.trim().trim_end_matches('/'))
+        format!(
+            "{}/_linbox_concat.txt",
+            spec.output_dir.trim().trim_end_matches('/')
+        )
     };
 
     let mut args = vec!["ffmpeg".to_string(), "-y".to_string()];
@@ -1320,7 +1357,7 @@ fn sequence_pattern(input: &str) -> (String, bool) {
         .char_indices()
         .filter(|(_, c)| !c.is_ascii_digit())
         .map(|(i, _)| i + 1)
-        .last()
+        .next_back()
         .unwrap_or(0);
     let tail = &stem[digits_start..];
     if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
@@ -1410,10 +1447,21 @@ fn build_video_to_gif(spec: &ConversionSpec) -> Result<CommandPlan, String> {
     }
     p1.push("-i".into());
     p1.push(spec.inputs[0].path.clone());
-    let w = if spec.image.gif_width > 0 { spec.image.gif_width } else { 480 };
-    let fps = if spec.image.gif_fps > 0.0 { spec.image.gif_fps } else { 15.0 };
+    let w = if spec.image.gif_width > 0 {
+        spec.image.gif_width
+    } else {
+        480
+    };
+    let fps = if spec.image.gif_fps > 0.0 {
+        spec.image.gif_fps
+    } else {
+        15.0
+    };
     p1.push("-vf".into());
-    p1.push(format!("fps={},scale={}:-1:flags=lanczos,palettegen", fps, w));
+    p1.push(format!(
+        "fps={},scale={}:-1:flags=lanczos,palettegen",
+        fps, w
+    ));
     p1.push(palette.clone());
 
     // 第二遍：合成 GIF（-ss 放在 -i 之前，与第一遍同样是输入定位，保证两遍取同一段画面）
@@ -1528,8 +1576,12 @@ mod tests {
         let mut spec = base_spec();
         spec.mode = JobMode::Concat;
         spec.inputs = vec![
-            InputSpec { path: "a.mp4".into() },
-            InputSpec { path: "b.mp4".into() },
+            InputSpec {
+                path: "a.mp4".into(),
+            },
+            InputSpec {
+                path: "b.mp4".into(),
+            },
         ];
         let plan = build_commands(&spec).unwrap();
         assert!(plan.concat_list.is_some());
@@ -1546,8 +1598,18 @@ mod tests {
         spec.output_format = ContainerFormat::Gif;
         let plan = build_commands(&spec).unwrap();
         assert_eq!(plan.commands.len(), 2);
-        assert!(plan.commands[0].args.iter().any(|a| a.contains("palettegen")));
-        assert!(plan.commands[1].args.iter().any(|a| a.contains("paletteuse")));
+        assert!(
+            plan.commands[0]
+                .args
+                .iter()
+                .any(|a| a.contains("palettegen"))
+        );
+        assert!(
+            plan.commands[1]
+                .args
+                .iter()
+                .any(|a| a.contains("paletteuse"))
+        );
     }
 
     /// 取 args 中 key 的下一项（-vf / -af / -c:v 后面的值）。
@@ -1577,7 +1639,10 @@ mod tests {
         spec.video.keep_aspect = true;
         let plan = build_commands(&spec).unwrap();
         let vf = arg_after(&plan.commands[0].args, "-vf").expect("应有 -vf");
-        assert!(vf.contains("force_original_aspect_ratio=decrease"), "vf={vf}");
+        assert!(
+            vf.contains("force_original_aspect_ratio=decrease"),
+            "vf={vf}"
+        );
         // 保持宽高比时不再硬写 (w,-2) 丢弃目标高度
         assert!(!vf.contains("scale=1920:-2"), "vf={vf}");
     }
@@ -1609,7 +1674,10 @@ mod tests {
         let args = &plan.commands[0].args;
         let vf = arg_after(args, "-vf").expect("VAAPI 无用户滤镜也应生成上传链");
         assert!(vf.contains("hwupload"), "vf={vf}");
-        assert!(!vf.contains("hwaccel_output_format"), "不得与 -hwaccel 冲突");
+        assert!(
+            !vf.contains("hwaccel_output_format"),
+            "不得与 -hwaccel 冲突"
+        );
     }
 
     #[test]
@@ -1634,7 +1702,9 @@ mod tests {
         spec.inputs[0].path = "frames/frame_0001.png".into();
         let plan = build_commands(&spec).unwrap();
         assert!(
-            plan.commands[0].args.contains(&"frames/frame_%04d.png".to_string()),
+            plan.commands[0]
+                .args
+                .contains(&"frames/frame_%04d.png".to_string()),
             "应把首帧推导为序列模式：{:?}",
             plan.commands[0].args
         );

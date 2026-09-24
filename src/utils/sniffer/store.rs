@@ -28,16 +28,17 @@ use crate::model::sniffer::{Checkpoint, PlatformConfig, SnifferStore, ValidKeyRe
 
 /// 解析 XDG 目录，未设置时回落到 `$HOME/<fallback>`。
 fn xdg_dir(env_key: &str, fallback: &str) -> PathBuf {
-    let base = std::env::var_os(env_key)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| match std::env::var_os("HOME") {
-            Some(home) => {
-                let mut p = PathBuf::from(home);
-                p.push(fallback);
-                p
-            }
-            None => PathBuf::from("."),
-        });
+    let base =
+        std::env::var_os(env_key)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| match std::env::var_os("HOME") {
+                Some(home) => {
+                    let mut p = PathBuf::from(home);
+                    p.push(fallback);
+                    p
+                }
+                None => PathBuf::from("."),
+            });
     let mut p = base;
     p.push("linbox");
     p
@@ -64,14 +65,18 @@ pub fn db_path() -> PathBuf {
 
 /// 断点文件（按平台独立存放，避免多平台并行嗅探时互相覆盖进度）。
 pub fn checkpoint_path(platform: &str) -> PathBuf {
-    data_dir().join(format!("apikey_checkpoint_{}.json", sanitize_platform(platform)))
+    data_dir().join(format!(
+        "apikey_checkpoint_{}.json",
+        sanitize_platform(platform)
+    ))
 }
 
 /// 平台名 → 安全文件名片段（中英文、数字、下划线、连字符保留，其余替换成 `_`）。
 fn sanitize_platform(name: &str) -> String {
     let mut out = String::new();
     for ch in name.chars() {
-        if ch.is_alphanumeric() || ch == '_' || ch == '-' || ('\u{4e00}'..='\u{9fff}').contains(&ch) {
+        if ch.is_alphanumeric() || ch == '_' || ch == '-' || ('\u{4e00}'..='\u{9fff}').contains(&ch)
+        {
             out.push(ch);
         } else {
             out.push('_');
@@ -122,14 +127,19 @@ fn pool() -> &'static SqlitePool {
             .filename(&path)
             .create_if_missing(true)
             .busy_timeout(Duration::from_secs(5));
-        SqlitePoolOptions::new().max_connections(8).connect_lazy_with(opts)
+        SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect_lazy_with(opts)
     })
 }
 
 /// 初始化数据库结构（幂等）。页面启动时调用一次；失败只记录，不影响打开。
 pub fn init_db() {
     if let Err(e) = super::runtime().block_on(async {
-        sqlx::query(CREATE_TABLE).execute(pool()).await.map_err(|e| e.to_string())
+        sqlx::query(CREATE_TABLE)
+            .execute(pool())
+            .await
+            .map_err(|e| e.to_string())
     }) {
         eprintln!("[linbox] SQLite 建表失败：{e}");
     }
@@ -266,7 +276,10 @@ pub fn rename_platform(old: &str, new: &str) -> Result<(), String> {
         return Ok(());
     }
     super::runtime().block_on(async {
-        let mut tx = pool().begin().await.map_err(|e| format!("开启事务失败：{e}"))?;
+        let mut tx = pool()
+            .begin()
+            .await
+            .map_err(|e| format!("开启事务失败：{e}"))?;
         sqlx::query(
             "INSERT OR IGNORE INTO valid_keys
                 (platform, base_url, endpoint, model, key, status, latency_ms, found_at, snippet)
@@ -283,7 +296,9 @@ pub fn rename_platform(old: &str, new: &str) -> Result<(), String> {
             .execute(&mut *tx)
             .await
             .map_err(|e| format!("清理旧平台名记录失败：{e}"))?;
-        tx.commit().await.map_err(|e| format!("提交事务失败：{e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("提交事务失败：{e}"))?;
         Ok(())
     })
 }
@@ -306,8 +321,9 @@ pub fn rename_checkpoint(old: &str, new: &str) {
 /// - `csv` = false → 格式化 JSON 数组
 pub fn export_valid(records: &[ValidKeyRecord], path: &str, csv: bool) -> Result<(), String> {
     let text = if csv {
-        let mut out =
-            String::from("\u{feff}platform,base_url,endpoint,model,status,latency_ms,found_at,key\n");
+        let mut out = String::from(
+            "\u{feff}platform,base_url,endpoint,model,status,latency_ms,found_at,key\n",
+        );
         for r in records {
             out.push_str(&format!(
                 "{},{},{},{},{},{},{},\"{}\"\n",
@@ -430,7 +446,7 @@ mod tests {
 
     #[test]
     fn export_produces_csv_header() {
-        let records = vec![sample(1)];
+        let records = [sample(1)];
         let text = {
             let mut s = String::from("\u{feff}");
             s.push_str("platform,base_url,endpoint,model,status,latency_ms,found_at,key\n");
@@ -448,7 +464,9 @@ mod tests {
         // 必须在任何 pool() 调用之前设置环境变量（池路径在首次连接时固定）
         let tmp = std::env::temp_dir().join(format!("linbox_sqlite_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        unsafe { std::env::set_var("XDG_DATA_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &tmp);
+        }
 
         init_db();
         let r1 = sample(11);
@@ -490,7 +508,10 @@ mod tests {
         };
         save_checkpoint(&cp).unwrap();
         rename_checkpoint(&r2.platform, &new_name);
-        assert!(load_checkpoint(&r2.platform).is_none(), "旧平台名的断点应被迁走");
+        assert!(
+            load_checkpoint(&r2.platform).is_none(),
+            "旧平台名的断点应被迁走"
+        );
         let moved = load_checkpoint(&new_name).expect("断点应随平台名迁移");
         assert_eq!(moved.fingerprint, "fp");
 

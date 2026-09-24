@@ -879,3 +879,160 @@ pub struct Snapshot {
     /// 采样时刻（毫秒时间戳）。
     pub at_ms: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mem_used_ratio_math() {
+        let m = MemStat {
+            total: 1000,
+            used: 250,
+            ..Default::default()
+        };
+        assert_eq!(m.used_ratio(), 0.25);
+        let zero = MemStat::default();
+        assert_eq!(zero.used_ratio(), 0.0, "total=0 必须防御除零");
+        assert_eq!(zero.swap_ratio(), 0.0, "swap_total=0 必须防御除零");
+        let s = MemStat {
+            swap_total: 4,
+            swap_used: 3,
+            ..Default::default()
+        };
+        assert_eq!(s.swap_ratio(), 0.75);
+    }
+
+    #[test]
+    fn net_errors_empty_when_clean() {
+        assert_eq!(NetIface::default().errors(), "");
+        let n = NetIface {
+            rx_errs: 2,
+            tx_errs: 1,
+            ..Default::default()
+        };
+        assert_eq!(n.errors(), "错误 2 / 1");
+        let n = NetIface {
+            rx_drop: 7,
+            tx_drop: 3,
+            ..Default::default()
+        };
+        assert_eq!(n.errors(), "丢包 7 / 3");
+        let n = NetIface {
+            rx_errs: 1,
+            tx_drop: 5,
+            ..Default::default()
+        };
+        assert_eq!(n.errors(), "错误 1 / 0 · 丢包 0 / 5");
+    }
+
+    #[test]
+    fn wireless_detection() {
+        assert!(!NetIface::default().is_wireless());
+        let w = NetIface {
+            signal_dbm: Some(-45.0),
+            ..Default::default()
+        };
+        assert!(w.is_wireless());
+        let w = NetIface {
+            link_quality: Some(50.0),
+            ..Default::default()
+        };
+        assert!(w.is_wireless());
+    }
+
+    #[test]
+    fn signal_text_matrix() {
+        let both = NetIface {
+            signal_dbm: Some(-50.0),
+            link_quality: Some(40.7),
+            ..Default::default()
+        };
+        assert_eq!(both.signal_text(), "信号 -50 dBm · 链路质量 41");
+        let dbm = NetIface {
+            signal_dbm: Some(-60.0),
+            ..Default::default()
+        };
+        assert_eq!(dbm.signal_text(), "信号 -60 dBm");
+        let qual = NetIface {
+            link_quality: Some(30.0),
+            ..Default::default()
+        };
+        assert_eq!(qual.signal_text(), "链路质量 30");
+        assert_eq!(NetIface::default().signal_text(), "");
+    }
+
+    #[test]
+    fn sensor_kind_labels_and_units() {
+        assert_eq!(SensorKind::Temp.label(), "温度");
+        assert_eq!(SensorKind::Fan.label(), "风扇");
+        assert_eq!(SensorKind::Voltage.label(), "电压");
+        assert_eq!(SensorKind::Power.label(), "功耗");
+        assert_eq!(SensorKind::Current.label(), "电流");
+        assert_eq!(SensorKind::Freq.label(), "频率");
+        assert_eq!(SensorKind::Temp.unit(), "°C");
+        assert_eq!(SensorKind::Fan.unit(), "RPM");
+        assert_eq!(SensorKind::Voltage.unit(), "V");
+        assert_eq!(SensorKind::Power.unit(), "W");
+        assert_eq!(SensorKind::Current.unit(), "A");
+        assert_eq!(SensorKind::Freq.unit(), "MHz");
+    }
+
+    #[test]
+    fn display_name_prefers_comm_then_cmdline() {
+        let p = Process {
+            name: "chrome".into(),
+            cmdline: "/usr/bin/chrome --type=renderer".into(),
+            ..Default::default()
+        };
+        assert_eq!(p.display_name(), "chrome");
+        let p = Process {
+            name: String::new(),
+            cmdline: "/usr/bin/python3 script.py".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.display_name(),
+            "/usr/bin/python3",
+            "空 comm 取 cmdline 首词"
+        );
+        let p = Process::default();
+        assert_eq!(p.display_name(), "");
+    }
+
+    #[test]
+    fn zombie_detection() {
+        let p = Process {
+            state_char: 'Z',
+            ..Default::default()
+        };
+        assert!(p.is_zombie());
+        let p = Process {
+            state_char: 'S',
+            ..Default::default()
+        };
+        assert!(!p.is_zombie());
+    }
+
+    #[test]
+    fn signal_lookup() {
+        let s = signal_by_num(31).expect("31 = SIGSYS 在表里");
+        assert_eq!(s.name, "SIGSYS");
+        assert!(signal_by_num(9999).is_none());
+    }
+
+    #[test]
+    fn proc_columns_covered() {
+        assert_eq!(ProcColumn::Name.label(), "名称");
+        assert_eq!(ProcColumn::Cgroup.label(), "应用/cgroup");
+        assert_eq!(ProcColumn::ALL.len(), 18, "ALL 必须覆盖全部 18 列变体");
+        // 默认可见列必须是 ALL 的子集
+        for c in ProcColumn::DEFAULT_VISIBLE {
+            assert!(ProcColumn::ALL.contains(c), "{:?} 不在 ALL 里", c);
+        }
+        assert!(ProcColumn::DEFAULT_VISIBLE.len() < ProcColumn::ALL.len());
+        for c in ProcColumn::ALL {
+            assert!(!c.label().is_empty());
+        }
+    }
+}

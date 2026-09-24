@@ -13,4 +13,4 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 #[allow(unused_imports)]
-pub use scan::{start as start_scan, Control, PathScanParams};
+pub use scan::{Control, PathScanParams, start as start_scan};

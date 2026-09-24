@@ -52,16 +52,19 @@ pub(crate) fn with_ui<F: FnOnce(&Ui)>(f: F) {
     let Some(ui) = INNER.with(|i| i.try_borrow().ok().and_then(|b| b.clone())) else {
         return;
     };
-    f(&*ui);
+    f(&ui);
 }
 
 /// 程序退出时停止采样线程（由 `main.rs` 调用）。
 pub fn shutdown() {
     INNER.with(|i| {
-        if let Ok(mut b) = i.try_borrow_mut() {
-            if let Some(ui) = b.take() {
-                ui.control.stop();
-            }
+        if let Ok(mut b) = i.try_borrow_mut()
+            && let Some(ui) = b.take()
+        {
+            ui.control.stop();
+            // 页销毁后没有 UI 消费速率/详情，把分层采样开关复位
+            mon::set_io_columns(false);
+            mon::set_io_detail(false);
         }
     });
 }
@@ -75,6 +78,8 @@ pub(crate) struct Ui {
     rx: RefCell<Receiver<Snapshot>>,
     /// 暂停刷新（采样继续，界面不更新，方便盯着某个进程看）
     paused: Cell<bool>,
+    /// 用户选择的采样周期（页面重新可见时恢复；不可见期间被降到 HIDDEN_INTERVAL_MS）
+    user_interval: Cell<u64>,
     toast_overlay: adw::ToastOverlay,
     status: gtk::Label,
     overview: overview::Overview,
@@ -125,11 +130,21 @@ impl Ui {
             snap.processes.len(),
             snap.sys.threads,
         ));
-        self.overview.update(&snap);
+        // 只刷新「内层标签可见」的视图（GOAL.md 2.5）：隐藏视图每秒全量
+        // 重建也是白烧 CPU。进程表另有一层自带门控（还负责存数据，必须每轮调用）。
+        if self.overview.widget().is_mapped() {
+            self.overview.update(&snap);
+        }
         self.procs.update(&snap);
-        self.sensors.update(&snap);
-        self.storage.update(&snap);
-        self.net.update(&snap);
+        if self.sensors.widget().is_mapped() {
+            self.sensors.update(&snap);
+        }
+        if self.storage.widget().is_mapped() {
+            self.storage.update(&snap);
+        }
+        if self.net.widget().is_mapped() {
+            self.net.update(&snap);
+        }
         *self.last.borrow_mut() = Some(snap);
     }
 
@@ -140,7 +155,22 @@ impl Ui {
                 .set_text("已暂停刷新（采样仍在后台进行，点「继续刷新」恢复显示）");
         }
     }
+
+    /// 页面不可见（被切走 / 窗口最小化）：采样降到 [`HIDDEN_INTERVAL_MS`]，
+    /// 界面排空由 120ms 定时器按 `is_mapped` 跳过（GOAL.md 2.4）。
+    fn on_unmapped(&self) {
+        self.control.set_interval_ms(HIDDEN_INTERVAL_MS);
+    }
+
+    /// 页面重新可见：恢复用户选择的采样周期。
+    fn on_mapped(&self) {
+        self.control
+            .set_interval_ms(self.user_interval.get().max(200));
+    }
 }
+
+/// 页面不可见时的采样周期（毫秒）。
+const HIDDEN_INTERVAL_MS: u64 = 5000;
 
 fn interval_label(ms: u64) -> String {
     for (name, secs) in INTERVAL_OPTIONS {
@@ -374,6 +404,7 @@ pub fn build() -> MonitorPage {
         control: control.clone(),
         rx: RefCell::new(rx),
         paused: Cell::new(false),
+        user_interval: Cell::new(control.interval_ms()),
         toast_overlay: toast_overlay.clone(),
         status: status.clone(),
         overview,
@@ -406,7 +437,9 @@ pub fn build() -> MonitorPage {
         move |dd| {
             let idx = dd.selected() as usize;
             if let Some((name, secs)) = INTERVAL_OPTIONS.get(idx) {
-                ui.control.set_interval_ms((secs * 1000.0) as u64);
+                let ms = (secs * 1000.0) as u64;
+                ui.user_interval.set(ms);
+                ui.control.set_interval_ms(ms);
                 ui.toast(&format!("采样周期已切换为 {name}"), false);
             }
         }
@@ -434,15 +467,35 @@ pub fn build() -> MonitorPage {
         }
     ));
 
-    // 每 120ms 排空一次 channel（采样线程按自己的周期产出）
+    // 每 120ms 排空一次 channel（采样线程按自己的周期产出）。
+    // 页面不可见时直接跳过：排空 + 五个视图刷新会让 GtkColumnView 每轮
+    // 全量销毁重建 ~2200 个单元格 widget（实测首页挂机 73% CPU 的主因，GOAL.md 2.4）。
     let weak = Rc::downgrade(&ui);
     glib::timeout_add_local(Duration::from_millis(120), move || match weak.upgrade() {
         Some(ui) => {
-            ui.drain();
+            if ui.toast_overlay.is_mapped() {
+                ui.drain();
+            }
             glib::ControlFlow::Continue
         }
         None => glib::ControlFlow::Break,
     });
+
+    // GOAL.md 2.4：不可见降频 / 可见恢复（窗口最小化同样走 unmap）
+    toast_overlay.connect_unmap(clone!(
+        #[weak]
+        ui,
+        move |_| ui.on_unmapped()
+    ));
+    toast_overlay.connect_map(clone!(
+        #[weak]
+        ui,
+        move |_| ui.on_mapped()
+    ));
+    // 启动停在首页：监视器页从未 map 过，先按不可见处理
+    if !toast_overlay.is_mapped() {
+        ui.on_unmapped();
+    }
 
     MonitorPage {
         root: toast_overlay,

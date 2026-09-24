@@ -71,7 +71,13 @@ impl DownloadManager {
         GLOBAL
             .get_or_init(|| {
                 let cfg = cfg.unwrap_or_default();
-                let client = build_client(&cfg).expect("初始化 HTTP 客户端失败（配置错误）");
+                // 用户配置里的 UA 等字段非法时回退默认配置重建；仍失败才是环境
+                // 级问题（rustls 初始化失败），此时无法提供下载功能，允许致命。
+                let client = build_client(&cfg).unwrap_or_else(|e| {
+                    eprintln!("[download] 配置构建 HTTP 客户端失败，回退默认配置：{e}");
+                    build_client(&DownloadConfig::default())
+                        .expect("默认配置也无法构建 HTTP 客户端（rustls 环境异常）")
+                });
                 let sem = Arc::new(Semaphore::new(cfg.max_concurrent_tasks as usize));
                 Arc::new(DownloadManager {
                     client,
@@ -90,13 +96,13 @@ impl DownloadManager {
     }
 
     pub fn config(&self) -> DownloadConfig {
-        self.cfg.read().unwrap().clone()
+        self.cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn set_config(&self, cfg: DownloadConfig) {
-        *self.semaphore.write().unwrap() =
+        *self.semaphore.write().unwrap_or_else(|e| e.into_inner()) =
             Arc::new(Semaphore::new(cfg.max_concurrent_tasks as usize));
-        *self.cfg.write().unwrap() = cfg;
+        *self.cfg.write().unwrap_or_else(|e| e.into_inner()) = cfg;
     }
 
     // -----------------------------------------------------------------------
@@ -142,8 +148,11 @@ impl DownloadManager {
             range_supported: false,
             created_at: now,
         }));
-        let id = task.lock().unwrap().id;
-        self.tasks.lock().unwrap().insert(id, task);
+        let id = task.lock().unwrap_or_else(|e| e.into_inner()).id;
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, task);
         exec_task(self.clone(), id);
         Ok(id)
     }
@@ -151,8 +160,14 @@ impl DownloadManager {
     /// 恢复暂停的任务（重新走探询 → meta 恢复分片 → 续下）。
     /// 仅对 Paused/Failed 状态的任务生效，其他状态静默忽略。
     pub fn resume(self: &Arc<Self>, id: u64) {
-        let should_exec = if let Some(task) = self.tasks.lock().unwrap().get(&id).cloned() {
-            let mut t = task.lock().unwrap();
+        let should_exec = if let Some(task) = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
+        {
+            let mut t = task.lock().unwrap_or_else(|e| e.into_inner());
             match t.status {
                 TaskStatus::Paused => {
                     t.pause_flag.store(false, Ordering::SeqCst);
@@ -177,8 +192,14 @@ impl DownloadManager {
 
     /// 暂停：置位暂停标记，块下载中断，保留分片与 meta。
     pub fn pause(&self, id: u64) {
-        if let Some(task) = self.tasks.lock().unwrap().get(&id).cloned() {
-            let t = task.lock().unwrap();
+        if let Some(task) = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
+        {
+            let t = task.lock().unwrap_or_else(|e| e.into_inner());
             t.pause_flag.store(true, Ordering::SeqCst);
         }
     }
@@ -189,8 +210,14 @@ impl DownloadManager {
     /// 其余状态（Pending/Paused/Failed 等，无活跃下载线程）当场清理现场。
     pub fn cancel_and_remove(self: &Arc<Self>, id: u64) {
         let mut direct: Option<(String, String, usize, u64)> = None;
-        if let Some(task) = self.tasks.lock().unwrap().get(&id).cloned() {
-            let mut t = task.lock().unwrap();
+        if let Some(task) = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
+        {
+            let mut t = task.lock().unwrap_or_else(|e| e.into_inner());
             t.cancel_flag.store(true, Ordering::SeqCst);
             if t.status != TaskStatus::Downloading {
                 t.status = TaskStatus::Cancelled;
@@ -199,8 +226,14 @@ impl DownloadManager {
                 }
             }
         }
-        self.tasks.lock().unwrap().remove(&id);
-        self.speed_cache.lock().unwrap().remove(&id);
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        self.speed_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
         if let Some((dir, filename, seg_count, task_id)) = direct {
             std::thread::spawn(move || {
                 for i in 0..seg_count {
@@ -213,17 +246,23 @@ impl DownloadManager {
 
     /// 从任务表移除（已完成/失败/取消的记录清理）。
     pub fn remove(&self, id: u64) {
-        self.tasks.lock().unwrap().remove(&id);
-        self.speed_cache.lock().unwrap().remove(&id);
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        self.speed_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
     }
 
     /// 清理所有已完成/失败/取消的任务（保留进行中/暂停）。
     pub fn purge_finished(&self) {
-        let mut tasks = self.tasks.lock().unwrap();
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         let ids: Vec<u64> = tasks
             .iter()
             .filter(|(_, t)| {
-                let t = t.lock().unwrap();
+                let t = t.lock().unwrap_or_else(|e| e.into_inner());
                 matches!(
                     t.status,
                     TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
@@ -233,7 +272,10 @@ impl DownloadManager {
             .collect();
         for id in ids {
             tasks.remove(&id);
-            self.speed_cache.lock().unwrap().remove(&id);
+            self.speed_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
         }
     }
 
@@ -241,11 +283,11 @@ impl DownloadManager {
     pub fn snapshot(&self) -> Vec<TaskSnapshot> {
         let now = std::time::Instant::now();
         // 锁顺序与其它方法一致：tasks → speed_cache，避免死锁
-        let tasks = self.tasks.lock().unwrap();
-        let mut cache = self.speed_cache.lock().unwrap();
+        let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.speed_cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut snaps: Vec<TaskSnapshot> = Vec::with_capacity(tasks.len());
         for (id, task) in tasks.iter() {
-            let t = task.lock().unwrap();
+            let t = task.lock().unwrap_or_else(|e| e.into_inner());
             let downloaded = t.downloaded.load(Ordering::Relaxed);
             let speed = match t.status {
                 TaskStatus::Downloading | TaskStatus::Pending => match cache.get(id) {
@@ -286,7 +328,7 @@ impl DownloadManager {
     }
 
     pub fn task_count(&self) -> usize {
-        self.tasks.lock().unwrap().len()
+        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -295,7 +337,11 @@ impl DownloadManager {
 // ---------------------------------------------------------------------------
 
 fn exec_task(mgr: Arc<DownloadManager>, id: u64) {
-    let sem = mgr.semaphore.read().unwrap().clone();
+    let sem = mgr
+        .semaphore
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     dl_runtime().spawn(async move {
         let _perm = sem.acquire_owned().await;
         run_download(mgr, id).await;
@@ -304,7 +350,13 @@ fn exec_task(mgr: Arc<DownloadManager>, id: u64) {
 
 /// 执行一个下载任务（探询 → 造段 → 并发分块 → 合并/收尾）。
 async fn run_download(mgr: Arc<DownloadManager>, id: u64) {
-    let task_arc = match mgr.tasks.lock().unwrap().get(&id).cloned() {
+    let task_arc = match mgr
+        .tasks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .cloned()
+    {
         Some(t) => t,
         None => return,
     };
@@ -314,9 +366,13 @@ async fn run_download(mgr: Arc<DownloadManager>, id: u64) {
     };
     // 兜底：目录被删/不存在时自动重建（正常情况下 add/resume 时已创建）
     {
-        let dir = task_arc.lock().unwrap().dir.clone();
+        let dir = task_arc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dir
+            .clone();
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            let mut t = task_arc.lock().unwrap();
+            let mut t = task_arc.lock().unwrap_or_else(|e| e.into_inner());
             t.status = TaskStatus::Failed;
             t.error = Some(format!("下载目录不可用（{dir}）：{e}"));
             return;
@@ -325,7 +381,7 @@ async fn run_download(mgr: Arc<DownloadManager>, id: u64) {
     // 标记复位：pause_flag 允许复位（新启动/恢复都从无暂停开始）；
     // cancel_flag 不复位——一旦取消必须消费到底，否则排队/探询中的任务会“删不动”。
     {
-        let mut t = task_arc.lock().unwrap();
+        let mut t = task_arc.lock().unwrap_or_else(|e| e.into_inner());
         if t.cancel_flag.load(Ordering::SeqCst) {
             // 启动前已被取消：直接退出（现场清理由 cancel_and_remove 负责）
             t.status = TaskStatus::Cancelled;
@@ -343,7 +399,7 @@ async fn run_download(mgr: Arc<DownloadManager>, id: u64) {
         Ok(r) => r,
         Err(e) => {
             {
-                let mut t = task_arc.lock().unwrap();
+                let mut t = task_arc.lock().unwrap_or_else(|e| e.into_inner());
                 t.status = TaskStatus::Failed;
                 t.error = Some(e.clone());
             }
@@ -351,7 +407,7 @@ async fn run_download(mgr: Arc<DownloadManager>, id: u64) {
         }
     };
     {
-        let mut t = task_arc.lock().unwrap();
+        let mut t = task_arc.lock().unwrap_or_else(|e| e.into_inner());
         t.url = url;
         t.dir = dir;
         t.filename = filename.clone();
@@ -396,7 +452,7 @@ async fn run_download(mgr: Arc<DownloadManager>, id: u64) {
 
     // 3) 根据结果收尾
     let (paused, cancelled) = {
-        let t = task_arc.lock().unwrap();
+        let t = task_arc.lock().unwrap_or_else(|e| e.into_inner());
         (
             t.pause_flag.load(Ordering::SeqCst),
             t.cancel_flag.load(Ordering::SeqCst),
@@ -406,21 +462,21 @@ async fn run_download(mgr: Arc<DownloadManager>, id: u64) {
     // 取消优先于暂停：两标记同置（先暂停后删除）时按取消收尾，分片/现场全部清理
     if cancelled {
         {
-            let mut t = task_arc.lock().unwrap();
+            let mut t = task_arc.lock().unwrap_or_else(|e| e.into_inner());
             t.status = TaskStatus::Cancelled;
         }
         cleanup_segments(&task_arc).await;
         return;
     }
     if paused {
-        let mut t = task_arc.lock().unwrap();
+        let mut t = task_arc.lock().unwrap_or_else(|e| e.into_inner());
         t.status = TaskStatus::Paused;
         return;
     }
     // 有失败分片
     if let Some((_, Err(e))) = results.iter().find(|(_, r)| r.is_err()) {
         {
-            let mut t = task_arc.lock().unwrap();
+            let mut t = task_arc.lock().unwrap_or_else(|e| e.into_inner());
             t.status = TaskStatus::Failed;
             t.error = Some(e.clone());
         }
@@ -429,7 +485,7 @@ async fn run_download(mgr: Arc<DownloadManager>, id: u64) {
     // 全部成功 → 合并
     match merge_segments(&task_arc).await {
         Ok(_path) => {
-            let mut t = task_arc.lock().unwrap();
+            let mut t = task_arc.lock().unwrap_or_else(|e| e.into_inner());
             t.status = TaskStatus::Completed;
             let total = t.total_size;
             if let Some(total) = total {
@@ -437,7 +493,7 @@ async fn run_download(mgr: Arc<DownloadManager>, id: u64) {
             }
         }
         Err(e) => {
-            let mut t = task_arc.lock().unwrap();
+            let mut t = task_arc.lock().unwrap_or_else(|e| e.into_inner());
             t.status = TaskStatus::Failed;
             t.error = Some(e);
         }
@@ -484,7 +540,7 @@ async fn probe(
     task: &Arc<Mutex<DownloadTask>>,
 ) -> Result<(String, String, String, Option<u64>, Vec<Segment>, u32, bool), String> {
     let (url, dir, given_filename, threads, task_id) = {
-        let t = task.lock().unwrap();
+        let t = task.lock().unwrap_or_else(|e| e.into_inner());
         (
             t.url.clone(),
             t.dir.clone(),
@@ -516,19 +572,20 @@ async fn probe(
 
     // 检查是否存在断点续传现场（本任务的 meta，文件名含任务 id）
     let meta_file_path = meta_path(&dir, &filename, task_id);
-    if let Some(meta) = load_meta(&meta_file_path) {
-        if meta.url == url && meta.version == META_VERSION {
-            let range_ok = meta.segments.len() > 1;
-            return Ok((
-                url,
-                dir,
-                filename,
-                meta.total_size,
-                meta.segments,
-                meta.threads.max(1),
-                range_ok,
-            ));
-        }
+    if let Some(meta) = load_meta(&meta_file_path)
+        && meta.url == url
+        && meta.version == META_VERSION
+    {
+        let range_ok = meta.segments.len() > 1;
+        return Ok((
+            url,
+            dir,
+            filename,
+            meta.total_size,
+            meta.segments,
+            meta.threads.max(1),
+            range_ok,
+        ));
     }
 
     let range_ok = status == StatusCode::PARTIAL_CONTENT;
@@ -587,7 +644,7 @@ async fn probe(
     };
 
     // 保存现场（断点续传 meta）
-    if segments.len() > 0 {
+    if !segments.is_empty() {
         let meta = MetaFile {
             version: META_VERSION,
             url: url.clone(),
@@ -617,10 +674,10 @@ async fn download_segment(
     task: Arc<Mutex<DownloadTask>>,
     idx: usize,
     retries: u32,
-    timeout_secs: u64,
+    _timeout_secs: u64,
 ) -> Result<(), String> {
     let (url, dir, filename, seg, range_ok, task_id) = {
-        let t = task.lock().unwrap();
+        let t = task.lock().unwrap_or_else(|e| e.into_inner());
         (
             t.url.clone(),
             t.dir.clone(),
@@ -651,7 +708,7 @@ async fn download_segment(
     // 服务器不支持 Range：无法续传，清空旧分片从头下载
     if !range_ok && existing > 0 {
         let _ = tokio::fs::remove_file(&seg_path).await;
-        existing = 0;
+        // existing 后续仅在下方重试分支再次清零，此处赋值无人读取（clippy）
     }
 
     let mut attempt = 0u32;
@@ -659,7 +716,6 @@ async fn download_segment(
         // !range_ok 不支持断点续传：每次重试前清空分片文件，防止追加导致数据重复
         if !range_ok && attempt > 0 {
             let _ = tokio::fs::remove_file(&seg_path).await;
-            existing = 0;
         }
         // 每次重试时重新计算 from：文件可能在上次尝试中已追加了数据，
         // 必须从当前文件大小续传，否则 Range 重叠会导致数据重复写入。
@@ -682,7 +738,7 @@ async fn download_segment(
         };
         // 暂停/取消检查
         {
-            let t = task.lock().unwrap();
+            let t = task.lock().unwrap_or_else(|e| e.into_inner());
             if t.pause_flag.load(Ordering::SeqCst) {
                 return Err("paused".into());
             }
@@ -735,7 +791,7 @@ async fn download_segment(
                 let mut written: u64 = 0;
                 loop {
                     let cancelled = {
-                        let t = task.lock().unwrap();
+                        let t = task.lock().unwrap_or_else(|e| e.into_inner());
                         t.pause_flag.load(Ordering::SeqCst) || t.cancel_flag.load(Ordering::SeqCst)
                     };
                     if cancelled {
@@ -792,7 +848,7 @@ fn backoff(attempt: u32) -> std::time::Duration {
 /// 合并分片 → 最终文件，删除分片与 meta。
 async fn merge_segments(task: &Arc<Mutex<DownloadTask>>) -> Result<PathBuf, String> {
     let (dir, filename, seg_count, task_id) = {
-        let t = task.lock().unwrap();
+        let t = task.lock().unwrap_or_else(|e| e.into_inner());
         (t.dir.clone(), t.filename.clone(), t.segments.len(), t.id)
     };
     let final_path = PathBuf::from(&dir).join(&filename);
@@ -849,7 +905,7 @@ async fn merge_segments(task: &Arc<Mutex<DownloadTask>>) -> Result<PathBuf, Stri
 /// 取消时清理分片与 meta。
 async fn cleanup_segments(task: &Arc<Mutex<DownloadTask>>) {
     let (dir, filename, seg_count, task_id) = {
-        let t = task.lock().unwrap();
+        let t = task.lock().unwrap_or_else(|e| e.into_inner());
         (t.dir.clone(), t.filename.clone(), t.segments.len(), t.id)
     };
     for i in 0..seg_count {
@@ -899,12 +955,13 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push(h * 16 + l);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -1095,11 +1152,47 @@ mod tests {
         assert_eq!(covered, 1000);
     }
 
+    /// GOAL 4.5：喂损坏输入不得 panic —— URL/百分号编码的边界垃圾。
+    #[test]
+    fn corrupt_url_and_percent_inputs_no_panic() {
+        // percent_decode：截断 / 非法 hex 序列一律原样保留
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("%A"), "%A", "截断的十六进制");
+        assert_eq!(percent_decode("%4g"), "%4g", "非法第二个字符");
+        assert_eq!(percent_decode("100%"), "100%", "尾部裸 %");
+        assert_eq!(percent_decode("%0"), "%0", "只有一位十六进制");
+        assert_eq!(percent_decode("a%00b"), "a\u{0}b", "合法序列正常解码");
+        // url_basename：空串 / 根路径 → None，不 panic
+        assert_eq!(url_basename(""), None);
+        assert_eq!(url_basename("/"), None);
+        assert_eq!(
+            url_basename("https://a.com/x%20y.zip"),
+            Some("x%20y.zip".into()),
+            "basename 保留原文不解码"
+        );
+    }
+
+    /// 断点续传现场损坏 / 缺失 → 当作无现场（None），绝不 panic。
+    #[test]
+    fn load_meta_missing_or_corrupt_returns_none() {
+        let dir = std::env::temp_dir().join(format!("linbox-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("x.lbm.json");
+        assert!(load_meta(&p).is_none(), "文件不存在");
+        std::fs::write(&p, "{not json").unwrap();
+        assert!(load_meta(&p).is_none(), "坏 JSON 必须当无现场，不 panic");
+        std::fs::write(&p, r#"{"version":"x"}"#).unwrap();
+        assert!(load_meta(&p).is_none(), "结构不符（version 非数字）");
+        std::fs::write(&p, "").unwrap();
+        assert!(load_meta(&p).is_none(), "空文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     mod integration {
         use super::*;
         use std::sync::OnceLock;
         use std::time::{Duration, Instant};
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::io::AsyncReadExt as _;
 
         const TEST_DIR: &str = "/tmp/linbox-http-dl";
 
@@ -1589,17 +1682,13 @@ mod tests {
             assert_ne!(id_a, id_b);
             // B 必须出现在列表中（不给旧任务收尾留空窗，立即检查后续每次都要在）
             let deadline = Instant::now() + Duration::from_secs(30);
-            let mut seen_b = false;
-            let mut last_status = String::new();
             loop {
                 assert!(Instant::now() < deadline, "B 未出现在列表中");
                 std::thread::sleep(Duration::from_millis(300));
                 let snaps = mgr.snapshot();
                 let b: Vec<_> = snaps.iter().filter(|s| s.id == id_b).collect();
                 assert!(!b.is_empty(), "B 在列表中消失了（面板会空）");
-                seen_b = true;
                 let s = b[0];
-                last_status = format!("{:?}", s.status);
                 if s.status == TaskStatus::Completed {
                     break;
                 }
@@ -1607,7 +1696,6 @@ mod tests {
                     panic!("B 失败：{}", s.error.clone().unwrap_or_default());
                 }
             }
-            assert!(seen_b);
             // 最终文件完整
             let data = std::fs::read(format!("{out}/same.bin")).unwrap();
             assert_eq!(sha256_of(&data), expect_sha, "重下文件损坏");

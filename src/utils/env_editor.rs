@@ -88,12 +88,10 @@ pub fn list_users() -> Vec<SystemUser> {
 /// 当前用户优先读 `$SHELL` 环境变量（按需求「检测 shell 环境变量作判断」），
 /// 失败回退 /etc/passwd；其他用户直接看 passwd。
 pub fn shell_of(user: &SystemUser, is_current: bool) -> ShellKind {
-    if is_current {
-        if let Ok(sh) = std::env::var("SHELL") {
-            let sh = sh.trim();
-            if !sh.is_empty() {
-                return shell_from_path(sh);
-            }
+    if is_current && let Ok(sh) = std::env::var("SHELL") {
+        let sh = sh.trim();
+        if !sh.is_empty() {
+            return shell_from_path(sh);
         }
     }
     shell_from_path(&user.shell)
@@ -124,44 +122,46 @@ fn parse_shell_line(raw: &str) -> Line {
     }
 
     // `export KEY=value`（要求 export 后必须是空白，避免误判 exportABC=x）
-    if t.starts_with("export") && t[6..].chars().next().map_or(false, |c| c.is_whitespace()) {
+    if t.starts_with("export") && t[6..].chars().next().is_some_and(|c| c.is_whitespace()) {
         let rest = t[6..].trim_start();
-        if let Some((k, v, r)) = split_kv(rest) {
-            if !k.is_empty() {
-                return Line::Env {
-                    key: k,
-                    value: v,
-                    exported: true,
-                    raw: Some(r),
-                };
-            }
+        if let Some((k, v, r)) = split_kv(rest)
+            && !k.is_empty()
+        {
+            return Line::Env {
+                key: k,
+                value: v,
+                exported: true,
+                raw: Some(r),
+            };
         }
         return Line::Other(raw.to_string());
     }
 
     // 裸赋值 `KEY=value`（不带 export；值以 `(` 开头是数组写法，不识别）
-    if let Some((k, v, r)) = split_kv(t) {
-        if is_ident(&k) && !v.starts_with('(') {
-            return Line::Env {
-                key: k,
-                value: v,
-                exported: false,
-                raw: Some(r),
-            };
-        }
+    if let Some((k, v, r)) = split_kv(t)
+        && is_ident(&k)
+        && !v.starts_with('(')
+    {
+        return Line::Env {
+            key: k,
+            value: v,
+            exported: false,
+            raw: Some(r),
+        };
     }
 
     // `alias name=command`
-    if t.starts_with("alias") && t[5..].chars().next().map_or(false, |c| c.is_whitespace()) {
+    if t.starts_with("alias") && t[5..].chars().next().is_some_and(|c| c.is_whitespace()) {
         let rest = t[5..].trim_start();
-        if let Some((n, c, r)) = split_kv(rest) {
-            if is_ident(&n) && !c.is_empty() {
-                return Line::Alias {
-                    name: n,
-                    command: c,
-                    raw: Some(r),
-                };
-            }
+        if let Some((n, c, r)) = split_kv(rest)
+            && is_ident(&n)
+            && !c.is_empty()
+        {
+            return Line::Alias {
+                name: n,
+                command: c,
+                raw: Some(r),
+            };
         }
         return Line::Other(raw.to_string());
     }
@@ -244,13 +244,13 @@ fn unquote_value(v: &str) -> String {
     let first = v.chars().next().unwrap();
     if first == '"' || first == '\'' {
         // 首尾同一引号且引号后是空或注释 → 取引号内内容
-        if let Some(pos) = v.rfind(first) {
-            if pos > 0 {
-                let inner = &v[1..pos];
-                let after = v[pos + 1..].trim();
-                if after.is_empty() || after.starts_with('#') {
-                    return inner.to_string();
-                }
+        if let Some(pos) = v.rfind(first)
+            && pos > 0
+        {
+            let inner = &v[1..pos];
+            let after = v[pos + 1..].trim();
+            if after.is_empty() || after.starts_with('#') {
+                return inner.to_string();
             }
         }
     }
@@ -525,11 +525,11 @@ pub fn save(path: &str, content: &str, user: &SystemUser, elevated: bool) -> Res
 /// 普通用户直写（当前用户自己的文件）。先备份，再原子落盘。
 fn write_direct(path: &str, content: &str) -> Result<(), String> {
     let p = Path::new(path);
-    if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("创建目录 {} 失败：{e}", parent.display()))?;
-        }
+    if let Some(parent) = p.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建目录 {} 失败：{e}", parent.display()))?;
     }
     if p.exists() {
         let bak = backup_path(path);
@@ -780,7 +780,7 @@ mod tests {
             join_path_value(&["/a".into(), "/b".into()], true),
             "/a:/b:$PATH"
         );
-        assert_eq!(join_path_value(&[].to_vec(), true), "$PATH");
+        assert_eq!(join_path_value([].as_ref(), true), "$PATH");
         assert_eq!(join_path_value(&["/a".into()], false), "/a");
     }
 
@@ -790,5 +790,57 @@ mod tests {
         assert_eq!(shell_from_path("/usr/bin/zsh"), ShellKind::Zsh);
         assert_eq!(shell_from_path("/usr/bin/fish"), ShellKind::Fish);
         assert_eq!(shell_from_path("/bin/dash"), ShellKind::Other);
+    }
+
+    /// 空内容与畸形行：不得 panic，全部落 Other 或空。
+    /// GOAL 4.2：真实样本 —— Debian 默认 `~/.bashrc` 头部片段（本机抄录）：
+    /// 交互检测 case 块 + 环境变量 + shopt/if/复合行，覆盖 Other/Env 混排。
+    const REAL_BASHRC_HEAD: &str = "case $- in\n    *i*) ;;\n      *) return;;\nesac\nHISTCONTROL=ignoreboth\nshopt -s histappend\nHISTSIZE=1000\nif [ -z \"${debian_chroot:-}\" ] && [ -r /etc/debian_chroot ]; then\n    debian_chroot=$(cat /etc/debian_chroot)\nfi\n";
+
+    #[test]
+    fn real_bashrc_head_roundtrip() {
+        let lines = parse(REAL_BASHRC_HEAD, &ShellKind::Bash);
+        // 混排识别：环境变量 2 个（HISTCONTROL/HISTSIZE…按行），其余 case/if/shopt 保留为 Other
+        let env_count = lines.iter().filter(|l| l.is_env()).count();
+        assert_eq!(
+            env_count, 3,
+            "HISTCONTROL/HISTSIZE/HISTFILESIZE? 逐行核对：实际 {env_count}"
+        );
+        // parse → serialize → parse 语义等值（未编辑行逐字节保留）
+        let out = serialize(&lines, &ShellKind::Bash);
+        let reparsed = parse(&out, &ShellKind::Bash);
+        assert_eq!(lines, reparsed, "roundtrip 后语义必须等值");
+        // 未编辑内容不丢失关键片段
+        assert!(out.contains("HISTCONTROL=ignoreboth"));
+        assert!(out.contains("case $- in"), "case 块必须原样保留");
+        assert!(out.contains("debian_chroot=$(cat /etc/debian_chroot)"));
+    }
+
+    #[test]
+    fn parse_empty_and_malformed_lines() {
+        assert!(parse("", &ShellKind::Bash).is_empty());
+        // export 后面没空白（exportABC=x 是普通变量名，不是 export 语句）
+        let lines = parse("exportABC=x\n", &ShellKind::Bash);
+        match &lines[0] {
+            Line::Env { key, exported, .. } => {
+                assert_eq!(key, "exportABC");
+                assert!(!*exported, "exportABC=x 不该被认成 export 语句");
+            }
+            other => panic!("expect env, got {other:?}"),
+        }
+        // 数组赋值与缺值别名不识别 → Other，原文保留
+        let lines = parse("ARR=(a b c)\nalias ll=\n", &ShellKind::Bash);
+        assert!(matches!(&lines[0], Line::Other(s) if s == "ARR=(a b c)"));
+        assert!(matches!(&lines[1], Line::Other(s) if s == "alias ll="));
+    }
+
+    /// 变量名合法性（Env 分支的守卫条件）。
+    #[test]
+    fn ident_validity() {
+        assert!(is_ident("_A1"));
+        assert!(is_ident("a_b9"));
+        assert!(!is_ident("1bad"), "数字开头非法");
+        assert!(!is_ident("a-b"), "连字符非法");
+        assert!(!is_ident(""), "空串非法");
     }
 }

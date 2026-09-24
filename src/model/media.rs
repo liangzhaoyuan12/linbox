@@ -62,9 +62,10 @@ impl OutputCategory {
 }
 
 /// 封装格式（视频盒 / 音频盒 / 图片编码）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ContainerFormat {
     // 视频
+    #[default]
     Mp4,
     Mkv,
     Webm,
@@ -190,12 +191,6 @@ impl ContainerFormat {
 impl fmt::Display for ContainerFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.label())
-    }
-}
-
-impl Default for ContainerFormat {
-    fn default() -> Self {
-        ContainerFormat::Mp4
     }
 }
 
@@ -591,5 +586,236 @@ impl QualityPreset {
             QualityPreset::Balanced => "平衡",
             QualityPreset::Speed => "速度优先",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_category_labels() {
+        assert_eq!(OutputCategory::Video.label(), "视频");
+        assert_eq!(OutputCategory::Audio.label(), "音频");
+        assert_eq!(OutputCategory::Image.label(), "图片");
+        assert_eq!(OutputCategory::default(), OutputCategory::Video);
+    }
+
+    #[test]
+    fn output_category_format_lists_exact() {
+        assert_eq!(
+            OutputCategory::Video.formats(),
+            &[
+                ContainerFormat::Mp4,
+                ContainerFormat::Mkv,
+                ContainerFormat::Webm,
+                ContainerFormat::Mov,
+                ContainerFormat::Avi,
+                ContainerFormat::Ts,
+                ContainerFormat::Flv,
+                ContainerFormat::OggV,
+            ]
+        );
+        assert_eq!(
+            OutputCategory::Audio.formats(),
+            &[
+                ContainerFormat::Mp3,
+                ContainerFormat::Aac,
+                ContainerFormat::OggA,
+                ContainerFormat::Flac,
+                ContainerFormat::Wav,
+                ContainerFormat::Opus,
+            ]
+        );
+        assert_eq!(
+            OutputCategory::Image.formats(),
+            &[
+                ContainerFormat::Jpg,
+                ContainerFormat::Png,
+                ContainerFormat::Webp,
+                ContainerFormat::Avif,
+                ContainerFormat::Bmp,
+                ContainerFormat::Gif,
+            ]
+        );
+    }
+
+    fn all_formats() -> [ContainerFormat; 20] {
+        use ContainerFormat::*;
+        [
+            Mp4, Mkv, Webm, Mov, Avi, Ts, Flv, OggV, Mp3, Aac, OggA, Flac, Wav, Opus, Jpg, Png,
+            Webp, Avif, Bmp, Gif,
+        ]
+    }
+
+    #[test]
+    fn extension_golden_spot_checks() {
+        assert_eq!(ContainerFormat::Mp4.extension(), "mp4");
+        assert_eq!(ContainerFormat::Mkv.extension(), "mkv");
+        // 三个容易写错的坑：AAC→m4a、OGG 视频/音频两种扩展、TS 是 ts
+        assert_eq!(ContainerFormat::Aac.extension(), "m4a");
+        assert_eq!(ContainerFormat::OggV.extension(), "ogv");
+        assert_eq!(ContainerFormat::OggA.extension(), "ogg");
+        assert_eq!(ContainerFormat::Ts.extension(), "ts");
+        assert_eq!(ContainerFormat::Webm.extension(), "webm");
+        assert_eq!(ContainerFormat::Opus.extension(), "opus");
+    }
+
+    #[test]
+    fn extensions_are_all_distinct() {
+        let mut v: Vec<&str> = all_formats().iter().map(|f| f.extension()).collect();
+        v.sort_unstable();
+        let before = v.len();
+        v.dedup();
+        assert_eq!(v.len(), before, "扩展名必须两两不同");
+    }
+
+    #[test]
+    fn force_format_matrix() {
+        // 全部格式都必须显式 -f；几个改名的：MKV→matroska、AAC→ipod、图片→image2
+        for f in all_formats() {
+            assert!(f.force_format().is_some(), "{:?} 缺 force_format", f);
+        }
+        assert_eq!(ContainerFormat::Mkv.force_format(), Some("matroska"));
+        assert_eq!(ContainerFormat::Aac.force_format(), Some("ipod"));
+        assert_eq!(ContainerFormat::Ts.force_format(), Some("mpegts"));
+        assert_eq!(ContainerFormat::OggV.force_format(), Some("ogg"));
+        assert_eq!(ContainerFormat::Gif.force_format(), Some("gif"));
+        for f in [
+            ContainerFormat::Jpg,
+            ContainerFormat::Png,
+            ContainerFormat::Webp,
+            ContainerFormat::Avif,
+            ContainerFormat::Bmp,
+        ] {
+            assert_eq!(f.force_format(), Some("image2"), "{:?}", f);
+        }
+    }
+
+    #[test]
+    fn labels_and_display() {
+        assert_eq!(ContainerFormat::Mp4.to_string(), "MP4");
+        assert_eq!(ContainerFormat::Webp.label(), "WebP");
+        assert_eq!(ContainerFormat::Opus.label(), "Opus");
+        for f in all_formats() {
+            assert_eq!(f.to_string(), f.label(), "Display 必须等于 label");
+            assert!(!f.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn image_and_animated_classification() {
+        let images = [
+            ContainerFormat::Jpg,
+            ContainerFormat::Png,
+            ContainerFormat::Webp,
+            ContainerFormat::Avif,
+            ContainerFormat::Bmp,
+            ContainerFormat::Gif,
+        ];
+        for f in all_formats() {
+            assert_eq!(f.is_image(), images.contains(&f), "{:?}", f);
+            assert_eq!(f.is_animated(), f == ContainerFormat::Gif, "{:?}", f);
+        }
+    }
+
+    #[test]
+    fn video_codec_labels_and_ffmpeg_names() {
+        use VideoCodec::*;
+        assert_eq!(Libx264.label(), "H.264 (libx264)");
+        assert_eq!(Libx265.ffmpeg_name(), "libx265");
+        assert_eq!(LibvpxVp9.ffmpeg_name(), "libvpx-vp9");
+        assert_eq!(LibaomAv1.ffmpeg_name(), "libaom-av1");
+        assert_eq!(Copy.ffmpeg_name(), "copy", "复制流必须是 copy");
+        assert_eq!(Copy.label(), "复制（不重编码）");
+        assert_eq!(VideoCodec::default(), VideoCodec::Libx264);
+        for c in [Libx264, Libx265, LibvpxVp9, LibaomAv1, Copy] {
+            assert!(!c.label().is_empty() && !c.ffmpeg_name().is_empty());
+        }
+    }
+
+    #[test]
+    fn video_codec_crf_ranges() {
+        use VideoCodec::*;
+        assert_eq!(Libx264.crf_max(), 51);
+        assert_eq!(Libx265.crf_max(), 51);
+        assert_eq!(LibvpxVp9.crf_max(), 63);
+        assert_eq!(LibaomAv1.crf_max(), 63);
+        assert_eq!(Copy.crf_max(), 0, "copy 不该有 CRF");
+        assert_eq!(Libx264.crf_default(), 23);
+        assert_eq!(Libx265.crf_default(), 23);
+        assert_eq!(LibvpxVp9.crf_default(), 30);
+        assert_eq!(LibaomAv1.crf_default(), 30);
+        assert_eq!(Copy.crf_default(), 0);
+        // 默认值必须落在量程内
+        for c in [Libx264, Libx265, LibvpxVp9, LibaomAv1] {
+            assert!(c.crf_default() <= c.crf_max(), "{:?}", c);
+        }
+    }
+
+    #[test]
+    fn bitrate_mode_labels() {
+        assert_eq!(BitrateMode::Crf.label(), "CRF（恒定质量）");
+        assert_eq!(BitrateMode::Cbr.label(), "CBR（恒定码率）");
+        assert_eq!(BitrateMode::Vbr.label(), "VBR（动态码率）");
+        assert_eq!(BitrateMode::Fixed.label(), "固定码率");
+        assert_eq!(BitrateMode::default(), BitrateMode::Crf);
+    }
+
+    #[test]
+    fn scale_algorithm_labels_match_ffmpeg() {
+        for a in [
+            ScaleAlgorithm::Bilinear,
+            ScaleAlgorithm::Lanczos,
+            ScaleAlgorithm::Bicubic,
+            ScaleAlgorithm::Spline,
+        ] {
+            assert_eq!(a.label(), a.ffmpeg_name());
+        }
+        assert_eq!(ScaleAlgorithm::default(), ScaleAlgorithm::Lanczos);
+    }
+
+    #[test]
+    fn color_space_labels() {
+        assert_eq!(ColorSpace::Bt709.label(), "bt709");
+        assert_eq!(ColorSpace::Bt601.label(), "bt601");
+        assert_eq!(ColorSpace::Bt2020.label(), "bt2020");
+        assert_eq!(ColorSpace::default(), ColorSpace::Bt709);
+    }
+
+    #[test]
+    fn quality_preset_labels() {
+        assert_eq!(QualityPreset::Quality.label(), "质量优先");
+        assert_eq!(QualityPreset::Balanced.label(), "平衡");
+        assert_eq!(QualityPreset::Speed.label(), "速度优先");
+        assert_eq!(QualityPreset::default(), QualityPreset::Balanced);
+    }
+
+    #[test]
+    fn hwaccel_preference_labels_cover_all() {
+        assert_eq!(HwAccelPreference::Auto.label(), "自动选择");
+        assert_eq!(HwAccelPreference::Software.label(), "强制软件");
+        assert_eq!(HwAccelPreference::Nvenc.label(), "NVENC (NVIDIA)");
+        assert_eq!(HwAccelPreference::Vaapi.label(), "VAAPI (Intel/AMD)");
+        assert_eq!(HwAccelPreference::Qsv.label(), "QSV (Intel)");
+        assert_eq!(HwAccelPreference::Amf.label(), "AMF (AMD)");
+        assert_eq!(
+            HwAccelPreference::Videotoolbox.label(),
+            "VideoToolbox (macOS)"
+        );
+        assert_eq!(HwAccelPreference::CudaDecode.label(), "CUDA 解码加速");
+        assert_eq!(HwAccelPreference::Dxva2.label(), "DXVA2 解码加速 (Windows)");
+        assert_eq!(
+            HwAccelPreference::D3d11va.label(),
+            "D3D11VA 解码加速 (Windows)"
+        );
+        assert_eq!(HwAccelPreference::Vulkan.label(), "Vulkan 加速");
+        assert_eq!(HwAccelPreference::Opencl.label(), "OpenCL 加速");
+    }
+
+    #[test]
+    fn container_default_is_mp4() {
+        assert_eq!(ContainerFormat::default(), ContainerFormat::Mp4);
+        assert_eq!(OutputCategory::default().formats()[0], ContainerFormat::Mp4);
     }
 }

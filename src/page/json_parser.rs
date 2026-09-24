@@ -171,7 +171,9 @@ pub fn build() -> JsonParserPage {
     title.set_halign(gtk::Align::Start);
     root_box.append(&title);
 
-    let subtitle = gtk::Label::new(Some("粘贴 JSON 文本或填入 URL 链接，解析后复制单个字段或整段结果。"));
+    let subtitle = gtk::Label::new(Some(
+        "粘贴 JSON 文本或填入 URL 链接，解析后复制单个字段或整段结果。",
+    ));
     subtitle.add_css_class("dim-label");
     subtitle.set_halign(gtk::Align::Start);
     subtitle.set_wrap(true);
@@ -263,9 +265,13 @@ pub fn build() -> JsonParserPage {
     url_box.append(&body_revealer);
 
     // 切换到 POST 时展开请求体编辑区，切回 GET 时收起
-    method_row.connect_selected_notify(clone!(#[weak] body_revealer, move |row| {
-        body_revealer.set_reveal_child(row.selected() == METHOD_POST);
-    }));
+    method_row.connect_selected_notify(clone!(
+        #[weak]
+        body_revealer,
+        move |row| {
+            body_revealer.set_reveal_child(row.selected() == METHOD_POST);
+        }
+    ));
 
     let url_hint = gtk::Label::new(Some(
         "仅支持 http:// 与 https:// 链接；GET 直接拉取文本，POST 可携带自定义请求体。",
@@ -383,79 +389,94 @@ pub fn build() -> JsonParserPage {
     // 选中行变化时启用/禁用「复制所选」
     {
         let inner = Rc::clone(&inner);
-        inner
-            .tree_view
-            .selection()
-            .connect_changed(move |sel| {
-                inner.copy_selected_btn.set_sensitive(sel.selected().is_some());
-            });
+        inner.tree_view.selection().connect_changed(move |sel| {
+            inner
+                .copy_selected_btn
+                .set_sensitive(sel.selected().is_some());
+        });
     }
 
     // 「复制所选」：复制选中行的字段值（容器行则复制键名）
     {
         let inner = Rc::clone(&inner);
-        inner.copy_selected_btn.connect_clicked(clone!(#[strong] inner, move |_| {
-            if let Some((model, iter)) = inner.tree_view.selection().selected() {
-                let value = model.get_value(&iter, 1).get::<String>().unwrap_or_default();
-                let text = if value.is_empty() {
-                    model.get_value(&iter, 0).get::<String>().unwrap_or_default()
-                } else {
-                    value
-                };
-                inner.toast_overlay.clipboard().set_text(&text);
-                inner.toast(&format!("已复制：{text}"));
+        inner.copy_selected_btn.connect_clicked(clone!(
+            #[strong]
+            inner,
+            move |_| {
+                if let Some((model, iter)) = inner.tree_view.selection().selected() {
+                    let value = model
+                        .get_value(&iter, 1)
+                        .get::<String>()
+                        .unwrap_or_default();
+                    let text = if value.is_empty() {
+                        model
+                            .get_value(&iter, 0)
+                            .get::<String>()
+                            .unwrap_or_default()
+                    } else {
+                        value
+                    };
+                    inner.toast_overlay.clipboard().set_text(&text);
+                    inner.toast(&format!("已复制：{text}"));
+                }
             }
-        }));
+        ));
     }
 
     // 「复制全部」：复制整段格式化 JSON
     {
         let inner = Rc::clone(&inner);
-        inner.copy_all_btn.connect_clicked(clone!(#[weak] inner, move |_| {
-            let text = inner.pretty.borrow().clone();
-            inner.toast_overlay.clipboard().set_text(&text);
-            inner.toast("已复制全部 JSON");
-        }));
+        inner.copy_all_btn.connect_clicked(clone!(
+            #[weak]
+            inner,
+            move |_| {
+                let text = inner.pretty.borrow().clone();
+                inner.toast_overlay.clipboard().set_text(&text);
+                inner.toast("已复制全部 JSON");
+            }
+        ));
     }
 
     // 「解析」按钮
     {
         let inner = Rc::clone(&inner);
-        inner.parse_button.connect_clicked(clone!(#[strong] inner, move |_| {
-            let mode = inner.input_stack.visible_child_name();
-            let is_url = mode.as_deref() == Some("url");
+        inner.parse_button.connect_clicked(clone!(
+            #[strong]
+            inner,
+            move |_| {
+                let mode = inner.input_stack.visible_child_name();
+                let is_url = mode.as_deref() == Some("url");
 
-            let raw = if is_url {
-                inner.url_row.text().to_string()
-            } else {
-                buffer_text(&inner.text_buffer)
-            };
+                let raw = if is_url {
+                    inner.url_row.text().to_string()
+                } else {
+                    buffer_text(&inner.text_buffer)
+                };
 
-            if raw.trim().is_empty() {
-                inner.toast("输入为空，请先粘贴文本或填写 URL");
-                return;
-            }
+                if raw.trim().is_empty() {
+                    inner.toast("输入为空，请先粘贴文本或填写 URL");
+                    return;
+                }
 
-            // 进入加载态
-            inner.spinner.set_visible(true);
-            inner.spinner.start();
-            inner.parse_button.set_sensitive(false);
+                // 进入加载态
+                inner.spinner.set_visible(true);
+                inner.spinner.start();
+                inner.parse_button.set_sensitive(false);
 
-            if is_url {
-                // URL 模式：组装请求描述 → 后台线程发送 → idle 回调回到主线程解析
-                let spec = inner.build_request(&raw);
+                if is_url {
+                    // URL 模式：组装请求描述 → 后台线程发送 → idle 回调回到主线程解析
+                    let spec = inner.build_request(&raw);
 
-                inner
-                    .status_label
-                    .set_text(&format!("正在以 {} 请求…", spec.method.as_str()));
+                    inner
+                        .status_label
+                        .set_text(&format!("正在以 {} 请求…", spec.method.as_str()));
 
-                let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
-                std::thread::spawn(move || {
-                    let _ = tx.send(http::send(&spec));
-                });
-                let inner = Rc::clone(&inner);
-                glib::source::idle_add_local(move || {
-                    match rx.try_recv() {
+                    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(http::send(&spec));
+                    });
+                    let inner = Rc::clone(&inner);
+                    glib::source::idle_add_local(move || match rx.try_recv() {
                         Ok(fetched) => {
                             let parsed = match fetched {
                                 Ok(text) => json_util::parse(&text),
@@ -466,17 +487,19 @@ pub fn build() -> JsonParserPage {
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                         Err(_) => glib::ControlFlow::Break,
-                    }
-                });
-            } else {
-                // 文本模式：直接在主线程解析（开销很小）
-                let parsed = json_util::parse(&raw);
-                inner.apply_parsed(parsed);
+                    });
+                } else {
+                    // 文本模式：直接在主线程解析（开销很小）
+                    let parsed = json_util::parse(&raw);
+                    inner.apply_parsed(parsed);
+                }
             }
-        }));
+        ));
     }
 
-    JsonParserPage { root: toast_overlay }
+    JsonParserPage {
+        root: toast_overlay,
+    }
 }
 
 impl Inner {

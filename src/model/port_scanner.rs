@@ -156,3 +156,116 @@ pub enum ScanEvent {
     /// 日志。
     Log(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name_of(port: u16) -> Option<&'static str> {
+        well_known_services()
+            .iter()
+            .find(|(p, _)| *p == port)
+            .map(|x| x.1)
+    }
+
+    #[test]
+    fn default_ports_full_range_sorted() {
+        let c = ScanConfig {
+            target: "127.0.0.1".into(),
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok(), "{:?}", c.validate().err());
+        let ports = c.ports();
+        assert_eq!(ports.len(), 65535, "默认 1..=65535");
+        assert_eq!(ports.first(), Some(&1));
+        assert_eq!(ports.last(), Some(&65535));
+        assert!(ports.windows(2).all(|w| w[0] < w[1]), "必须严格升序");
+        assert_eq!(ProtocolFamily::Tcp.label(), "TCP");
+        assert_eq!(ProtocolFamily::Udp.label(), "UDP");
+    }
+
+    #[test]
+    fn custom_ports_override_sorted_dedup() {
+        let c = ScanConfig {
+            custom_ports: vec![443, 80, 443, 22],
+            ..Default::default()
+        };
+        assert_eq!(c.ports(), vec![22, 80, 443], "覆盖范围且排序去重");
+        let c = ScanConfig {
+            port_start: 1000,
+            port_end: 1003,
+            ..Default::default()
+        };
+        assert_eq!(c.ports(), vec![1000, 1001, 1002, 1003]);
+    }
+
+    #[test]
+    fn validate_matrix() {
+        let base = || ScanConfig {
+            target: "10.0.0.1".into(),
+            ..Default::default()
+        };
+        // 空目标
+        let c = ScanConfig::default();
+        assert!(c.validate().is_err());
+        let c = ScanConfig {
+            target: "   ".into(),
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        // 起止倒置（仅在无自定义列表时报错）
+        let c = ScanConfig {
+            port_start: 100,
+            port_end: 10,
+            ..base()
+        };
+        assert!(c.validate().is_err());
+        // 有自定义列表时起止不参与校验
+        let c = ScanConfig {
+            port_start: 100,
+            port_end: 10,
+            custom_ports: vec![22],
+            ..base()
+        };
+        assert!(c.validate().is_ok());
+        // 并发边界：0 和 10000 都非法（10001 超上限），1/10000 合法
+        let c = ScanConfig {
+            concurrency: 0,
+            ..base()
+        };
+        assert!(c.validate().is_err());
+        let c = ScanConfig {
+            concurrency: 10001,
+            ..base()
+        };
+        assert!(c.validate().is_err());
+        let c = ScanConfig {
+            concurrency: 1,
+            ..base()
+        };
+        assert!(c.validate().is_ok());
+        let c = ScanConfig {
+            concurrency: 10000,
+            ..base()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn well_known_services_table() {
+        let svcs = well_known_services();
+        assert!(svcs.len() > 20);
+        let mut seen = std::collections::HashSet::new();
+        for (port, name) in svcs {
+            assert!((1..=65535).contains(port), "{port}");
+            assert!(!name.is_empty());
+            assert!(seen.insert(*port), "端口 {} 重复", port);
+        }
+        assert_eq!(name_of(22), Some("SSH"));
+        assert_eq!(name_of(443), Some("HTTPS"));
+        assert_eq!(name_of(3306), Some("MySQL"));
+        assert_eq!(name_of(5432), Some("PostgreSQL"));
+        assert_eq!(name_of(6379), Some("Redis"));
+        assert!(name_of(65000).is_none() || !seen.contains(&65000));
+    }
+}

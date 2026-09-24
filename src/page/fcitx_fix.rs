@@ -186,23 +186,29 @@ pub fn build() -> FcitxFixPage {
     // 检测按钮
     {
         let inner = Rc::clone(&inner);
-        inner
-            .detect_button
-            .connect_clicked(clone!(#[strong] inner, move |_| run_detect(&inner)));
+        inner.detect_button.connect_clicked(clone!(
+            #[strong]
+            inner,
+            move |_| run_detect(&inner)
+        ));
     }
     // 修复按钮
     {
         let inner = Rc::clone(&inner);
-        inner
-            .fix_button
-            .connect_clicked(clone!(#[strong] inner, move |_| apply_fix(&inner)));
+        inner.fix_button.connect_clicked(clone!(
+            #[strong]
+            inner,
+            move |_| apply_fix(&inner)
+        ));
     }
     // 重启按钮
     {
         let inner = Rc::clone(&inner);
-        inner
-            .restart_button
-            .connect_clicked(clone!(#[strong] inner, move |_| restart_fcitx(&inner)));
+        inner.restart_button.connect_clicked(clone!(
+            #[strong]
+            inner,
+            move |_| restart_fcitx(&inner)
+        ));
     }
 
     // 注册全局强引用：子线程的 idle 回调通过它回主线程刷新 UI。
@@ -211,7 +217,9 @@ pub fn build() -> FcitxFixPage {
     // 初次检测
     run_detect(&inner);
 
-    FcitxFixPage { root: toast_overlay }
+    FcitxFixPage {
+        root: toast_overlay,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +296,7 @@ thread_local! {
     ///
     /// 必须是 `Option<Rc<Inner>>` 而不是 `Weak<Inner>`：否则 `build()` 返回后
     /// `inner` 被销毁，所有回调都会静默失效。子线程通过它回主线程刷新 UI。
-    static INNER: RefCell<Option<Rc<Inner>>> = RefCell::new(None);
+    static INNER: RefCell<Option<Rc<Inner>>> = const { RefCell::new(None) };
 }
 
 /// 应用退出前调用：清空全局句柄，避免窗口销毁期的 GTK 回调访问正在析构的 TLS。
@@ -306,7 +314,7 @@ fn with_inner<F: FnOnce(&Inner)>(f: F) {
     let Some(inner) = INNER.with(|i| i.try_borrow().ok().and_then(|b| b.clone())) else {
         return;
     };
-    f(&*inner);
+    f(&inner);
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +410,8 @@ impl Inner {
                 self.toast("fcitx5 已重启");
             }
             Err(e) => {
-                self.restart_result_label.set_text(&format!("重启失败：{e}"));
+                self.restart_result_label
+                    .set_text(&format!("重启失败：{e}"));
                 self.toast(&format!("重启失败：{e}"));
             }
         }
@@ -411,8 +420,7 @@ impl Inner {
     /// 主线程中处理写入结果：提示、刷新状态。
     fn finish_fix(&self, result: Result<usize, String>) {
         self.fix_button.set_sensitive(true);
-        self.fix_button
-            .set_label("应用修复（需要 root 权限）");
+        self.fix_button.set_label("应用修复（需要 root 权限）");
 
         match result {
             Ok(added) => {
@@ -427,7 +435,9 @@ impl Inner {
                 self.update_labels();
 
                 if !fcitx_installed {
-                    self.toast("警告：未检测到 fcitx5，变量已写入但输入法可能不生效，请先安装 fcitx5");
+                    self.toast(
+                        "警告：未检测到 fcitx5，变量已写入但输入法可能不生效，请先安装 fcitx5",
+                    );
                     self.status_label.set_text(&format!(
                         "已写入 {} 条变量，但警告：未检测到 fcitx5，建议先安装。",
                         added

@@ -233,22 +233,30 @@ pub fn build() -> InotifyTunePage {
     }
 
     // 检测按钮
-    inner
-        .detect_button
-        .connect_clicked(clone!(#[strong] inner, move |_| run_detect(&inner)));
+    inner.detect_button.connect_clicked(clone!(
+        #[strong]
+        inner,
+        move |_| run_detect(&inner)
+    ));
     // 一键提升
-    inner
-        .preset_button
-        .connect_clicked(clone!(#[strong] inner, move |_| apply_preset(&inner)));
+    inner.preset_button.connect_clicked(clone!(
+        #[strong]
+        inner,
+        move |_| apply_preset(&inner)
+    ));
     // 自定义
-    inner
-        .custom_button
-        .connect_clicked(clone!(#[strong] inner, move |_| apply_custom(&inner)));
+    inner.custom_button.connect_clicked(clone!(
+        #[strong]
+        inner,
+        move |_| apply_custom(&inner)
+    ));
 
     // 初次检测
     run_detect(&inner);
 
-    InotifyTunePage { root: toast_overlay }
+    InotifyTunePage {
+        root: toast_overlay,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +350,7 @@ thread_local! {
     ///
     /// 必须是 `Option<Rc<Inner>>` 而不是 `Weak<Inner>`：否则 `build()` 返回后
     /// `inner` 被销毁，所有回调都会静默失效。子线程通过它回主线程刷新 UI。
-    static INNER: RefCell<Option<Rc<Inner>>> = RefCell::new(None);
+    static INNER: RefCell<Option<Rc<Inner>>> = const { RefCell::new(None) };
 }
 
 /// 应用退出前调用：清空全局句柄，避免窗口销毁期的回调访问正在析构的 TLS。
@@ -359,7 +367,7 @@ fn with_inner<F: FnOnce(&Inner)>(f: F) {
     let Some(inner) = INNER.with(|i| i.try_borrow().ok().and_then(|b| b.clone())) else {
         return;
     };
-    f(&*inner);
+    f(&inner);
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +378,9 @@ fn with_inner<F: FnOnce(&Inner)>(f: F) {
 fn run_detect(inner: &Rc<Inner>) {
     inner.set_busy(true);
     inner.watches_label.set_text("max_user_watches：检测中…");
-    inner.instances_label.set_text("max_user_instances：检测中…");
+    inner
+        .instances_label
+        .set_text("max_user_instances：检测中…");
 
     std::thread::spawn(|| {
         let st = tune::status();
@@ -427,10 +437,9 @@ fn apply_custom(inner: &Rc<Inner>) {
             return;
         };
         if let Err(e) = tune::validate(param, v) {
-            inner.custom_status.set_text(&format!(
-                "{} 数值不合理：{e}",
-                param.label()
-            ));
+            inner
+                .custom_status
+                .set_text(&format!("{} 数值不合理：{e}", param.label()));
             return;
         }
         params.push((param, v));
@@ -438,9 +447,9 @@ fn apply_custom(inner: &Rc<Inner>) {
     }
 
     if params.is_empty() {
-        inner.custom_status.set_text(
-            "两项都留空了 —— 至少填写一项数值，或直接用上方「一键提升」。",
-        );
+        inner
+            .custom_status
+            .set_text("两项都留空了 —— 至少填写一项数值，或直接用上方「一键提升」。");
         return;
     }
     inner.custom_status.set_text("");

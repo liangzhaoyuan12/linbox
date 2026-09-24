@@ -182,7 +182,7 @@ pub fn cpu_stat_delta(
 /// 解析 `/proc/meminfo`（值单位 kB，输出换算成字节）。
 pub fn parse_meminfo(text: &str) -> MemStat {
     let mut m = MemStat::default();
-    let mut get = |key: &str| -> u64 {
+    let get = |key: &str| -> u64 {
         text.lines()
             .find(|l| l.starts_with(key))
             .and_then(|l| l.split_whitespace().nth(1))
@@ -463,12 +463,29 @@ impl PidRaw {
 /// comm 在括号里且**可以包含空格和括号**，所以必须按第一个 `(` 和最后一个
 /// `)` 切分，不能用 `split_whitespace`。
 pub fn parse_pid_stat(text: &str) -> Option<PidRaw> {
+    let mut fields = Vec::new();
+    parse_pid_stat_into(text, &mut fields)
+}
+
+/// 同 [`parse_pid_stat`]，但字段索引向量由调用方提供（GOAL.md 2.2：热路径
+/// 跨进程复用同一个 `Vec`，省掉每进程一次堆分配）。
+///
+/// 索引存的是**字节区间**而不是 `&str`：区间不借用 `text`，`text` 缓冲可以
+/// 随意清空复用（存 `&str` 会和跨循环的 `text.clear()` 打架，见 rust 闭包/
+/// 循环借用推断）。
+pub fn parse_pid_stat_into(text: &str, rest: &mut Vec<(usize, usize)>) -> Option<PidRaw> {
+    rest.clear();
     let open = text.find('(')?;
     let close = text.rfind(')')?;
     let pid: i32 = text[..open].trim().parse().ok()?;
     let comm = text[open + 1..close].to_string();
-    let rest: Vec<&str> = text[close + 1..].split_whitespace().collect();
-    let s = |i: usize| rest.get(i).copied().unwrap_or("");
+    let base = close + 1;
+    let base_addr = text.as_ptr() as usize;
+    for w in text[base..].split_whitespace() {
+        let start = w.as_ptr() as usize - base_addr;
+        rest.push((start, start + w.len()));
+    }
+    let s = |i: usize| rest.get(i).map(|&(a, b)| &text[a..b]).unwrap_or("");
     let n = |i: usize| s(i).parse::<u64>().unwrap_or(0);
     let i = |i: usize| s(i).parse::<i64>().unwrap_or(0);
     Some(PidRaw {
@@ -568,10 +585,10 @@ pub fn uid_names() -> HashMap<u32, String> {
     if let Ok(text) = fs::read_to_string("/etc/passwd") {
         for line in text.lines() {
             let f: Vec<&str> = line.split(':').collect();
-            if f.len() >= 3 {
-                if let Ok(uid) = f[2].parse::<u32>() {
-                    m.insert(uid, f[0].to_string());
-                }
+            if f.len() >= 3
+                && let Ok(uid) = f[2].parse::<u32>()
+            {
+                m.insert(uid, f[0].to_string());
             }
         }
     }
@@ -588,9 +605,42 @@ pub fn proc_cpu_pct(delta_ticks: u64, ticks_per_sec: u64, dt: f64) -> f32 {
     (100.0 * delta_ticks as f64 / ticks_per_sec.max(1) as f64 / dt / n_cpus() as f64) as f32
 }
 
+/// IO 调度类文本（进程列表「IO」列），读不到返回空串。
+fn io_class_text(pid: i32) -> String {
+    crate::utils::monitor::signal::get_io_priority(pid)
+        .map(|(c, l)| {
+            if c.has_level() {
+                format!("{}/{}", c.short(), l)
+            } else {
+                c.short().to_string()
+            }
+        })
+        .unwrap_or_default()
+}
+
 /// 收集所有进程的概要（差分用上次的 pid → (cpu_ticks, read_bytes, write_bytes)）。
 ///
 /// `ticks_per_sec` 是 CLK_TCK；`dt` 是两次采样的间隔秒数。
+/// `caches` 是跨周期的 pid 级缓存（cmdline/cgroup/io_class，调用方负责按存活
+/// pid 清理）；`want_io` 控制是否读 `/proc/<pid>/io`（界面需要速率时才开）；
+/// `io_valid` 表示上一轮是否读过 io（关→开的第一轮差分基准无效，速率置 0）。
+///
+/// # 分层采样（GOAL.md 2.1 / 2.3）
+/// 每轮每个进程只读 `stat` +（缓存未命中时的）`cmdline/cgroup`；`io` 按需读；
+/// 亲和性不再每轮计算（详情/对话框现场调 [`affinity_hex`]）。
+#[doc(hidden)]
+#[derive(Default)]
+pub struct PidCache {
+    starttime: u64,
+    comm: String,
+    cmdline: String,
+    cgroup: String,
+    io_class: String,
+}
+
+// 采样热路径（GOAL 2.x 优化核心）：参数再打包成 struct 会改动调用方与
+// bench，收益仅是 lint 数字，此处如实豁免。
+#[allow(clippy::too_many_arguments)]
 pub fn collect_processes(
     prev: &HashMap<i32, (u64, u64, u64)>,
     ticks_per_sec: u64,
@@ -599,10 +649,19 @@ pub fn collect_processes(
     btime: u64,
     uptime: u64,
     users: &HashMap<u32, String>,
+    caches: &mut HashMap<i32, PidCache>,
+    want_io: bool,
+    io_valid: bool,
 ) -> Vec<Process> {
     let page_size = 4096u64;
     let dt = if dt <= 0.0 { 1.0 } else { dt };
     let mut out = Vec::with_capacity(prev.len().max(256));
+    // —— 缓冲复用（GOAL.md 2.2）：路径 / 文本 / 字段索引 / cmdline 字节跨进程复用 ——
+    use std::io::Read as _;
+    let mut path_buf = String::with_capacity(64);
+    let mut text = String::with_capacity(1024);
+    let mut cmd_bytes: Vec<u8> = Vec::with_capacity(512);
+    let mut stat_fields: Vec<(usize, usize)> = Vec::with_capacity(48);
 
     let Ok(rd) = fs::read_dir("/proc") else {
         return out;
@@ -618,32 +677,107 @@ pub fn collect_processes(
             .metadata()
             .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
             .unwrap_or(0);
-        let dir = e.path();
-        let Ok(stat_text) = fs::read_to_string(dir.join("stat")) else {
+        // 路径拼成字符串复用缓冲（省掉每进程2 次 PathBuf 分配）
+        stat_fields.clear();
+        path_buf.clear();
+        path_buf.push_str("/proc/");
+        path_buf.push_str(&name);
+        let base_len = path_buf.len();
+        path_buf.push_str("/stat");
+        text.clear();
+        if fs::File::open(&path_buf)
+            .and_then(|mut f| f.read_to_string(&mut text))
+            .is_err()
+        {
             continue; // 进程刚退出
-        };
-        let Some(raw) = parse_pid_stat(&stat_text) else {
+        }
+        let Some(raw) = parse_pid_stat_into(&text, &mut stat_fields) else {
             continue;
         };
 
-        let cmdline = fs::read(dir.join("cmdline"))
-            .map(|b| parse_cmdline(&b))
-            .unwrap_or_default();
-        let (read_bytes, write_bytes, rchar, wchar) = fs::read_to_string(dir.join("io"))
-            .map(|t| parse_pid_io(&t))
-            .unwrap_or((0, 0, 0, 0));
-        let cgroup = fs::read_to_string(dir.join("cgroup"))
-            .map(|t| parse_cgroup(&t))
-            .unwrap_or_default();
+        // —— 分层采样（GOAL.md 2.1/2.3）——
+        // cmdline / cgroup / io_class 按 pid 缓存：cmdline 只在 comm 变化
+        // （execve 会改 comm）时重读；cgroup 按 starttime 失效；io_class
+        // 没有高频变化源，直接按 pid 缓存（进程消失时由调用方清理）。
+        let cmdline;
+        let cgroup;
+        let io_class;
+        let stale = caches
+            .get(&pid)
+            .is_none_or(|c| c.starttime != raw.starttime);
+        if stale {
+            path_buf.truncate(base_len);
+            path_buf.push_str("/cmdline");
+            cmd_bytes.clear();
+            let _ = fs::File::open(&path_buf).and_then(|mut f| f.read_to_end(&mut cmd_bytes));
+            cmdline = parse_cmdline(&cmd_bytes);
+            path_buf.truncate(base_len);
+            path_buf.push_str("/cgroup");
+            text.clear();
+            let _ = fs::File::open(&path_buf).and_then(|mut f| f.read_to_string(&mut text));
+            cgroup = parse_cgroup(&text);
+            io_class = io_class_text(pid);
+            caches.insert(
+                pid,
+                PidCache {
+                    starttime: raw.starttime,
+                    comm: raw.comm.clone(),
+                    cmdline: cmdline.clone(),
+                    cgroup: cgroup.clone(),
+                    io_class: io_class.clone(),
+                },
+            );
+        } else {
+            // 内部不变量（非 IO 错误路径）：上一步刚 insert 必存在
+            let c = caches.get_mut(&pid).expect("上一步刚查过必存在");
+            if c.comm != raw.comm {
+                // execve 保留 starttime，但 comm / cmdline 都会变
+                c.comm = raw.comm.clone();
+                path_buf.truncate(base_len);
+                path_buf.push_str("/cmdline");
+                cmd_bytes.clear();
+                let _ = fs::File::open(&path_buf).and_then(|mut f| f.read_to_end(&mut cmd_bytes));
+                c.cmdline = parse_cmdline(&cmd_bytes);
+            }
+            cmdline = c.cmdline.clone();
+            cgroup = c.cgroup.clone();
+            io_class = c.io_class.clone();
+        }
+        // /proc/<pid>/io 只在速率列可见 / 详情选中时才读（GOAL.md 2.1）
+        let (read_bytes, write_bytes, rchar, wchar) = if want_io {
+            path_buf.truncate(base_len);
+            path_buf.push_str("/io");
+            text.clear();
+            let ok = fs::File::open(&path_buf)
+                .and_then(|mut f| f.read_to_string(&mut text))
+                .is_ok();
+            if ok {
+                parse_pid_io(&text)
+            } else {
+                (0, 0, 0, 0)
+            }
+        } else {
+            (0, 0, 0, 0)
+        };
 
         let ticks = raw.cpu_ticks();
+        // 速率只有「上一轮也读了 io」时才可信，否则差分基准是空值会算出天文数字
+        let rates_ok = want_io && io_valid;
         let (cpu, read_rate, write_rate) = match prev.get(&pid) {
-            Some((pt, pr, pw)) if prev.contains_key(&pid) => {
+            Some((pt, pr, pw)) => {
                 let dc = ticks.saturating_sub(*pt);
                 (
                     proc_cpu_pct(dc, ticks_per_sec, dt),
-                    (read_bytes.saturating_sub(*pr)) as f64 / dt,
-                    (write_bytes.saturating_sub(*pw)) as f64 / dt,
+                    if rates_ok {
+                        (read_bytes.saturating_sub(*pr)) as f64 / dt
+                    } else {
+                        0.0
+                    },
+                    if rates_ok {
+                        (write_bytes.saturating_sub(*pw)) as f64 / dt
+                    } else {
+                        0.0
+                    },
                 )
             }
             _ => (0.0, 0.0, 0.0),
@@ -678,15 +812,7 @@ pub fn collect_processes(
             nice: raw.nice,
             priority: raw.priority,
             policy: policy_name(raw.policy).to_string(),
-            io_class: crate::utils::monitor::signal::get_io_priority(pid)
-                .map(|(c, l)| {
-                    if c.has_level() {
-                        format!("{}/{}", c.short(), l)
-                    } else {
-                        c.short().to_string()
-                    }
-                })
-                .unwrap_or_default(),
+            io_class,
             cpu_time: ticks as f64 / ticks_per_sec as f64,
             uptime: uptime_secs,
             read_bytes,
@@ -698,7 +824,7 @@ pub fn collect_processes(
             on_cpu: if raw.state == 'R' { 1 } else { 0 },
             pgid: raw.pgrp,
             sid: raw.session,
-            affinity: affinity_hex(pid),
+            affinity: String::new(), // 快照不算亲和性：详情/对话框现场调 affinity_hex
             depth: 0,
             child_count: 0,
             cgroup,
@@ -813,20 +939,18 @@ pub fn matches_filter(p: &Process, query: &str, only_uid: Option<u32>, hide_kern
     if hide_kernel && p.cmdline.is_empty() && p.pid != 1 {
         return false;
     }
-    if let Some(uid) = only_uid {
-        if p.uid != uid {
-            return false;
-        }
+    if let Some(uid) = only_uid
+        && p.uid != uid
+    {
+        return false;
     }
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         return true;
     }
     // 纯数字按 pid 精确/前缀匹配
-    if q.chars().all(|c| c.is_ascii_digit()) {
-        if p.pid.to_string().starts_with(&q) {
-            return true;
-        }
+    if q.chars().all(|c| c.is_ascii_digit()) && p.pid.to_string().starts_with(&q) {
+        return true;
     }
     p.display_name().to_lowercase().contains(&q)
         || p.cmdline.to_lowercase().contains(&q)
@@ -967,6 +1091,10 @@ pub fn process_detail(pid: i32) -> crate::model::monitor::ProcessDetail {
 }
 
 /// 读取 CPU 亲和性掩码（十六进制），读不到返回空串。
+///
+/// 从高位字节向低位拼接（等价于「全拼再 trim 前导 0」），跳过前导零字节、
+/// 用 `write!` 直接写入缓冲：原来每字节一次 `format!` 分配，一次调用
+/// 128 次堆分配，放不进每轮采样热路径。
 pub fn affinity_hex(pid: i32) -> String {
     unsafe extern "C" {
         fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> i32;
@@ -976,14 +1104,17 @@ pub fn affinity_hex(pid: i32) -> String {
     if r != 0 {
         return String::new();
     }
-    let mut bits: Vec<u8> = Vec::new();
-    for byte in mask.iter() {
-        bits.push(*byte);
-    }
-    // 转成紧凑的十六进制（去掉尾部多余的 00）
-    let mut hex = String::new();
-    for byte in bits.iter().rev() {
-        hex.push_str(&format!("{byte:02x}"));
+    let mut hex = String::with_capacity(48);
+    let mut started = false;
+    use std::fmt::Write as _;
+    for byte in mask.iter().rev() {
+        if !started {
+            if *byte == 0 {
+                continue;
+            }
+            started = true;
+        }
+        let _ = write!(hex, "{byte:02x}");
     }
     let trimmed = hex.trim_start_matches('0');
     if trimmed.is_empty() {
@@ -1064,7 +1195,7 @@ procs_blocked 0\n";
         // 总量应等于各列之和
         assert_eq!(
             total.total(),
-            38540507 + 3432 + 24465425 + 882807111 + 7590260 + 0 + 95667 + 0
+            ((38540507 + 3432 + 24465425 + 882807111 + 7590260) + 95667)
         );
     }
 
@@ -1334,7 +1465,7 @@ wlp3s0: 46469330773 38555671    0    3    0     0          0         0 222462410
         assert!(matches_filter(&p, "liang", None, false)); // 用户
         assert!(matches_filter(&p, "new-window", None, false)); // 命令行
         assert!(!matches_filter(&p, "chrome", None, false));
-        assert!(matches_filter(&p, "", Some(1000), false) == false); // uid 不匹配
+        assert!(!matches_filter(&p, "", Some(1000), false)); // uid 不匹配
         p.uid = 1000;
         assert!(matches_filter(&p, "", Some(1000), false));
 
@@ -1437,6 +1568,9 @@ wlp3s0: 46469330773 38555671    0    3    0     0          0         0 222462410
             totals.btime,
             parse_uptime(&std::fs::read_to_string("/proc/uptime").unwrap()),
             &users,
+            &mut HashMap::new(),
+            true,
+            false,
         );
         assert!(procs.len() > 20, "进程数异常：{}", procs.len());
         let p1 = procs.iter().find(|p| p.pid == 1).unwrap();
@@ -1455,5 +1589,38 @@ wlp3s0: 46469330773 38555671    0    3    0     0          0         0 222462410
         let me = process_detail(std::process::id() as i32);
         assert!(!me.exe.is_empty(), "读不到自己的 exe");
         assert!(me.cwd.starts_with('/'));
+    }
+
+    /// GOAL 4.5：损坏的 /proc/stat 片段 → None，不 panic。
+    #[test]
+    fn parse_corrupt_pid_stat_returns_none() {
+        assert!(parse_pid_stat("").is_none());
+        assert!(parse_pid_stat("1").is_none(), "只有 pid");
+        assert!(parse_pid_stat("not a stat line").is_none());
+        assert!(
+            parse_pid_stat("42 (no closing paren S x y").is_none(),
+            "未闭合括号"
+        );
+        // "pid (comm)" 缺全部后续字段：宽松解析返回部分默认值的 PidRaw
+        // （真实 /proc/<pid>/stat 行恒完整，消费方以完整行为前提）；
+        // 关键是不 panic。
+        let _ = parse_pid_stat("1 (x)").expect("缺字段行应得部分默认值而非 panic");
+    }
+
+    /// GOAL 4.5：损坏的聚合文件片段 → 默认值 / 空列表，不 panic。
+    #[test]
+    fn parse_corrupt_aggregates_default_without_panic() {
+        let m = parse_meminfo("");
+        assert_eq!(m.total, 0, "空输入给默认值");
+        let m = parse_meminfo("garbage lines\nMemTotal: notanumber kB");
+        assert_eq!(m.total, 0, "非法数字忽略");
+        let (load, _, _) = parse_loadavg("");
+        assert_eq!(load, [0.0; 3]);
+        let (load, _, _) = parse_loadavg("x y z");
+        assert_eq!(load, [0.0; 3], "非数字负载忽略");
+        assert!(parse_net_dev("").is_empty());
+        assert!(parse_net_dev("header garbage\n!!! ***").is_empty());
+        assert!(parse_diskstats("").is_empty());
+        assert!(parse_diskstats("!! junk !!").is_empty());
     }
 }

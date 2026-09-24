@@ -15,14 +15,6 @@ pub mod port_scanner;
 pub mod sniffer;
 pub mod systemd;
 
-pub use archive_cracker::*;
-pub use download::*;
-pub use env_editor::*;
-pub use imfix::*;
-pub use inotify::*;
-pub use media::*;
-pub use monitor::*;
-pub use path_scanner::*;
-pub use port_scanner::*;
-pub use sniffer::*;
-pub use systemd::*;
+// 故意不做 `pub use xxx::*` 顶层扁平导出：多个模块导出同名项
+// （ScanEvent/ScanConfig/fingerprint），glob 互相冲突（ambiguous glob re-exports）。
+// 全仓引用均为子模块路径（crate::model::<mod>::<Item>），顶层不聚合。

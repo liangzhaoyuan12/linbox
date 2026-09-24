@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use adw::prelude::*;
 
 use crate::model::path_scanner::{
-    ExcludeSizeRange, PathProbeResult, PathScanConfig, PathScanEvent, BUILTIN_PATHS,
+    BUILTIN_PATHS, ExcludeSizeRange, PathProbeResult, PathScanConfig, PathScanEvent,
 };
 use crate::utils::path_scanner::scan::{self, PathScanParams};
 
@@ -111,7 +111,9 @@ fn mono_view(min_height: i32, editable: bool) -> gtk::TextView {
 }
 
 fn buffer_text(buffer: &gtk::TextBuffer) -> String {
-    buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string()
+    buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+        .to_string()
 }
 
 fn button_row(buttons: &[&gtk::Button]) -> gtk::Box {
@@ -126,13 +128,22 @@ fn button_row(buttons: &[&gtk::Button]) -> gtk::Box {
 
 fn now_text() -> String {
     glib::DateTime::now_local()
-        .map(|dt| dt.format("%H:%M:%S").map(|s| s.to_string()).unwrap_or_default())
+        .map(|dt| {
+            dt.format("%H:%M:%S")
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        })
         .unwrap_or_default()
 }
 
 fn duration_text(secs: u64) -> String {
     if secs >= 3600 {
-        format!("{}h{:02}m{:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+        format!(
+            "{}h{:02}m{:02}s",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
     } else if secs >= 60 {
         format!("{}m{:02}s", secs / 60, secs % 60)
     } else {
@@ -175,7 +186,6 @@ struct Inner {
     headers_view: gtk::TextView,
     builtin_switch: adw::SwitchRow,
     custom_path_row: adw::EntryRow,
-    custom_path_chooser: gtk::Button,
 
     // 扫描参数
     concurrency_row: adw::SpinRow,
@@ -252,7 +262,8 @@ impl Inner {
         }
         // 滚动到底部
         let end = buf.end_iter();
-        self.log_view.scroll_mark_onscreen(&buf.create_mark(None, &end, false));
+        self.log_view
+            .scroll_mark_onscreen(&buf.create_mark(None, &end, false));
         self.log_lines.set(buf.line_count());
     }
 
@@ -334,7 +345,8 @@ impl Inner {
             for r in results.iter() {
                 self.result_list.append(&Self::build_result_row(r));
             }
-            self.result_count.set_text(&format!("共 {} 条", results.len()));
+            self.result_count
+                .set_text(&format!("共 {} 条", results.len()));
         }
     }
 }
@@ -456,8 +468,13 @@ fn g_toggle_pause() {
     if let Some(ref ctrl) = *s.control.borrow() {
         ctrl.set_paused(new_paused);
     }
-    s.pause_btn.set_label(if new_paused { "继续" } else { "暂停" });
-    s.append_log(if new_paused { "已暂停" } else { "继续扫描" });
+    s.pause_btn
+        .set_label(if new_paused { "继续" } else { "暂停" });
+    s.append_log(if new_paused {
+        "已暂停"
+    } else {
+        "继续扫描"
+    });
 }
 
 fn g_stop() {
@@ -493,7 +510,7 @@ fn tick() -> glib::ControlFlow {
                     s.append_log(&format!("引擎已启动，共 {total} 条路径"));
                     s.progress.set_fraction(0.0);
                 }
-                Ok(PathScanEvent::Result { outcome, index }) => {
+                Ok(PathScanEvent::Result { outcome, index: _ }) => {
                     s.results.borrow_mut().push(outcome.clone());
                     s.rebuild_result_list();
                 }
@@ -619,7 +636,11 @@ pub fn build() -> PathScannerPage {
     tc.add(&headers_box);
 
     // 字典来源
-    let builtin_switch = switch_row("使用内置字典", "包含 /admin、/api、/.git 等 100+ 常见路径", true);
+    let builtin_switch = switch_row(
+        "使用内置字典",
+        "包含 /admin、/api、/.git 等 100+ 常见路径",
+        true,
+    );
     tc.add(&builtin_switch);
 
     let custom_path_row = entry_row("自定义字典文件路径（每行一条路径）");
@@ -720,7 +741,6 @@ pub fn build() -> PathScannerPage {
         headers_view: headers_view.clone(),
         builtin_switch: builtin_switch.clone(),
         custom_path_row: custom_path_row.clone(),
-        custom_path_chooser: custom_path_chooser.clone(),
         concurrency_row: concurrency_row.clone(),
         rate_row: rate_row.clone(),
         timeout_row: timeout_row.clone(),
@@ -759,12 +779,11 @@ pub fn build() -> PathScannerPage {
             None::<&gtk::Window>,
             gtk::gio::Cancellable::NONE,
             move |result| {
-                if let Ok(file) = result {
-                    if let Some(path) = file.path() {
-                        if let Some(s) = s_weak.as_ref().and_then(|w| w.upgrade()) {
-                            s.custom_path_row.set_text(&path.to_string_lossy());
-                        }
-                    }
+                if let Ok(file) = result
+                    && let Some(path) = file.path()
+                    && let Some(s) = s_weak.as_ref().and_then(|w| w.upgrade())
+                {
+                    s.custom_path_row.set_text(&path.to_string_lossy());
                 }
             },
         );
@@ -775,18 +794,19 @@ pub fn build() -> PathScannerPage {
     // 主循环排空事件
     glib::source::timeout_add(Duration::from_millis(100), tick);
 
-    PathScannerPage { root: toast_overlay }
+    PathScannerPage {
+        root: toast_overlay,
+    }
 }
 
 /// 关闭时清理（供 app.connect_shutdown 调用）。
 pub fn shutdown() {
     INNER.with(|i| {
-        if let Some(weak) = i.borrow().as_ref() {
-            if let Some(s) = weak.upgrade() {
-                if let Some(ctrl) = s.control.borrow().as_ref() {
-                    ctrl.stop();
-                }
-            }
+        if let Some(weak) = i.borrow().as_ref()
+            && let Some(s) = weak.upgrade()
+            && let Some(ctrl) = s.control.borrow().as_ref()
+        {
+            ctrl.stop();
         }
         *i.borrow_mut() = None;
     });

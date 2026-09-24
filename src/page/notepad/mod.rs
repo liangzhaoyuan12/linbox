@@ -9,16 +9,20 @@
 //! `entries/<id>/inline/0.png`、`1.png` …；`files/` 下的才是附件。
 //! （详见 `storage` 模块头注释）
 
+pub mod git_store;
 pub mod storage;
 pub mod sync;
-pub mod git_store;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::gdk;
-use gtk::gdk::gdk_pixbuf::{Colorspace, InterpType, Pixbuf};
+use gtk::gdk::gdk_pixbuf::{InterpType, Pixbuf};
+// Colorspace 只在下方 #[cfg(test)] 里用：必须单独 cfg 导入，
+// 否则非测试构建报 unused、会被 clippy --fix 误删（GOAL.md 4.4 教训）
+#[cfg(test)]
+use gtk::gdk::gdk_pixbuf::Colorspace;
 use gtk::gio;
 use gtk::pango;
 
@@ -115,13 +119,13 @@ fn with_inner<F: FnOnce(&Inner)>(f: F) {
     let Some(inner) = INNER.with(|i| i.try_borrow().ok().and_then(|b| b.clone())) else {
         return;
     };
-    f(&*inner);
+    f(&inner);
 }
 
 /// 同 `with_inner`，但把闭包的返回值带出来（没有 Inner 时返回 `None`）。
 fn with_inner_r<T, F: FnOnce(&Inner) -> T>(f: F) -> Option<T> {
     let inner = INNER.with(|i| i.try_borrow().ok().and_then(|b| b.clone()))?;
-    Some(f(&*inner))
+    Some(f(&inner))
 }
 
 /// 应用退出时释放全局句柄，避免 TLS 析构阶段再碰 GTK 控件。
@@ -142,7 +146,12 @@ pub fn set_window(w: &impl IsA<gtk::Window>) {
 
 /// 备忘录内容是否有未同步的改动。
 pub fn is_dirty() -> bool {
-    INNER.with(|i| i.try_borrow().ok().and_then(|b| b.as_ref().map(|inner| inner.dirty.get())).unwrap_or(false))
+    INNER.with(|i| {
+        i.try_borrow()
+            .ok()
+            .and_then(|b| b.as_ref().map(|inner| inner.dirty.get()))
+            .unwrap_or(false)
+    })
 }
 
 /// 把编辑区里还没落盘的内容强制写盘（绕过 200 ms 节流）。
@@ -335,7 +344,7 @@ pub fn build() -> NotepadPage {
     let empty_new_btn = gtk::Button::with_label("新建条目");
     empty_new_btn.add_css_class("suggested-action");
     empty_new_btn.set_halign(gtk::Align::Center);
-    empty_new_btn.connect_clicked(move |_| with_inner(|i| create_entry(i)));
+    empty_new_btn.connect_clicked(move |_| with_inner(create_entry));
 
     let empty_page = adw::StatusPage::new();
     empty_page.set_icon_name(Some("document-edit-symbolic"));
@@ -405,25 +414,25 @@ pub fn build() -> NotepadPage {
     wire();
 
     // 新建 / 删除条目
-    add_btn.connect_clicked(move |_| with_inner(|i| create_entry(i)));
-    del_btn.connect_clicked(move |_| with_inner(|i| delete_current(i)));
+    add_btn.connect_clicked(move |_| with_inner(create_entry));
+    del_btn.connect_clicked(move |_| with_inner(delete_current));
 
     // 正文插图片 / 附件管理
-    insert_img_btn.connect_clicked(move |_| with_inner(|i| insert_image_dialog(i)));
-    add_att_btn.connect_clicked(move |_| with_inner(|i| pick_attachments(i)));
-    att_open.connect_clicked(move |_| with_inner(|i| open_attachment(i)));
-    att_show.connect_clicked(move |_| with_inner(|i| show_attachment_in_folder(i)));
-    att_del.connect_clicked(move |_| with_inner(|i| confirm_delete_attachment(i)));
+    insert_img_btn.connect_clicked(move |_| with_inner(insert_image_dialog));
+    add_att_btn.connect_clicked(move |_| with_inner(pick_attachments));
+    att_open.connect_clicked(move |_| with_inner(open_attachment));
+    att_show.connect_clicked(move |_| with_inner(show_attachment_in_folder));
+    att_del.connect_clicked(move |_| with_inner(confirm_delete_attachment));
 
     // 导出 / 导入 ZIP
-    export_btn.connect_clicked(move |_| with_inner(|i| export_dialog(i)));
-    import_btn.connect_clicked(move |_| with_inner(|i| import_dialog(i)));
+    export_btn.connect_clicked(move |_| with_inner(export_dialog));
+    import_btn.connect_clicked(move |_| with_inner(import_dialog));
 
     // 云同步
-    cloud_cfg_btn.connect_clicked(move |_| with_inner(|i| cloud_config_dialog(i)));
-    cloud_sync_btn.connect_clicked(move |_| with_inner(|i| start_cloud_sync(i)));
-    pull_btn.connect_clicked(move |_| with_inner(|i| start_pull(i)));
-    push_btn.connect_clicked(move |_| with_inner(|i| start_push(i)));
+    cloud_cfg_btn.connect_clicked(move |_| with_inner(cloud_config_dialog));
+    cloud_sync_btn.connect_clicked(move |_| with_inner(start_cloud_sync));
+    pull_btn.connect_clicked(move |_| with_inner(start_pull));
+    push_btn.connect_clicked(move |_| with_inner(start_push));
 
     // 剪贴板粘贴图片：正文和标题两处输入框都挂上，谁有焦点谁生效
     attach_paste_controller(&text_view);
@@ -454,7 +463,7 @@ pub fn build() -> NotepadPage {
                     }
                 }
                 glib::idle_add_once(|| {
-                    with_inner(|i| refresh_list(i));
+                    with_inner(refresh_list);
                 });
             }
         });
@@ -532,7 +541,9 @@ fn pick_attachments(inner: &Inner) {
                 let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
                     continue;
                 };
-                let Ok(data) = std::fs::read(&path) else { continue };
+                let Ok(data) = std::fs::read(&path) else {
+                    continue;
+                };
                 if storage::write_file(&id, name, &data).is_some() {
                     n += 1;
                 }
@@ -628,7 +639,7 @@ fn import_dialog(inner: &Inner) {
 /// 云同步设置对话框：支持 HTTP 服务器 + Git 仓库。
 #[allow(deprecated)]
 fn cloud_config_dialog(inner: &Inner) {
-    let configs = sync::load_configs();
+    let _configs = sync::load_configs();
 
     // 直接用 Inner 存储的主窗口引用
     let parent_win = inner.window.borrow().clone();
@@ -713,10 +724,19 @@ fn cloud_config_dialog(inner: &Inner) {
             password: pass_ref.text().to_string(),
         };
         status_ref.set_text("连接中…");
-        match sync::test_connection(&cfg) {
-            Ok(()) => status_ref.set_text("✓ 连接成功"),
-            Err(e) => status_ref.set_text(&format!("✗ {e}")),
-        }
+        // 网络请求不能占 UI 线程（GOAL.md 3.2）
+        let status = status_ref.clone();
+        glib::spawn_future_local(async move {
+            let handle = crate::utils::sniffer::runtime()
+                .spawn_blocking(move || sync::test_connection(&cfg));
+            match handle
+                .await
+                .unwrap_or_else(|e| Err(format!("任务失败：{e}")))
+            {
+                Ok(()) => status.set_text("✓ 连接成功"),
+                Err(e) => status.set_text(&format!("✗ {e}")),
+            }
+        });
     });
     btn_box.append(&test_btn);
 
@@ -783,7 +803,9 @@ fn cloud_config_dialog(inner: &Inner) {
     git_email_row.set_show_apply_button(false);
     vbox.append(&git_email_row);
 
-    let git_hint = gtk::Label::new(Some("支持 SSH（git@…）和 HTTPS（https://…），优先尝试 SSH 密钥"));
+    let git_hint = gtk::Label::new(Some(
+        "支持 SSH（git@…）和 HTTPS（https://…），优先尝试 SSH 密钥",
+    ));
     git_hint.add_css_class("dim-label");
     git_hint.set_halign(gtk::Align::Start);
     git_hint.set_margin_bottom(4);
@@ -819,10 +841,19 @@ fn cloud_config_dialog(inner: &Inner) {
             return;
         }
         git_status_ref.set_text("验证中…");
-        match sync::test_git_connection(&cfg) {
-            Ok(()) => git_status_ref.set_text("✓ 仓库可访问"),
-            Err(e) => git_status_ref.set_text(&format!("✗ {e}")),
-        }
+        // git ls-remote 是网络 + 子进程，不能占 UI 线程（GOAL.md 3.2）
+        let status = git_status_ref.clone();
+        glib::spawn_future_local(async move {
+            let handle = crate::utils::sniffer::runtime()
+                .spawn_blocking(move || sync::test_git_connection(&cfg));
+            match handle
+                .await
+                .unwrap_or_else(|e| Err(format!("任务失败：{e}")))
+            {
+                Ok(()) => status.set_text("✓ 仓库可访问"),
+                Err(e) => status.set_text(&format!("✗ {e}")),
+            }
+        });
     });
     git_btn_box.append(&git_test_btn);
 
@@ -848,25 +879,38 @@ fn cloud_config_dialog(inner: &Inner) {
             git_status_ref2.set_text("请填写仓库地址");
             return;
         }
-        // 先验证可访问性
+        // 先验证可访问性（网络部分放后台线程，GOAL.md 3.2）
         git_status_ref2.set_text("验证仓库可访问性…");
-        match sync::test_git_connection(&cfg) {
-            Ok(()) => {
-                match sync::add_git_config(cfg) {
+        let status = git_status_ref2.clone();
+        let list = list_ref2.clone();
+        let e_url = git_url_ref2.clone();
+        let e_user = git_user_ref2.clone();
+        let e_pass = git_pass_ref2.clone();
+        let e_name = git_name_ref2.clone();
+        let e_email = git_email_ref2.clone();
+        glib::spawn_future_local(async move {
+            let probe_cfg = cfg.clone();
+            let handle = crate::utils::sniffer::runtime()
+                .spawn_blocking(move || sync::test_git_connection(&probe_cfg));
+            match handle
+                .await
+                .unwrap_or_else(|e| Err(format!("任务失败：{e}")))
+            {
+                Ok(()) => match sync::add_git_config(cfg) {
                     Ok(()) => {
-                        rebuild_backend_list(&list_ref2);
-                        git_url_ref2.set_text("");
-                        git_user_ref2.set_text("");
-                        git_pass_ref2.set_text("");
-                        git_name_ref2.set_text("");
-                        git_email_ref2.set_text("");
-                        git_status_ref2.set_text("✓ 仓库已添加");
+                        rebuild_backend_list(&list);
+                        e_url.set_text("");
+                        e_user.set_text("");
+                        e_pass.set_text("");
+                        e_name.set_text("");
+                        e_email.set_text("");
+                        status.set_text("✓ 仓库已添加");
                     }
-                    Err(e) => git_status_ref2.set_text(&format!("✗ {e}")),
-                }
+                    Err(e) => status.set_text(&format!("✗ {e}")),
+                },
+                Err(e) => status.set_text(&format!("✗ 无法访问：{e}")),
             }
-            Err(e) => git_status_ref2.set_text(&format!("✗ 无法访问：{e}")),
-        }
+        });
     });
     git_btn_box.append(&add_git_btn);
     vbox.append(&git_btn_box);
@@ -1177,9 +1221,11 @@ fn start_pull(inner: &Inner) {
                         }
                     }
                     if parts.is_empty() {
-                        i.toast("刷新完成，已是最新"); mark_clean();
+                        i.toast("刷新完成，已是最新");
+                        mark_clean();
                     } else {
-                        i.toast(&format!("刷新完成：{}", parts.join("，"))); mark_clean();
+                        i.toast(&format!("刷新完成：{}", parts.join("，")));
+                        mark_clean();
                     }
                     if !summary.errors.is_empty() {
                         i.toast(&format!("部分错误：{}", summary.errors.join("；")));
@@ -1230,9 +1276,11 @@ fn start_push(inner: &Inner) {
                         }
                     }
                     if parts.is_empty() {
-                        i.toast("推送完成，无需更新"); mark_clean();
+                        i.toast("推送完成，无需更新");
+                        mark_clean();
                     } else {
-                        i.toast(&format!("推送完成：{}", parts.join("，"))); mark_clean();
+                        i.toast(&format!("推送完成：{}", parts.join("，")));
+                        mark_clean();
                     }
                     if !summary.errors.is_empty() {
                         i.toast(&format!("部分错误：{}", summary.errors.join("；")));
@@ -1705,9 +1753,7 @@ fn inline_image_at(
     let (bx, by) =
         text_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
     let iter = text_view.iter_at_location(bx, by)?;
-    if iter.paintable().is_none() {
-        return None;
-    }
+    iter.paintable()?;
     let idx = inline_index_at(&inner.buffer, &iter);
     Some((iter, idx))
 }
@@ -1722,17 +1768,6 @@ fn inline_image_to_temp(inner: &Inner, iter: &gtk::TextIter) -> Option<std::path
     let cur_id = inner.current_id.borrow().clone();
     let id = cur_id?;
     storage::inline_image_path(&id, idx)
-}
-
-/// 点中内联图片 → 导出成临时文件（右键菜单 / 双击打开共用）。
-fn inline_image_path_at(
-    inner: &Inner,
-    text_view: &gtk::TextView,
-    x: f64,
-    y: f64,
-) -> Option<std::path::PathBuf> {
-    let (iter, _idx) = inline_image_at(inner, text_view, x, y)?;
-    inline_image_to_temp(inner, &iter)
 }
 
 /// 附件列表：右键菜单（打开 / 在文件夹中显示）。
@@ -1771,13 +1806,15 @@ fn attach_attachment_gestures(att_box: &gtk::FlowBox) {
 /// 单击图片会把它选成「1 个字符位」的选区，所以「选中 → 右键」能精确对上这张图。
 fn selected_inline_image(inner: &Inner) -> Option<(gtk::TextIter, usize)> {
     let (a, b) = inner.buffer.selection_bounds()?;
-    let (lo, hi) = if a.offset() <= b.offset() { (a, b) } else { (b, a) };
+    let (lo, hi) = if a.offset() <= b.offset() {
+        (a, b)
+    } else {
+        (b, a)
+    };
     if hi.offset() - lo.offset() != 1 {
         return None; // 不是正好一格（拖选了文字 / 选了多张）
     }
-    if lo.paintable().is_none() {
-        return None; // 选中的是普通字符
-    }
+    lo.paintable()?;
     Some((lo, inline_index_at(&inner.buffer, &lo)))
 }
 
@@ -1946,7 +1983,21 @@ fn is_url_word_char(c: char) -> bool {
 fn is_url_trailing_punct(c: char) -> bool {
     matches!(
         c,
-        '.' | ',' | ';' | ':' | '!' | '?' | '。' | '，' | '；' | '：' | '！' | '？' | '、' | '）' | '】' | '》'
+        '.' | ','
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+            | '。'
+            | '，'
+            | '；'
+            | '：'
+            | '！'
+            | '？'
+            | '、'
+            | '）'
+            | '】'
+            | '》'
     )
 }
 
@@ -2095,7 +2146,7 @@ fn confirm_delete_attachment(inner: &Inner) {
     };
     let dialog = adw::MessageDialog::builder()
         .heading("删除附件")
-        .body(&format!("确定删除「{name}」？此操作不可撤销。"))
+        .body(format!("确定删除「{name}」？此操作不可撤销。"))
         .build();
     if let Some(w) = inner.window() {
         dialog.set_transient_for(Some(&w));
@@ -2122,11 +2173,7 @@ fn confirm_delete_attachment(inner: &Inner) {
 
 /// 按扩展名给个图标（不查 mime 库，够用且离线）。
 fn icon_for_file(name: &str) -> &'static str {
-    let ext = name
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "doc" | "docx" | "odt" | "rtf" | "txt" | "md" => "x-office-document-symbolic",
         "ppt" | "pptx" | "odp" | "key" => "x-office-presentation-symbolic",
@@ -2165,18 +2212,20 @@ fn wire() {
 
         // 选区变化 → 同步「打开图片 / 在文件夹中显示」的启用/隐藏状态
         inner.buffer.connect_notify(Some("has-selection"), |_, _| {
-            with_inner(|i| update_inline_menu_state(i))
+            with_inner(update_inline_menu_state)
         });
 
         // 标题改变 → 自动保存（立即写盘）
-        inner.title_entry.connect_changed(|_| with_inner(|i| save_current(i, true)));
+        inner
+            .title_entry
+            .connect_changed(|_| with_inner(|i| save_current(i, true)));
 
         // 附件选中变化 → 打开 / 在文件夹中显示 / 删除 三个按钮跟着启用禁用。
         // 放这里（而不是 build 里）是为了让单测也覆盖到：测试环境只调 wire()，
         // 漏了这条线的话按钮会永远是灰的，而且编译、单测都不会报错。
         inner
             .att_box
-            .connect_selected_children_changed(|_| with_inner(|i| update_attach_buttons(i)));
+            .connect_selected_children_changed(|_| with_inner(update_attach_buttons));
     });
 }
 
@@ -2365,14 +2414,23 @@ mod tests {
     use std::path::PathBuf;
 
     /// GTK 只能在单一线程初始化，而 cargo test 每个用例一个线程 ——
-    /// 所以几个场景必须在同一个 `#[test]` 里顺序跑。
+    /// 所以全仓所有构造 GTK 控件的场景必须在这同一个 `#[test]` 里顺序跑
+    /// （否则第二个入口会 panic「Attempted to initialize GTK from two
+    /// different threads」，并行时甚至 SIGSEGV —— 实测教训）。
     #[test]
-    fn notepad_editor_does_not_leak_between_entries() {
+    fn gtk_scenarios() {
         if gtk::init().is_err() {
             eprintln!("跳过：当前环境无法初始化 GTK");
             return;
         }
         let _ = adw::init();
+        // 1) 备忘录编辑器场景组
+        notepad_editor_does_not_leak_between_entries();
+        // 2) 下载页 ListBox 行增删场景（跨模块并入，避免第二个 GTK 入口）
+        crate::page::download::tests::row_add_remove_keeps_listbox_consistent();
+    }
+
+    fn notepad_editor_does_not_leak_between_entries() {
         scenario_switching_entry();
         scenario_creating_entry();
         scenario_entry_deleted_elsewhere();
@@ -2570,17 +2628,12 @@ mod tests {
         let pixbuf = Pixbuf::new(Colorspace::Rgb, false, 8, 4, 4).expect("造测试图片失败");
         inner.buffer.set_text("前");
         insert_pixbuf_at_cursor(&inner, &pixbuf);
-        inner
-            .buffer
-            .insert(&mut inner.buffer.end_iter(), "后");
+        inner.buffer.insert(&mut inner.buffer.end_iter(), "后");
         save_current(&inner, true);
 
         let saved = storage::read_content(&a);
         assert_eq!(saved, format!("前{}后", OBJ), "正文里的图片位置存丢了");
-        assert!(
-            storage::read_inline(&a, 0).is_some(),
-            "内嵌图片没有落盘"
-        );
+        assert!(storage::read_inline(&a, 0).is_some(), "内嵌图片没有落盘");
 
         // 重新加载：图片必须回到正文里
         // 注意 GtkTextBuffer::text() 是不含图片的（GTK 会跳过图片段），
@@ -2589,10 +2642,7 @@ mod tests {
         assert_eq!(editor_text(&inner), "前后", "重新加载后正文文字不对");
         let mut iter = inner.buffer.start_iter();
         iter.forward_char();
-        assert!(
-            iter.paintable().is_some(),
-            "重新加载后正文里的图片不见了"
-        );
+        assert!(iter.paintable().is_some(), "重新加载后正文里的图片不见了");
         // 双击/右键打开时靠这个索引去找 inline/N.png，算错就会打开别的图或打不开
         assert_eq!(
             inline_index_at(&inner.buffer, &iter),
@@ -2656,10 +2706,7 @@ mod tests {
             select_inline_image(&inner, &img),
             "单击内联图片应该要选中它"
         );
-        let (s, e) = inner
-            .buffer
-            .selection_bounds()
-            .expect("单击后应该产生选区");
+        let (s, e) = inner.buffer.selection_bounds().expect("单击后应该产生选区");
         let (lo, hi) = (s.offset().min(e.offset()), s.offset().max(e.offset()));
         assert_eq!(
             (lo, hi),
@@ -2743,7 +2790,10 @@ mod tests {
 
         // 5) 没有 scheme 的不算
         assert!(find_url_at("只是普通文字", 0).is_none());
-        assert!(find_url_at("a.com/path", 0).is_none(), "无 scheme 不该当 URL");
+        assert!(
+            find_url_at("a.com/path", 0).is_none(),
+            "无 scheme 不该当 URL"
+        );
 
         // 6) 全文扫描：两个 URL 各推一次（句末标点不能导致重复识别）
         let t = "第一行 https://a.com\n第二行 http://b.org/x。";
@@ -2844,7 +2894,10 @@ mod tests {
 
         // 一条附件都没有
         assert!(!inner.att_open.is_sensitive(), "没附件时「打开」不该可用");
-        assert!(!inner.att_show.is_sensitive(), "没附件时「在文件夹中显示」不该可用");
+        assert!(
+            !inner.att_show.is_sensitive(),
+            "没附件时「在文件夹中显示」不该可用"
+        );
         assert!(!inner.att_del.is_sensitive(), "没附件时「删除」不该可用");
 
         assert!(storage::write_file(&a, "报告.docx", b"one").is_some());
@@ -2857,7 +2910,10 @@ mod tests {
         );
 
         // 选中一个附件 → 三个都启用（靠 selected-children-changed 那条信号链）
-        let child = inner.att_box.child_at_index(0).expect("附件列表里应该有第一项");
+        let child = inner
+            .att_box
+            .child_at_index(0)
+            .expect("附件列表里应该有第一项");
         inner.att_box.select_child(&child);
         assert!(inner.att_open.is_sensitive(), "选中后「打开」该可用");
         assert!(
@@ -2945,7 +3001,10 @@ mod tests {
             "选区判定没认出这是一张内联图片"
         );
         update_inline_menu_state(&inner);
-        assert!(act("open-inline").is_enabled(), "选中图片后「打开图片」该可用");
+        assert!(
+            act("open-inline").is_enabled(),
+            "选中图片后「打开图片」该可用"
+        );
         assert!(
             act("show-inline").is_enabled(),
             "选中图片后「在文件夹中显示」该可用"

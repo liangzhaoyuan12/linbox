@@ -23,12 +23,12 @@ use std::time::{Duration, Instant};
 use adw::prelude::*;
 
 use crate::model::sniffer::{
-    fingerprint, PlatformConfig, ScanConfig, ValidKeyRecord, Verdict, DEFAULT_ENDPOINT,
-    PATTERN_TEMPLATES, CUSTOM_TEMPLATE_INDEX,
+    CUSTOM_TEMPLATE_INDEX, DEFAULT_ENDPOINT, PATTERN_TEMPLATES, PlatformConfig, ScanConfig,
+    ValidKeyRecord, Verdict, fingerprint,
 };
 use crate::utils::sniffer::{
-    format_count, generate, load_checkpoint, parse_header_lines, GenerateOptions, ProbeTarget,
-    ScanEvent, ScanParams, StopReason,
+    GenerateOptions, ProbeTarget, ScanEvent, ScanParams, StopReason, format_count, generate,
+    load_checkpoint, parse_header_lines,
 };
 use crate::utils::sniffer::{probe as probe_util, scan as scan_util, store};
 
@@ -145,7 +145,7 @@ struct Inner {
     dict_info: gtk::Label,
     dict_preview: gtk::TextView,
     /// 各平台已生成的候选字典：(pattern 指纹, keys)。键 = 平台名。
-    dicts: RefCell<std::collections::HashMap<String, (String, Arc<Vec<String>>)>>,
+    dicts: RefCell<DictCache>,
 
     // 扫描参数
     concurrency_row: adw::SpinRow,
@@ -160,7 +160,6 @@ struct Inner {
     start_btn: gtk::Button,
     pause_btn: gtk::Button,
     stop_btn: gtk::Button,
-    reset_cp_btn: gtk::Button,
     progress: gtk::ProgressBar,
     stat_label: gtk::Label,
     resume_hint: gtk::Label,
@@ -266,7 +265,9 @@ fn mono_view(min_height: i32, editable: bool) -> gtk::TextView {
 }
 
 fn buffer_text(buffer: &gtk::TextBuffer) -> String {
-    buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string()
+    buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+        .to_string()
 }
 
 fn set_buffer_text(buffer: &gtk::TextBuffer, text: &str) {
@@ -298,21 +299,33 @@ fn mask_key(key: &str) -> String {
 /// 本地时间文本；时钟异常时回落到原始时间戳。
 fn time_text(unix: u64) -> String {
     match glib::DateTime::from_unix_local(unix as i64) {
-        Ok(dt) => dt.format("%Y-%m-%d %H:%M:%S").map(|s| s.to_string()).unwrap_or_default(),
+        Ok(dt) => dt
+            .format("%Y-%m-%d %H:%M:%S")
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
         Err(_) => unix.to_string(),
     }
 }
 
 fn now_text() -> String {
     glib::DateTime::now_local()
-        .map(|dt| dt.format("%H:%M:%S").map(|s| s.to_string()).unwrap_or_default())
+        .map(|dt| {
+            dt.format("%H:%M:%S")
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        })
         .unwrap_or_default()
 }
 
 /// 秒数 → `1h02m03s` 形式。
 fn duration_text(secs: u64) -> String {
     if secs >= 3600 {
-        format!("{}h{:02}m{:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+        format!(
+            "{}h{:02}m{:02}s",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
     } else if secs >= 60 {
         format!("{}m{:02}s", secs / 60, secs % 60)
     } else {
@@ -464,7 +477,9 @@ pub fn build() -> ApiKeySnifferPage {
     config_expander.add_row(&max_row);
     let max_hint = adw::ActionRow::new();
     max_hint.set_title("注意");
-    max_hint.set_subtitle("u128 无上限，不设固定条数上限；生成前按当前可用运存判断，数值越大占用的运存越多");
+    max_hint.set_subtitle(
+        "u128 无上限，不设固定条数上限；生成前按当前可用运存判断，数值越大占用的运存越多",
+    );
     config_expander.add_row(&max_hint);
     let unbounded_row = spin_row("* + {n,} 等无界量词展开上限", 1.0, 8.0, 1.0, 0, 3.0);
     config_expander.add_row(&unbounded_row);
@@ -483,11 +498,22 @@ pub fn build() -> ApiKeySnifferPage {
     config_expander.add_row(&rate_row);
     let timeout_row = spin_row("单次请求超时（秒）", 1.0, 120.0, 1.0, 0, 15.0);
     config_expander.add_row(&timeout_row);
-    let retry_row = spin_row("失败重试次数（网络错误 / 5xx / 429）", 0.0, 5.0, 1.0, 0, 1.0);
+    let retry_row = spin_row(
+        "失败重试次数（网络错误 / 5xx / 429）",
+        0.0,
+        5.0,
+        1.0,
+        0,
+        1.0,
+    );
     config_expander.add_row(&retry_row);
     let resume_switch = switch_row("断点续跑", "中断后下次从断点继续；配置变更会自动失效", true);
     config_expander.add_row(&resume_switch);
-    let persist_switch = switch_row("命中即入本地库", "有效 Key 追加写入 SQLite，自动去重，永久保存", true);
+    let persist_switch = switch_row(
+        "命中即入本地库",
+        "有效 Key 追加写入 SQLite，自动去重，永久保存",
+        true,
+    );
     config_expander.add_row(&persist_switch);
 
     let save_btn = gtk::Button::with_label("保存");
@@ -524,7 +550,12 @@ pub fn build() -> ApiKeySnifferPage {
     stop_btn.add_css_class("destructive-action");
     stop_btn.set_sensitive(false);
     let reset_cp_btn = gtk::Button::with_label("清除断点");
-    rc_.add(&button_row(&[&start_btn, &pause_btn, &stop_btn, &reset_cp_btn]));
+    rc_.add(&button_row(&[
+        &start_btn,
+        &pause_btn,
+        &stop_btn,
+        &reset_cp_btn,
+    ]));
 
     let progress = gtk::ProgressBar::new();
     progress.set_show_text(true);
@@ -669,7 +700,6 @@ pub fn build() -> ApiKeySnifferPage {
         start_btn: start_btn.clone(),
         pause_btn: pause_btn.clone(),
         stop_btn: stop_btn.clone(),
-        reset_cp_btn: reset_cp_btn.clone(),
         progress: progress.clone(),
         stat_label: stat_label.clone(),
         resume_hint: resume_hint.clone(),
@@ -744,7 +774,9 @@ pub fn build() -> ApiKeySnifferPage {
     // 主循环里排空扫描事件队列（闭包不带捕获，满足 signal 的 Send 要求）
     glib::source::timeout_add(Duration::from_millis(100), tick);
 
-    ApiKeySnifferPage { root: toast_overlay }
+    ApiKeySnifferPage {
+        root: toast_overlay,
+    }
 }
 
 /// 定时排空扫描事件队列。
@@ -762,7 +794,7 @@ thread_local! {
     ///
     /// 必须是 `Option<Rc<Inner>>` 而不是 `Weak<Inner>`：否则 `build()` 返回后
     /// `inner` 被销毁，所有回调都会静默失效。
-    static INNER: RefCell<Option<Rc<Inner>>> = RefCell::new(None);
+    static INNER: RefCell<Option<Rc<Inner>>> = const { RefCell::new(None) };
 }
 
 fn with_inner<F: FnOnce(&Inner)>(f: F) {
@@ -771,16 +803,7 @@ fn with_inner<F: FnOnce(&Inner)>(f: F) {
     let Some(inner) = INNER.with(|i| i.try_borrow().ok().and_then(|b| b.clone())) else {
         return;
     };
-    f(&*inner);
-}
-
-fn g_select_platform(name: String) {
-    with_inner(|i| {
-        if let Some(p) = i.platforms.borrow().iter().find(|p| p.name == name).cloned() {
-            i.load_platform(&p);
-            i.persist_last_platform(&p.name);
-        }
-    });
+    f(&inner);
 }
 
 fn g_select_all(enable: bool) {
@@ -903,7 +926,11 @@ impl Inner {
         if name.is_empty() {
             return None;
         }
-        self.platforms.borrow().iter().find(|p| p.name == name).cloned()
+        self.platforms
+            .borrow()
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
     }
 
     /// 根据当前可用运存与当前正则，实时刷新「注意」行的推荐最大条数。
@@ -955,7 +982,8 @@ impl Inner {
                 self.pattern_row.set_text(&p.pattern);
             }
             None => {
-                self.template_combo.set_selected(CUSTOM_TEMPLATE_INDEX as u32);
+                self.template_combo
+                    .set_selected(CUSTOM_TEMPLATE_INDEX as u32);
                 self.pattern_row.set_sensitive(true);
                 self.pattern_row.set_text(&p.pattern);
             }
@@ -969,7 +997,10 @@ impl Inner {
                 .join("\n"),
         );
 
-        let known = ENDPOINTS.iter().position(|e| *e == p.endpoint).map(|i| i as u32);
+        let known = ENDPOINTS
+            .iter()
+            .position(|e| *e == p.endpoint)
+            .map(|i| i as u32);
         match known {
             Some(i) => {
                 self.endpoint_combo.set_selected(i);
@@ -1076,7 +1107,13 @@ impl Inner {
         let name = self.loaded_name.borrow().clone();
         if name.is_empty() {
             self.fill_new_form();
-        } else if let Some(p) = self.platforms.borrow().iter().find(|p| p.name == name).cloned() {
+        } else if let Some(p) = self
+            .platforms
+            .borrow()
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+        {
             // 重新载入已保存的配置，丢弃未保存的编辑
             self.load_platform(&p);
         }
@@ -1110,10 +1147,10 @@ impl Inner {
         // 字典按平台缓存：改名时迁移，否则保持
         {
             let mut dicts = self.dicts.borrow_mut();
-            if old_name != cfg.name {
-                if let Some(d) = dicts.remove(&old_name) {
-                    dicts.insert(cfg.name.clone(), d);
-                }
+            if old_name != cfg.name
+                && let Some(d) = dicts.remove(&old_name)
+            {
+                dicts.insert(cfg.name.clone(), d);
             }
         }
         // 级联改名：本地库（valid_keys 表）与断点文件里的平台名一起迁移，
@@ -1155,7 +1192,13 @@ impl Inner {
 
     /// 按名字载入平台（列表行点击 / 编辑按钮回调），展开配置卡。
     fn load_platform_by_name(&self, name: &str) {
-        if let Some(p) = self.platforms.borrow().iter().find(|p| p.name == name).cloned() {
+        if let Some(p) = self
+            .platforms
+            .borrow()
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+        {
             self.load_platform(&p);
             self.config_expander.set_expanded(true);
         }
@@ -1238,17 +1281,27 @@ impl Inner {
             });
         }
 
-        self.task_empty.set_visible(self.platforms.borrow().is_empty());
-        if let Some(name) = select {
-            if let Some(p) = self.platforms.borrow().iter().find(|p| p.name == name).cloned() {
-                *self.loaded_name.borrow_mut() = p.name.clone();
-            }
+        self.task_empty
+            .set_visible(self.platforms.borrow().is_empty());
+        if let Some(name) = select
+            && let Some(p) = self
+                .platforms
+                .borrow()
+                .iter()
+                .find(|p| p.name == name)
+                .cloned()
+        {
+            *self.loaded_name.borrow_mut() = p.name.clone();
         }
     }
 
     /// 内部方法：Rc 自身，供列表行回调使用。
     fn self_rc(&self) -> Rc<Inner> {
-        INNER.with(|i| i.borrow().clone().unwrap_or_else(|| unreachable!("页面未注册")))
+        INNER.with(|i| {
+            i.borrow()
+                .clone()
+                .unwrap_or_else(|| unreachable!("页面未注册"))
+        })
     }
 
     fn persist_platforms(&self) {
@@ -1319,7 +1372,13 @@ impl Inner {
             }
         };
         self.pending_dict.borrow_mut().remove(0);
-        let Some(p) = self.platforms.borrow().iter().find(|p| p.name == name).cloned() else {
+        let Some(p) = self
+            .platforms
+            .borrow()
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+        else {
             self.log(&format!("「{name}」配置缺失，跳过字典生成"));
             self.set_task_status(&name, "配置缺失");
             return self.gen_next_dict();
@@ -1343,9 +1402,7 @@ impl Inner {
         self.log(&format!("「{name}」正在生成字典…"));
 
         // `Arc<Mutex<..>>` 才能跨线程搬运（`Rc` 不是 Send）；结果附带生成时所属的平台名
-        let slot: Arc<
-            Mutex<Option<(String, Result<crate::utils::sniffer::Dictionary, String>)>>,
-        > = Arc::new(Mutex::new(None));
+        let slot: Arc<Mutex<Option<(String, GenerateResult)>>> = Arc::new(Mutex::new(None));
         GENERATE_SLOT.with(|s| *s.borrow_mut() = Some(Arc::clone(&slot)));
         let pattern = p.pattern.clone();
         let task_name = name.clone();
@@ -1386,7 +1443,11 @@ impl Inner {
                 self.log(&format!("「{name}」字典生成完成：{len} 条候选（乱序）"));
                 // 只更新「当前正在编辑那个平台」的预览
                 if *self.loaded_name.borrow() == name {
-                    let preview: Vec<&str> = keys.iter().take(PREVIEW_LIMIT).map(|s| s.as_str()).collect();
+                    let preview: Vec<&str> = keys
+                        .iter()
+                        .take(PREVIEW_LIMIT)
+                        .map(|s| s.as_str())
+                        .collect();
                     let mut text = preview.join("\n");
                     if len > PREVIEW_LIMIT {
                         text.push_str(&format!(
@@ -1470,7 +1531,8 @@ impl Inner {
         }
         let name = self.loaded_name.borrow().clone();
         if name.is_empty() {
-            self.resume_hint.set_text("当前平台未保存，断点按平台名区分");
+            self.resume_hint
+                .set_text("当前平台未保存，断点按平台名区分");
             return;
         }
         match load_checkpoint(&name) {
@@ -1609,7 +1671,10 @@ impl Inner {
                             cp.valid
                         ));
                     } else {
-                        self.log(&format!("「{}」断点与当前配置不匹配，已忽略并从头开始", p.name));
+                        self.log(&format!(
+                            "「{}」断点与当前配置不匹配，已忽略并从头开始",
+                            p.name
+                        ));
                         store::clear_checkpoint(&p.name);
                     }
                 }
@@ -1650,7 +1715,10 @@ impl Inner {
                 counters: Counters::default(),
                 finished: false,
             });
-            self.set_task_status(&p.name, &format!("启动中 · {} 条", format_count(keys.len() as u128)));
+            self.set_task_status(
+                &p.name,
+                &format!("启动中 · {} 条", format_count(keys.len() as u128)),
+            );
         }
 
         if runs.is_empty() {
@@ -1674,7 +1742,12 @@ impl Inner {
 
         let total_runs = self.runs.borrow().len();
         for run in self.runs.borrow().iter() {
-            let p = self.platforms.borrow().iter().find(|p| p.name == run.name).cloned();
+            let p = self
+                .platforms
+                .borrow()
+                .iter()
+                .find(|p| p.name == run.name)
+                .cloned();
             let Some(cfg) = p else { continue };
             self.log(&format!(
                 "开始扫描「{}」：字典 {} 条，从第 {} 条开始，并发 {}，限速 {} 次/秒",
@@ -1690,7 +1763,11 @@ impl Inner {
             ));
         }
         if !skipped.is_empty() {
-            self.log(&format!("跳过 {} 个平台：{}", skipped.len(), skipped.join("；")));
+            self.log(&format!(
+                "跳过 {} 个平台：{}",
+                skipped.len(),
+                skipped.join("；")
+            ));
             self.toast(&format!("已跳过 {} 个平台（详见日志）", skipped.len()));
         }
         self.log(&format!("共启动 {} 个平台的扫描，并行进行中", total_runs));
@@ -1707,7 +1784,11 @@ impl Inner {
             run.control.set_paused(next);
         }
         self.pause_btn.set_label(if next { "继续" } else { "暂停" });
-        self.log(if next { "已暂停全部扫描" } else { "已继续全部扫描" });
+        self.log(if next {
+            "已暂停全部扫描"
+        } else {
+            "已继续全部扫描"
+        });
     }
 
     fn stop(&self) {
@@ -2005,8 +2086,12 @@ impl Inner {
         }
         let frac = done as f64 / total as f64;
         self.progress.set_fraction(frac);
-        self.progress
-            .set_text(Some(&format!("{:.1}% · {} / {}", frac * 100.0, format_count(done as u128), format_count(total as u128))));
+        self.progress.set_text(Some(&format!(
+            "{:.1}% · {} / {}",
+            frac * 100.0,
+            format_count(done as u128),
+            format_count(total as u128)
+        )));
         // 同步每行状态
         drop(runs);
         let runs = self.runs.borrow();
@@ -2021,7 +2106,12 @@ impl Inner {
             };
             self.set_task_status(
                 &run.name,
-                &format!("{:.0}% · {} / {}", p, format_count(run.counters.tested as u128), format_count(run.total as u128)),
+                &format!(
+                    "{:.0}% · {} / {}",
+                    p,
+                    format_count(run.counters.tested as u128),
+                    format_count(run.total as u128)
+                ),
             );
         }
     }
@@ -2192,16 +2282,15 @@ impl Inner {
 
         let limit = 400i32;
         let lines = buffer.line_count();
-        if lines > limit {
-            if let Some(mut cut) = buffer.iter_at_line(lines - limit) {
-                let mut start = buffer.start_iter();
-                buffer.delete(&mut start, &mut cut);
-            }
+        if lines > limit
+            && let Some(mut cut) = buffer.iter_at_line(lines - limit)
+        {
+            let mut start = buffer.start_iter();
+            buffer.delete(&mut start, &mut cut);
         }
         self.log_lines.set(buffer.line_count().min(limit));
         let mut end = buffer.end_iter();
-        self.log_view
-            .scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
+        self.log_view.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
     }
 
     fn clear_log(&self) {
@@ -2237,8 +2326,7 @@ impl Inner {
         let url = probe_util::join_url(&target.base_url, &target.endpoint);
         let method = target.method().as_str();
 
-        let slot: Arc<Mutex<Option<(crate::model::sniffer::ProbeOutcome, String, &'static str)>>> =
-            Arc::new(Mutex::new(None));
+        let slot: Arc<Mutex<Option<TestResult>>> = Arc::new(Mutex::new(None));
         TEST_SLOT.with(|s| *s.borrow_mut() = Some(Arc::clone(&slot)));
 
         // tokio 异步探测：不阻塞 UI，完成后回主线程更新结果
@@ -2268,13 +2356,14 @@ impl Inner {
     fn test_done(&self) {
         self.t_send_btn.set_sensitive(true);
         let slot = TEST_SLOT.with(|s| s.borrow_mut().take());
-        let (outcome, url, method) = match slot.and_then(|s| s.lock().ok().and_then(|mut g| g.take())) {
-            Some(v) => v,
-            None => {
-                self.t_result_label.set_text("测试失败：内部状态丢失");
-                return;
-            }
-        };
+        let (outcome, url, method) =
+            match slot.and_then(|s| s.lock().ok().and_then(|mut g| g.take())) {
+                Some(v) => v,
+                None => {
+                    self.t_result_label.set_text("测试失败：内部状态丢失");
+                    return;
+                }
+            };
         self.t_result_label.set_text(&format!(
             "{} {} → HTTP {} {}（{} ms）\n判定：{}\n说明：{}",
             method,
@@ -2308,14 +2397,22 @@ pub fn shutdown() {
     });
 }
 
+/// 平台名 → (pattern 指纹, 候选字典)。
+type DictCache = std::collections::HashMap<String, (String, Arc<Vec<String>>)>;
+/// 后台字典生成的返回值。
+type GenerateResult = Result<crate::utils::sniffer::Dictionary, String>;
+/// 字典生成结果中转槽的完整类型。
+type GenerateSlot = Option<Arc<Mutex<Option<(String, GenerateResult)>>>>;
+/// 单次测试的返回值：(探测结果, 实际请求的 URL, 请求方法)。
+type TestResult = (crate::model::sniffer::ProbeOutcome, String, &'static str);
+/// 测试结果中转槽的完整类型。
+type TestSlot = Option<Arc<Mutex<Option<TestResult>>>>;
+
 thread_local! {
     /// 后台字典生成的结果中转槽（结果附带所属平台名；放在 `Arc<Mutex<..>>` 里才能跨线程搬运）。
-    static GENERATE_SLOT: RefCell<
-        Option<Arc<Mutex<Option<(String, Result<crate::utils::sniffer::Dictionary, String>)>>>>,
-    > = RefCell::new(None);
-    /// 单次测试的结果中转槽：(探测结果, 实际请求的 URL, 请求方法)。
-    static TEST_SLOT: RefCell<Option<Arc<Mutex<Option<(crate::model::sniffer::ProbeOutcome, String, &'static str)>>>>> =
-        RefCell::new(None);
+    static GENERATE_SLOT: RefCell<GenerateSlot> = const { RefCell::new(None) };
+    /// 单次测试的结果中转槽。
+    static TEST_SLOT: RefCell<TestSlot> = const { RefCell::new(None) };
 }
 
 fn tick_generate_done() -> glib::ControlFlow {
@@ -2347,7 +2444,11 @@ fn pick_export_path(inner: Rc<Inner>, csv: bool) {
         .root()
         .and_then(|r| r.downcast::<gtk::Window>().ok());
     let dialog = gtk::FileChooserDialog::builder()
-        .title(if csv { "导出为 CSV" } else { "导出为 JSON" })
+        .title(if csv {
+            "导出为 CSV"
+        } else {
+            "导出为 JSON"
+        })
         .action(gtk::FileChooserAction::Save)
         .modal(true)
         .build();
@@ -2359,14 +2460,14 @@ fn pick_export_path(inner: Rc<Inner>, csv: bool) {
     dialog.set_current_name(if csv { "api_keys.csv" } else { "api_keys.json" });
 
     dialog.connect_response(move |d, resp| {
-        if resp == gtk::ResponseType::Accept {
-            if let Some(file) = d.file().and_then(|f| f.path()) {
-                let path = file.to_string_lossy().to_string();
-                let records = inner.valid_records.borrow().clone();
-                match store::export_valid(&records, &path, csv) {
-                    Ok(()) => inner.toast(&format!("已导出 {} 条到 {path}", records.len())),
-                    Err(e) => inner.toast(&format!("导出失败：{e}")),
-                }
+        if resp == gtk::ResponseType::Accept
+            && let Some(file) = d.file().and_then(|f| f.path())
+        {
+            let path = file.to_string_lossy().to_string();
+            let records = inner.valid_records.borrow().clone();
+            match store::export_valid(&records, &path, csv) {
+                Ok(()) => inner.toast(&format!("已导出 {} 条到 {path}", records.len())),
+                Err(e) => inner.toast(&format!("导出失败：{e}")),
             }
         }
         d.destroy();

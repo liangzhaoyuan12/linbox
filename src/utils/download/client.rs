@@ -22,3 +22,37 @@ pub fn build_client(cfg: &DownloadConfig) -> Result<reqwest::Client, String> {
 pub fn probe_timeout(cfg: &DownloadConfig) -> Duration {
     Duration::from_secs(cfg.timeout_secs.max(1))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_timeout_uses_config_with_floor() {
+        let mut cfg = DownloadConfig {
+            timeout_secs: 45,
+            ..Default::default()
+        };
+        assert_eq!(probe_timeout(&cfg), Duration::from_secs(45));
+        cfg.timeout_secs = 0;
+        assert_eq!(
+            probe_timeout(&cfg),
+            Duration::from_secs(1),
+            "0 必须抬到 1 秒防挂死"
+        );
+    }
+
+    #[test]
+    fn build_client_ok() {
+        // 构造成功即说明 rustls + UA + connect/read timeout + 重定向策略合法；
+        // 故意不设总请求超时（大文件靠 read_timeout 兜底，见模块头注释）。
+        let cfg = DownloadConfig::default();
+        build_client(&cfg).expect("reqwest 客户端应能构造");
+        // floor 到 1 秒也不得 panic
+        let cfg2 = DownloadConfig {
+            timeout_secs: 0,
+            ..Default::default()
+        };
+        build_client(&cfg2).expect("timeout=0 时 read_timeout 应被抬到 1s");
+    }
+}

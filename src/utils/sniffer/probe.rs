@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::model::sniffer::{ProbeOutcome, Verdict, DEFAULT_ENDPOINT, SNIPPET_MAX};
+use crate::model::sniffer::{DEFAULT_ENDPOINT, ProbeOutcome, SNIPPET_MAX, Verdict};
 
 /// 探测端点（不含 Key）。
 #[derive(Debug, Clone)]
@@ -72,7 +72,11 @@ pub fn join_url(base_url: &str, endpoint: &str) -> String {
     let base = base_url.trim().trim_end_matches('/');
     let ep = endpoint.trim();
     let ep = if ep.is_empty() { DEFAULT_ENDPOINT } else { ep };
-    let ep = if ep.starts_with('/') { ep.to_string() } else { format!("/{ep}") };
+    let ep = if ep.starts_with('/') {
+        ep.to_string()
+    } else {
+        format!("/{ep}")
+    };
     let normalized = ep.trim_end_matches('/').to_ascii_lowercase();
     if base.to_ascii_lowercase().ends_with(&normalized) {
         return base.to_string();
@@ -137,7 +141,12 @@ fn detail_of(body: &str, fallback: &str) -> String {
             .or_else(|| value.pointer("/error"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .or_else(|| value.get("message").and_then(|v| v.as_str()).map(|s| s.to_string()));
+            .or_else(|| {
+                value
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
         if let Some(m) = msg {
             let m: String = m.chars().take(200).collect();
             return m;
@@ -187,10 +196,7 @@ pub async fn probe(client: &reqwest::Client, target: &ProbeTarget, key: &str) ->
     match result {
         Ok(response) => {
             let status = response.status();
-            let status_text = status
-                .canonical_reason()
-                .unwrap_or_default()
-                .to_string();
+            let status_text = status.canonical_reason().unwrap_or_default().to_string();
             let retry_after = response
                 .headers()
                 .get("retry-after")
@@ -199,10 +205,10 @@ pub async fn probe(client: &reqwest::Client, target: &ProbeTarget, key: &str) ->
             let body = response.text().await.unwrap_or_default();
             let verdict = Verdict::from_status(status.as_u16());
             let mut detail = detail_of(&body, &status_text);
-            if let Some(ra) = retry_after {
-                if !ra.trim().is_empty() {
-                    detail = format!("{detail}（Retry-After: {ra}）");
-                }
+            if let Some(ra) = retry_after
+                && !ra.trim().is_empty()
+            {
+                detail = format!("{detail}（Retry-After: {ra}）");
             }
             ProbeOutcome {
                 verdict,
@@ -248,7 +254,10 @@ mod tests {
             join_url("https://a.com/v1/", "/chat/completions"),
             "https://a.com/v1/chat/completions"
         );
-        assert_eq!(join_url("https://a.com/v1", "chat/completions"), "https://a.com/v1/chat/completions");
+        assert_eq!(
+            join_url("https://a.com/v1", "chat/completions"),
+            "https://a.com/v1/chat/completions"
+        );
     }
 
     #[test]
@@ -261,7 +270,10 @@ mod tests {
 
     #[test]
     fn empty_endpoint_falls_back_to_default() {
-        assert_eq!(join_url("https://a.com/v1", ""), "https://a.com/v1/chat/completions");
+        assert_eq!(
+            join_url("https://a.com/v1", ""),
+            "https://a.com/v1/chat/completions"
+        );
     }
 
     #[test]
@@ -285,7 +297,8 @@ mod tests {
 
     #[test]
     fn extracts_error_message_from_json() {
-        let body = r#"{"error":{"message":"Incorrect API key provided","type":"invalid_request_error"}}"#;
+        let body =
+            r#"{"error":{"message":"Incorrect API key provided","type":"invalid_request_error"}}"#;
         assert_eq!(detail_of(body, "fallback"), "Incorrect API key provided");
     }
 
@@ -300,7 +313,10 @@ mod tests {
         let headers = parse_header_lines("X-A: 1\n# comment\n\nX-B:two\nno-colon\n");
         assert_eq!(
             headers,
-            vec![("X-A".to_string(), "1".to_string()), ("X-B".to_string(), "two".to_string())]
+            vec![
+                ("X-A".to_string(), "1".to_string()),
+                ("X-B".to_string(), "two".to_string())
+            ]
         );
     }
 

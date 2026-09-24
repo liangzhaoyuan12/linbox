@@ -19,9 +19,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::model::inotify::{
-    InotifyStatus, RECOMMENDED_INSTANCES, RECOMMENDED_WATCHES,
-};
+use crate::model::inotify::{InotifyStatus, RECOMMENDED_INSTANCES, RECOMMENDED_WATCHES};
 
 /// 实时值来源（内核导出的当前生效值，最可信）。
 const WATCHES_PROC: &str = "/proc/sys/fs/inotify/max_user_watches";
@@ -94,7 +92,11 @@ pub fn live_instances() -> Option<u64> {
 /// 所以返回的 map 里留下的一定是真正生效的那个文件和值。
 ///
 /// 返回 `(key → (值, 来源文件))`；同时保留全部出现位置供展示"被谁覆盖"。
-pub fn collect_persisted() -> (BTreeMap<String, (u64, String)>, Vec<(String, u64, String)>) {
+pub type EffectiveMap = BTreeMap<String, (u64, String)>;
+/// 一次出现：(键, 值, 来源文件)。
+pub type Occurrence = (String, u64, String);
+
+pub fn collect_persisted() -> (EffectiveMap, Vec<Occurrence>) {
     let mut files: Vec<PathBuf> = Vec::new();
 
     // sysctl 处理 --system 时的顺序：先 /etc/sysctl.conf，再 /etc/sysctl.d/*.conf。
@@ -105,9 +107,7 @@ pub fn collect_persisted() -> (BTreeMap<String, (u64, String)>, Vec<(String, u64
     if let Ok(rd) = fs::read_dir("/etc/sysctl.d") {
         let mut confs: Vec<PathBuf> = rd
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.extension().and_then(|s| s.to_str()) == Some("conf") && p.is_file()
-            })
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("conf") && p.is_file())
             .collect();
         // 字典序：与 sysctl 的 glob 排序一致（99-* 天然排在 50-* 之后）。
         confs.sort();
@@ -128,9 +128,7 @@ pub fn collect_persisted() -> (BTreeMap<String, (u64, String)>, Vec<(String, u64
 ///
 /// 约定与 `collect_persisted` 一致：输入必须按 sysctl 的实际加载顺序排列，
 /// 同名键后出现者胜。
-pub fn effective_from_texts(
-    files: &[(String, String)],
-) -> (BTreeMap<String, (u64, String)>, Vec<(String, u64, String)>) {
+pub fn effective_from_texts(files: &[(String, String)]) -> (EffectiveMap, Vec<Occurrence>) {
     let mut effective: BTreeMap<String, (u64, String)> = BTreeMap::new();
     let mut all: Vec<(String, u64, String)> = Vec::new();
 
@@ -327,7 +325,9 @@ pub fn persist(params: &[(Param, u64)]) -> Result<(), String> {
 fn build_persist_content(params: &[(Param, u64)]) -> String {
     let mut s = String::new();
     s.push_str("# 由 linbox「inotify 调优」页面写入。\n");
-    s.push_str("# 提高文件监听上限（VS Code / WebStorm / webpack / nodemon / watchman 等常用）。\n");
+    s.push_str(
+        "# 提高文件监听上限（VS Code / WebStorm / webpack / nodemon / watchman 等常用）。\n",
+    );
     s.push_str("# 删除本文件并重启即可恢复默认值；也可手动改小数值。\n");
     s.push_str("# 注：故意不写 /etc/sysctl.conf —— Debian 的 sysctl 脚本会剥掉该文件的\n");
     s.push_str("#     整行注释并应用，可能误启用其中被注释掉的建议项。\n");
@@ -420,7 +420,10 @@ mod tests {
         let (eff, all) = effective_from_texts(&files);
         assert_eq!(
             eff.get("fs.inotify.max_user_watches"),
-            Some(&(524288u64, "/etc/sysctl.d/99-linbox-inotify.conf".to_string())),
+            Some(&(
+                524288u64,
+                "/etc/sysctl.d/99-linbox-inotify.conf".to_string()
+            )),
             "99-* 必须覆盖 50-* 和 sysctl.conf"
         );
         // all 保留全部出现位置（供页面提示"被谁覆盖"）
@@ -435,7 +438,7 @@ mod tests {
             "net.core.somaxconn=4096\nfs.inotify.max_user_instances=512\n".to_string(),
         )];
         let (eff, all) = effective_from_texts(&files);
-        assert!(eff.get("net.core.somaxconn").is_none());
+        assert!(!eff.contains_key("net.core.somaxconn"));
         assert_eq!(eff.get("fs.inotify.max_user_instances").unwrap().0, 512);
         assert_eq!(all.len(), 1);
     }
@@ -475,13 +478,41 @@ mod tests {
     /// 持久化文件内容：每个键恰好一行、可被我们的解析器原样读回。
     #[test]
     fn persist_content_roundtrips() {
-        let content = build_persist_content(&[
-            (Param::Watches, 524288),
-            (Param::Instances, 512),
-        ]);
+        let content = build_persist_content(&[(Param::Watches, 524288), (Param::Instances, 512)]);
         let (eff, all) = effective_from_texts(&[("x.conf".to_string(), content)]);
         assert_eq!(all.len(), 2, "两个键都应出现");
         assert_eq!(eff.get("fs.inotify.max_user_watches").unwrap().0, 524288);
         assert_eq!(eff.get("fs.inotify.max_user_instances").unwrap().0, 512);
+    }
+
+    /// 参数白名单元数据（key 同时是 sysctl 命令参数，拼错会注入）。
+    #[test]
+    fn param_whitelist_metadata() {
+        assert_eq!(Param::Watches.key(), "fs.inotify.max_user_watches");
+        assert_eq!(Param::Instances.key(), "fs.inotify.max_user_instances");
+        assert!(Param::Watches.proc_path().contains("/proc/sys/fs/inotify/"));
+        assert!(Param::Instances.proc_path().ends_with("max_user_instances"));
+        assert!(Param::Watches.label().contains("max_user_watches"));
+        assert_eq!(ALL_PARAMS, [Param::Watches, Param::Instances]);
+    }
+
+    /// 合法区间的边界值：恰好等于上限必须通过（+1 已被 validate_bounds 覆盖为拒绝）。
+    #[test]
+    fn validate_upper_boundary_exact() {
+        assert!(validate(Param::Watches, SANE_MAX_WATCHES).is_ok());
+        assert!(validate(Param::Instances, SANE_MAX_INSTANCES).is_ok());
+        assert!(validate(Param::Watches, 1).is_ok(), "最小合法值 1");
+    }
+
+    /// Linux 真机 smoke：/proc 必然存在且有可读默认值。
+    #[test]
+    fn platform_and_live_readable_on_linux() {
+        assert!(
+            platform_supported(),
+            "Linux 桌面应支持 /proc/sys/fs/inotify"
+        );
+        let w = live_watches().expect("max_user_watches 必须可读");
+        assert!(w >= 8192, "内核默认至少 8192，实际 {w}");
+        assert!(live_instances().is_some());
     }
 }

@@ -59,17 +59,16 @@ pub fn release_unused_memory() {}
 // 作为本模块对外的完整 API 面，部分符号暂未被当前页面用到，故关掉未使用告警。
 #[allow(unused_imports)]
 pub use generate::{
-    available_memory_bytes, estimate_space, format_count, generate, recommended_max_keys,
-    sample_seed_for, Dictionary, GenerateOptions,
+    Dictionary, GenerateOptions, available_memory_bytes, estimate_space, format_count, generate,
+    recommended_max_keys, sample_seed_for,
 };
 #[allow(unused_imports)]
-pub use probe::{chat_body, join_url, now_unix, parse_header_lines, ProbeMethod, ProbeTarget};
+pub use probe::{ProbeMethod, ProbeTarget, chat_body, join_url, now_unix, parse_header_lines};
 #[allow(unused_imports)]
-pub use scan::{start as start_scan, Control, ScanEvent, ScanParams, StopReason};
+pub use scan::{Control, ScanEvent, ScanParams, StopReason, start as start_scan};
 #[allow(unused_imports)]
 pub use store::{
-    append_valid, checkpoint_path, clear_checkpoint, clear_valid, config_dir, data_dir,
-    db_path, delete_valid, export_valid, init_db, load_checkpoint, load_store, load_valid,
+    append_valid, checkpoint_path, clear_checkpoint, clear_valid, config_dir, data_dir, db_path,
+    default_store, delete_valid, export_valid, init_db, load_checkpoint, load_store, load_valid,
     rename_checkpoint, rename_platform, save_checkpoint, save_platforms, save_store,
-    default_store,
 };

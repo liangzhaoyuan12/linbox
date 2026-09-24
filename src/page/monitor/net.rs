@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use gtk::prelude::*;
 
 use super::{card, card_title, kv_row, value_label};
-use crate::model::monitor::{NetIface, Snapshot};
+use crate::model::monitor::Snapshot;
 use crate::utils::monitor as mon;
 use crate::widgets::graph::Graph;
 

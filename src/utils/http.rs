@@ -123,4 +123,40 @@ mod tests {
         assert!(validate_url("ftp://a.com").is_err());
     }
 
+    #[test]
+    fn method_parse_edge_cases() {
+        assert_eq!(Method::parse("  get\t"), Some(Method::Get), "容忍首尾空白");
+        assert_eq!(Method::parse("PoSt"), Some(Method::Post), "大小写不敏感");
+        assert_eq!(Method::parse("PUT"), None);
+        assert_eq!(Method::parse(""), None);
+        assert_eq!(Method::parse("GETX"), None, "不得前缀误匹配");
+        assert_eq!(Method::default(), Method::Get, "默认方法是 GET");
+        assert_eq!(Method::Get.as_str(), "GET");
+    }
+
+    #[test]
+    fn validate_url_edge_cases() {
+        // 严格小写前缀：大写协议头不算数
+        assert!(validate_url("HTTP://a.com").is_err());
+        assert!(validate_url("HTTPS://a.com").is_err());
+        assert!(validate_url("example.com").is_err(), "缺协议头拒绝");
+        assert!(validate_url("httpx://a.com").is_err());
+        assert!(
+            validate_url("\n\thttps://a.com/x\n").is_ok(),
+            "空白裁剪后合法"
+        );
+        assert_eq!(
+            validate_url("  http://a.com/x  ").unwrap(),
+            "http://a.com/x"
+        );
+    }
+
+    #[test]
+    fn request_spec_defaults() {
+        let spec = RequestSpec::default();
+        assert_eq!(spec.method, Method::Get);
+        assert!(spec.url.is_empty());
+        assert!(spec.headers.is_empty());
+        assert!(spec.body.is_empty());
+    }
 }

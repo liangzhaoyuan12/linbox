@@ -90,10 +90,10 @@ fn detect_service(stream: &mut TcpStream, port: u16) -> (String, String, Protoco
     let banner = String::from_utf8_lossy(&banner_buf[..banner_len]).to_string();
 
     // 如果 banner 已经包含识别信息，直接匹配
-    if !banner.is_empty() {
-        if let Some(s) = match_banner(port, &banner) {
-            return s;
-        }
+    if !banner.is_empty()
+        && let Some(s) = match_banner(port, &banner)
+    {
+        return s;
     }
 
     // 对每个探针进行尝试
@@ -126,13 +126,13 @@ fn detect_service(stream: &mut TcpStream, port: u16) -> (String, String, Protoco
                 break;
             }
         }
-        if !matched && !probe.banner_contains.is_empty() {
-            if resp
+        if !matched
+            && !probe.banner_contains.is_empty()
+            && resp
                 .to_lowercase()
                 .contains(&probe.banner_contains.to_lowercase())
-            {
-                matched = true;
-            }
+        {
+            matched = true;
         }
 
         if matched {
@@ -158,7 +158,7 @@ fn detect_service(stream: &mut TcpStream, port: u16) -> (String, String, Protoco
 }
 
 /// 纯 banner 匹配（连接后服务主动发数据的情况）。
-fn match_banner(port: u16, banner: &str) -> Option<(String, String, ProtocolFamily, String)> {
+fn match_banner(_port: u16, banner: &str) -> Option<(String, String, ProtocolFamily, String)> {
     let lower = banner.to_lowercase();
 
     // SSH
@@ -167,12 +167,24 @@ fn match_banner(port: u16, banner: &str) -> Option<(String, String, ProtocolFami
         return Some(("SSH".into(), "SSH-2.0".into(), ProtocolFamily::Tcp, ver));
     }
     // FTP
-    if lower.contains("220") && (lower.contains("ftp") || lower.contains("filezilla") || lower.contains("proftpd") || lower.contains("vsftpd") || lower.contains("pure-ftpd")) {
+    if lower.contains("220")
+        && (lower.contains("ftp")
+            || lower.contains("filezilla")
+            || lower.contains("proftpd")
+            || lower.contains("vsftpd")
+            || lower.contains("pure-ftpd"))
+    {
         let ver = extract_version(banner, "FTP");
         return Some(("FTP".into(), "FTP".into(), ProtocolFamily::Tcp, ver));
     }
     // SMTP
-    if lower.contains("220") && (lower.contains("smtp") || lower.contains("esmtp") || lower.contains("postfix") || lower.contains("sendmail") || lower.contains("exim")) {
+    if lower.contains("220")
+        && (lower.contains("smtp")
+            || lower.contains("esmtp")
+            || lower.contains("postfix")
+            || lower.contains("sendmail")
+            || lower.contains("exim"))
+    {
         let ver = extract_version(banner, "SMTP");
         return Some(("SMTP".into(), "SMTP".into(), ProtocolFamily::Tcp, ver));
     }
@@ -188,27 +200,52 @@ fn match_banner(port: u16, banner: &str) -> Option<(String, String, ProtocolFami
     }
     // Redis
     if lower.contains("-err") && lower.contains("wrongpass") {
-        return Some(("Redis".into(), "Redis".into(), ProtocolFamily::Tcp, String::new()));
+        return Some((
+            "Redis".into(),
+            "Redis".into(),
+            ProtocolFamily::Tcp,
+            String::new(),
+        ));
     }
     // MongoDB
     if lower.contains("mongodb") {
         let ver = extract_version(banner, "MongoDB");
-        return Some(("MongoDB".into(), "MongoDB wire".into(), ProtocolFamily::Tcp, ver));
+        return Some((
+            "MongoDB".into(),
+            "MongoDB wire".into(),
+            ProtocolFamily::Tcp,
+            ver,
+        ));
     }
     // Elasticsearch
     if lower.contains("elasticsearch") || lower.contains("cluster_name") {
         let ver = extract_version(banner, "Elasticsearch");
-        return Some(("Elasticsearch".into(), "REST/HTTP".into(), ProtocolFamily::Tcp, ver));
+        return Some((
+            "Elasticsearch".into(),
+            "REST/HTTP".into(),
+            ProtocolFamily::Tcp,
+            ver,
+        ));
     }
     // Memcached
     if lower.contains("version") && lower.contains("memcached") {
         let ver = extract_version(banner, "Memcached");
-        return Some(("Memcached".into(), "Memcached".into(), ProtocolFamily::Tcp, ver));
+        return Some((
+            "Memcached".into(),
+            "Memcached".into(),
+            ProtocolFamily::Tcp,
+            ver,
+        ));
     }
     // RDP
     if banner.starts_with("\x03\x00") || banner.starts_with("\x00\x00") {
         // RDP X.224 connection response
-        return Some(("RDP".into(), "RDP".into(), ProtocolFamily::Tcp, String::new()));
+        return Some((
+            "RDP".into(),
+            "RDP".into(),
+            ProtocolFamily::Tcp,
+            String::new(),
+        ));
     }
     None
 }
@@ -257,12 +294,20 @@ fn guess_by_port(port: u16) -> (String, String, ProtocolFamily) {
         1521 => ("Oracle".into(), "Oracle TNS".into(), ProtocolFamily::Tcp),
         3306 => ("MySQL".into(), "MySQL".into(), ProtocolFamily::Tcp),
         3389 => ("RDP".into(), "RDP".into(), ProtocolFamily::Tcp),
-        5432 => ("PostgreSQL".into(), "PostgreSQL".into(), ProtocolFamily::Tcp),
+        5432 => (
+            "PostgreSQL".into(),
+            "PostgreSQL".into(),
+            ProtocolFamily::Tcp,
+        ),
         5900 => ("VNC".into(), "VNC/RFB".into(), ProtocolFamily::Tcp),
         6379 => ("Redis".into(), "Redis".into(), ProtocolFamily::Tcp),
         8080 => ("HTTP".into(), "HTTP/1.x".into(), ProtocolFamily::Tcp),
         8443 => ("HTTPS".into(), "HTTPS".into(), ProtocolFamily::Tcp),
-        9200 => ("Elasticsearch".into(), "REST/HTTP".into(), ProtocolFamily::Tcp),
+        9200 => (
+            "Elasticsearch".into(),
+            "REST/HTTP".into(),
+            ProtocolFamily::Tcp,
+        ),
         11211 => ("Memcached".into(), "Memcached".into(), ProtocolFamily::Tcp),
         27017 => ("MongoDB".into(), "MongoDB wire".into(), ProtocolFamily::Tcp),
         _ => ("unknown".into(), "unknown".into(), ProtocolFamily::Tcp),
@@ -276,7 +321,7 @@ fn extract_version(text: &str, service: &str) -> String {
             // SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1
             if let Some(idx) = text.find("SSH-") {
                 let rest = &text[idx..];
-                if let Some(end) = rest.find(|c: char| c == '\r' || c == '\n') {
+                if let Some(end) = rest.find(['\r', '\n']) {
                     return rest[..end].trim().to_string();
                 }
                 return rest.trim().to_string();
@@ -287,7 +332,7 @@ fn extract_version(text: &str, service: &str) -> String {
             // 220 ProFTPD 1.3.6 Server ready.
             if let Some(idx) = text.find("220") {
                 let rest = text[idx..].trim();
-                if let Some(end) = rest.find(|c: char| c == '\r' || c == '\n') {
+                if let Some(end) = rest.find(['\r', '\n']) {
                     return rest[..end].trim().to_string();
                 }
                 return rest.trim().to_string();
@@ -298,7 +343,7 @@ fn extract_version(text: &str, service: &str) -> String {
             // 220 mail.example.com ESMTP Postfix
             if let Some(idx) = text.find("220") {
                 let rest = text[idx..].trim();
-                if let Some(end) = rest.find(|c: char| c == '\r' || c == '\n') {
+                if let Some(end) = rest.find(['\r', '\n']) {
                     return rest[..end].trim().to_string();
                 }
                 return rest.trim().to_string();
@@ -313,7 +358,7 @@ fn extract_version(text: &str, service: &str) -> String {
             // Server: nginx/1.24.0  or  Server: Apache/2.4.52
             if let Some(idx) = text.to_lowercase().find("server:") {
                 let rest = &text[idx + 7..];
-                if let Some(end) = rest.find(|c: char| c == '\r' || c == '\n') {
+                if let Some(end) = rest.find(['\r', '\n']) {
                     return rest[..end].trim().to_string();
                 }
             }
@@ -335,7 +380,7 @@ fn extract_version(text: &str, service: &str) -> String {
         "MongoDB" => {
             if let Some(idx) = text.find("MongoDB") {
                 let rest = &text[idx..];
-                if let Some(end) = rest.find(|c: char| c == '\r' || c == '\n') {
+                if let Some(end) = rest.find(['\r', '\n']) {
                     return rest[..end].trim().to_string();
                 }
             }
@@ -345,7 +390,7 @@ fn extract_version(text: &str, service: &str) -> String {
             // VERSION 1.6.22
             if let Some(idx) = text.to_uppercase().find("VERSION") {
                 let rest = &text[idx + 7..];
-                if let Some(end) = rest.find(|c: char| c == '\r' || c == '\n') {
+                if let Some(end) = rest.find(['\r', '\n']) {
                     return format!("Memcached {}", rest[..end].trim());
                 }
             }
@@ -371,7 +416,20 @@ pub fn start_scan(config: ScanConfig, tx: Sender<ScanEvent>) {
     });
 
     let addr = match format!("{}:0", config.target.trim()).to_socket_addrs() {
-        Ok(mut addrs) => addrs.next().unwrap(),
+        // to_socket_addrs 可成功返回空迭代器（某些 DNS 无记录响应），
+        // 必须与解析失败同路径优雅收尾，unwrap 会直接杀掉扫描线程。
+        Ok(mut addrs) => match addrs.next() {
+            Some(a) => a,
+            None => {
+                let _ = tx.send(ScanEvent::Log("DNS 解析失败：未返回任何地址".into()));
+                let _ = tx.send(ScanEvent::Finished {
+                    total: 0,
+                    open: 0,
+                    elapsed_secs: 0,
+                });
+                return;
+            }
+        },
         Err(e) => {
             let _ = tx.send(ScanEvent::Log(format!("DNS 解析失败：{e}")));
             let _ = tx.send(ScanEvent::Finished {
@@ -407,7 +465,6 @@ pub fn start_scan(config: ScanConfig, tx: Sender<ScanEvent>) {
             let tx = Arc::clone(&tx);
             let done = Arc::clone(&done_count);
             let ip = ip.clone();
-            let timeout = timeout;
             let sd = service_detection;
 
             std::thread::spawn(move || {
@@ -425,7 +482,7 @@ pub fn start_scan(config: ScanConfig, tx: Sender<ScanEvent>) {
                     let _ = tx.lock().unwrap().send(ScanEvent::PortResult(result));
 
                     let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if d % 100 == 0 || d == total {
+                    if d.is_multiple_of(100) || d == total {
                         let _ = tx.lock().unwrap().send(ScanEvent::Progress { done: d });
                     }
                 }
@@ -509,7 +566,10 @@ mod tests {
     #[test]
     fn extract_ftp_banner() {
         let banner = "220 ProFTPD 1.3.6 Server ready.\r\n";
-        assert_eq!(extract_version(banner, "FTP"), "220 ProFTPD 1.3.6 Server ready.");
+        assert_eq!(
+            extract_version(banner, "FTP"),
+            "220 ProFTPD 1.3.6 Server ready."
+        );
     }
 
     #[test]
@@ -543,5 +603,62 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.ports(), vec![80, 443, 8080]);
+    }
+
+    #[test]
+    fn extract_version_missing_returns_empty() {
+        assert_eq!(extract_version("garbage without marker", "SSH"), "");
+        assert_eq!(extract_version("no banner here", "FTP"), "");
+        assert_eq!(
+            extract_version("HTTP/1.1 200 OK\r\nX-Other: 1\r\n", "HTTP"),
+            ""
+        );
+    }
+
+    #[test]
+    fn extract_version_ssh_without_newline() {
+        // 无行终止符时取到串尾
+        assert_eq!(
+            extract_version("SSH-2.0-dropbear_2022.83", "SSH"),
+            "SSH-2.0-dropbear_2022.83"
+        );
+    }
+
+    #[test]
+    fn extract_version_vnc_takes_first_line() {
+        assert_eq!(extract_version("RFB 003.008\n", "VNC"), "RFB 003.008");
+        assert_eq!(extract_version("\n\tRFB 003.88\n", "VNC"), "RFB 003.88");
+    }
+
+    #[test]
+    fn extract_version_http_server_header_case_insensitive() {
+        // Server 头大小写不敏感
+        assert_eq!(
+            extract_version("HTTP/1.0 200 OK\r\nserver: lighttpd/1.4.69\r\n", "HTTP"),
+            "lighttpd/1.4.69"
+        );
+        assert_eq!(
+            extract_version("HTTP/1.1 200 OK\r\nSERVER: Apache/2.4.52\r\n", "HTTPS"),
+            "Apache/2.4.52"
+        );
+    }
+
+    #[test]
+    fn extract_version_mysql_number() {
+        assert_eq!(
+            extract_version("mysql 8.0.33-0ubuntu", "MySQL"),
+            "MySQL 8.0.33"
+        );
+        assert_eq!(extract_version("no digits at all", "MySQL"), "");
+    }
+
+    #[test]
+    fn config_reversed_range_is_empty() {
+        let config = ScanConfig {
+            port_start: 83,
+            port_end: 80,
+            ..Default::default()
+        };
+        assert!(config.ports().is_empty(), "start>end 时范围展开应为空");
     }
 }

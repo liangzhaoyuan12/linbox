@@ -15,12 +15,11 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use glib::clone;
-use gtk::prelude::*;
 
 use crate::model::media::*;
 use crate::utils::media::command::{
-    build_commands, to_shell_script, CommandPlan, ConversionSpec, FilterEntry, JobMode, RotateMode,
-    WatermarkPos,
+    CommandPlan, ConversionSpec, FilterEntry, JobMode, RotateMode, WatermarkPos, build_commands,
+    to_shell_script,
 };
 use crate::utils::media::hwaccel::{self, HwCapabilities};
 use crate::utils::media::probe::{self, MediaInfo};
@@ -177,7 +176,12 @@ const V_CODECS: &[&str] = &[
     "AV1 (libaom-av1)",
     "复制（不重编码）",
 ];
-const BITRATE_MODES: &[&str] = &["CRF（恒定质量）", "CBR（恒定码率）", "VBR（动态码率）", "固定码率"];
+const BITRATE_MODES: &[&str] = &[
+    "CRF（恒定质量）",
+    "CBR（恒定码率）",
+    "VBR（动态码率）",
+    "固定码率",
+];
 const RES_PRESETS: &[&str] = &[
     "保持源",
     "4K (3840×2160)",
@@ -191,10 +195,25 @@ const FPS_PRESETS: &[&str] = &["保持源 (same)", "24", "25", "30", "50", "60",
 const SCALE_ALGOS: &[&str] = &["bilinear", "lanczos", "bicubic", "spline"];
 const COLORSPACES: &[&str] = &["bt709", "bt601", "bt2020"];
 const COLOR_RANGES: &[&str] = &["tv（受限）", "pc（全范围）"];
-const A_CODECS: &[&str] = &["AAC", "MP3", "Opus", "Vorbis", "FLAC", "PCM (WAV)", "复制（不重编码）"];
+const A_CODECS: &[&str] = &[
+    "AAC",
+    "MP3",
+    "Opus",
+    "Vorbis",
+    "FLAC",
+    "PCM (WAV)",
+    "复制（不重编码）",
+];
 const CHANNELS: &[&str] = &["保持源", "单声道", "立体声", "5.1 环绕"];
 const SAMPLE_RATES: &[&str] = &["保持源", "44.1 kHz", "48 kHz", "96 kHz"];
-const ROTATES: &[&str] = &["无", "顺时针 90°", "180°", "逆时针 90°", "水平翻转", "垂直翻转"];
+const ROTATES: &[&str] = &[
+    "无",
+    "顺时针 90°",
+    "180°",
+    "逆时针 90°",
+    "水平翻转",
+    "垂直翻转",
+];
 const WM_POSITIONS: &[&str] = &["左上", "右上", "左下", "右下", "居中"];
 /// 硬件加速下拉的「完整」选项列表（覆盖 ffmpeg 全部硬件加速后端）。
 /// 顺序即下拉展示顺序，索引与 `HwAccelPreference` 一一对应。
@@ -238,12 +257,12 @@ fn card(title: &str) -> (adw::PreferencesGroup, adw::PreferencesGroup) {
 /// 组合行下拉。
 fn combo_row(title: &str, labels: &[&str], init: u32) -> adw::ComboRow {
     let model = gtk::StringList::new(labels);
-    let row = adw::ComboRow::builder()
+
+    adw::ComboRow::builder()
         .model(&model)
         .selected(init)
         .title(title)
-        .build();
-    row
+        .build()
 }
 
 /// 数值行（adw::SpinRow）。
@@ -269,9 +288,8 @@ fn switch_row(title: &str, subtitle: &str) -> adw::SwitchRow {
 }
 
 /// 文本输入行。
-fn entry_row(title: &str, placeholder: &str) -> adw::EntryRow {
-    let row = adw::EntryRow::builder().title(title).build();
-    row
+fn entry_row(title: &str, _placeholder: &str) -> adw::EntryRow {
+    adw::EntryRow::builder().title(title).build()
 }
 
 /// 把任意控件的属性变化绑定到 `update_preview`（图形 + 自定义参数实时联动）。
@@ -305,7 +323,9 @@ pub fn build() -> MediaConverterPage {
     title.set_halign(gtk::Align::Start);
     root_box.append(&title);
 
-    let subtitle = gtk::Label::new(Some("基于 ffmpeg：拖入媒体文件，配置参数，预览并生成命令后转换。"));
+    let subtitle = gtk::Label::new(Some(
+        "基于 ffmpeg：拖入媒体文件，配置参数，预览并生成命令后转换。",
+    ));
     subtitle.add_css_class("dim-label");
     subtitle.set_halign(gtk::Align::Start);
     subtitle.set_wrap(true);
@@ -516,7 +536,11 @@ pub fn build() -> MediaConverterPage {
     adv_expander.set_transition_duration(200);
     let adv_toggle = gtk::CheckButton::new();
     adv_toggle.set_label(Some("展开高级选项"));
-    adv_toggle.connect_toggled(clone!(#[weak] adv_expander , move |b| adv_expander.set_reveal_child(b.is_active())));
+    adv_toggle.connect_toggled(clone!(
+        #[weak]
+        adv_expander,
+        move |b| adv_expander.set_reveal_child(b.is_active())
+    ));
     let toggle_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     toggle_box.append(&adv_toggle);
     adv_content.add(&toggle_box);
@@ -859,9 +883,15 @@ pub fn build() -> MediaConverterPage {
     out_name_row.connect_notify(Some("text"), move |row, _| {
         with_inner(|i| i.on_name_text_changed(row.text().as_str()));
     });
-    custom_global.buffer().connect_changed(|_| g_update_preview());
-    custom_input.buffer().connect_changed(|_| g_update_preview());
-    custom_output.buffer().connect_changed(|_| g_update_preview());
+    custom_global
+        .buffer()
+        .connect_changed(|_| g_update_preview());
+    custom_input
+        .buffer()
+        .connect_changed(|_| g_update_preview());
+    custom_output
+        .buffer()
+        .connect_changed(|_| g_update_preview());
 
     // 分类/模式联动改变卡片可见性
     mode_row.connect_selected_notify(|row| g_on_mode_change(row.selected()));
@@ -893,7 +923,7 @@ pub fn build() -> MediaConverterPage {
         let prefs = load_prefs();
         apply_prefs(&inner, &prefs);
         // 分类可能改变格式下拉内容，重建后再恢复格式选择
-        refresh_format_options(&*inner);
+        refresh_format_options(&inner);
         if let Some(n) = prefs.get("format").and_then(|x| x.as_u64()) {
             inner.format_row.set_selected(n as u32);
         }
@@ -915,18 +945,25 @@ pub fn build() -> MediaConverterPage {
     // 注册全局强引用，供 signal 回调（要求 Send）经 thread_local 句柄访问本页面。
     INNER.with(|i| *i.borrow_mut() = Some(Rc::clone(&inner)));
 
-    MediaConverterPage { root: toast_overlay }
+    MediaConverterPage {
+        root: toast_overlay,
+    }
 }
 
 /// 视频格式标签（与 `OutputCategory::Video.formats()` 顺序一致）。
 fn video_format_labels() -> Vec<&'static str> {
-    OutputCategory::Video.formats().iter().map(|f| f.label()).collect()
-}
-fn audio_format_labels() -> Vec<&'static str> {
-    OutputCategory::Audio.formats().iter().map(|f| f.label()).collect()
+    OutputCategory::Video
+        .formats()
+        .iter()
+        .map(|f| f.label())
+        .collect()
 }
 fn image_format_labels() -> Vec<&'static str> {
-    OutputCategory::Image.formats().iter().map(|f| f.label()).collect()
+    OutputCategory::Image
+        .formats()
+        .iter()
+        .map(|f| f.label())
+        .collect()
 }
 /// 根据分类生成对应封装格式标签。
 fn format_labels_for(cat: OutputCategory) -> Vec<&'static str> {
@@ -970,7 +1007,7 @@ thread_local! {
     /// 当前页面的强引用，供 signal 回调（drop / 点击等）经此访问页面实例。
     /// 用 `Option<Rc<Inner>>` 而非 `Weak`：否则 `build()` 返回后 `inner` 被销毁，
     /// `Weak` 升级永远失败，导致所有交互回调静默失效（文件选择、下拉联动等都不工作）。
-    static INNER: std::cell::RefCell<Option<Rc<Inner>>> = std::cell::RefCell::new(None);
+    static INNER: std::cell::RefCell<Option<Rc<Inner>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// 应用退出前调用：清空全局句柄，避免窗口销毁期的 GTK 回调访问正在析构的 TLS。
@@ -989,7 +1026,7 @@ fn with_inner<F: FnOnce(&Inner)>(f: F) {
     let Some(inner) = INNER.with(|i| i.try_borrow().ok().and_then(|b| b.clone())) else {
         return;
     };
-    f(&*inner);
+    f(&inner);
 }
 
 /// 把 gio::File 列表（ListModel）解析为路径字符串列表。
@@ -1102,7 +1139,11 @@ fn pick_files(inner: Rc<Inner>, folders: bool) {
         gtk::FileChooserAction::Open
     };
     let dialog = gtk::FileChooserDialog::builder()
-        .title(if folders { "选择文件夹" } else { "选择文件" })
+        .title(if folders {
+            "选择文件夹"
+        } else {
+            "选择文件"
+        })
         .action(action)
         .modal(true)
         .build();
@@ -1110,7 +1151,10 @@ fn pick_files(inner: Rc<Inner>, folders: bool) {
         dialog.set_transient_for(Some(w));
     }
     dialog.add_button("取消", gtk::ResponseType::Cancel);
-    dialog.add_button(if folders { "选择" } else { "打开" }, gtk::ResponseType::Accept);
+    dialog.add_button(
+        if folders { "选择" } else { "打开" },
+        gtk::ResponseType::Accept,
+    );
     dialog.set_select_multiple(true);
     let inner = Rc::clone(&inner);
     dialog.connect_response(move |d, resp| {
@@ -1142,13 +1186,12 @@ fn pick_output_dir(inner: Rc<Inner>) {
     dialog.add_button("选择", gtk::ResponseType::Accept);
     let inner = Rc::clone(&inner);
     dialog.connect_response(move |d, resp| {
-        if resp == gtk::ResponseType::Accept {
-            if let Some(file) = d.file() {
-                if let Some(p) = file.path() {
-                    inner.out_dir_row.set_text(&p.to_string_lossy());
-                    inner.update_preview();
-                }
-            }
+        if resp == gtk::ResponseType::Accept
+            && let Some(file) = d.file()
+            && let Some(p) = file.path()
+        {
+            inner.out_dir_row.set_text(&p.to_string_lossy());
+            inner.update_preview();
         }
         d.destroy();
     });
@@ -1167,13 +1210,13 @@ fn spawn_hw_detect(announce: bool) {
         // 用 Cell 包裹，避免把非 Copy 的缓存值在 FnMut 闭包里 move 出去
         let slot = std::cell::Cell::new(Some(cache));
         glib::source::idle_add(move || {
-            if let Some(c) = slot.take() {
-                if let Some(inner) = INNER.with(|i| i.borrow().clone()) {
-                    let summary = c.caps.summary();
-                    inner.apply_hw_cache(&c);
-                    if announce {
-                        inner.toast(&format!("已重新检测：{summary}"));
-                    }
+            if let Some(c) = slot.take()
+                && let Some(inner) = INNER.with(|i| i.borrow().clone())
+            {
+                let summary = c.caps.summary();
+                inner.apply_hw_cache(&c);
+                if announce {
+                    inner.toast(&format!("已重新检测：{summary}"));
                 }
             }
             glib::ControlFlow::Break
@@ -1340,16 +1383,16 @@ fn snapshot(inner: &Inner) -> serde_json::Value {
     use serde_json::{Map, Value};
     let mut m: Map<String, Value> = Map::new();
     // 用闭包逐个插入，避免 `json!` 宏在字段过多时触发递归上限
-    let mut ins_u = |m: &mut Map<String, Value>, k: &str, v: u32| {
+    let ins_u = |m: &mut Map<String, Value>, k: &str, v: u32| {
         m.insert(k.to_string(), Value::from(v));
     };
-    let mut ins_f = |m: &mut Map<String, Value>, k: &str, v: f64| {
+    let ins_f = |m: &mut Map<String, Value>, k: &str, v: f64| {
         m.insert(k.to_string(), Value::from(v));
     };
-    let mut ins_b = |m: &mut Map<String, Value>, k: &str, v: bool| {
+    let ins_b = |m: &mut Map<String, Value>, k: &str, v: bool| {
         m.insert(k.to_string(), Value::from(v));
     };
-    let mut ins_s = |m: &mut Map<String, Value>, k: &str, v: &str| {
+    let ins_s = |m: &mut Map<String, Value>, k: &str, v: &str| {
         m.insert(k.to_string(), Value::from(v));
     };
 
@@ -1369,7 +1412,11 @@ fn snapshot(inner: &Inner) -> serde_json::Value {
     ins_f(&mut m, "v_h", inner.v_h.adjustment().value());
     ins_b(&mut m, "v_keep_aspect", inner.v_keep_aspect.is_active());
     ins_u(&mut m, "v_fps", inner.v_fps.selected());
-    ins_f(&mut m, "v_fps_custom", inner.v_fps_custom.adjustment().value());
+    ins_f(
+        &mut m,
+        "v_fps_custom",
+        inner.v_fps_custom.adjustment().value(),
+    );
     ins_u(&mut m, "v_scale_algo", inner.v_scale_algo.selected());
     ins_u(&mut m, "v_colorspace", inner.v_colorspace.selected());
     ins_u(&mut m, "v_color_range", inner.v_color_range.selected());
@@ -1382,11 +1429,19 @@ fn snapshot(inner: &Inner) -> serde_json::Value {
     ins_f(&mut m, "a_fade_in", inner.a_fade_in.adjustment().value());
     ins_f(&mut m, "a_fade_out", inner.a_fade_out.adjustment().value());
     ins_f(&mut m, "i_quality", inner.i_quality.adjustment().value());
-    ins_f(&mut m, "i_compression", inner.i_compression.adjustment().value());
+    ins_f(
+        &mut m,
+        "i_compression",
+        inner.i_compression.adjustment().value(),
+    );
     ins_b(&mut m, "i_strip", inner.i_strip.is_active());
     ins_f(&mut m, "i_longest", inner.i_longest.adjustment().value());
     ins_f(&mut m, "i_percent", inner.i_percent.adjustment().value());
-    ins_f(&mut m, "i_extract_fps", inner.i_extract_fps.adjustment().value());
+    ins_f(
+        &mut m,
+        "i_extract_fps",
+        inner.i_extract_fps.adjustment().value(),
+    );
     ins_f(&mut m, "i_gif_fps", inner.i_gif_fps.adjustment().value());
     ins_f(&mut m, "i_gif_w", inner.i_gif_w.adjustment().value());
     ins_b(&mut m, "clip_enabled", inner.clip_enabled.is_active());
@@ -1409,7 +1464,11 @@ fn snapshot(inner: &Inner) -> serde_json::Value {
     ins_s(&mut m, "adv_wm_path", &inner.adv_wm_path.text());
     ins_u(&mut m, "adv_wm_pos", inner.adv_wm_pos.selected());
     ins_f(&mut m, "adv_wm_op", inner.adv_wm_op.adjustment().value());
-    ins_b(&mut m, "adv_audio_denoise", inner.adv_audio_denoise.is_active());
+    ins_b(
+        &mut m,
+        "adv_audio_denoise",
+        inner.adv_audio_denoise.is_active(),
+    );
     ins_s(&mut m, "adv_preset", &inner.adv_preset.text());
     ins_s(&mut m, "adv_tune", &inner.adv_tune.text());
     ins_s(&mut m, "adv_profile", &inner.adv_profile.text());
@@ -1417,12 +1476,28 @@ fn snapshot(inner: &Inner) -> serde_json::Value {
     ins_s(&mut m, "adv_pix_fmt", &inner.adv_pix_fmt.text());
     ins_b(&mut m, "adv_faststart", inner.adv_faststart.is_active());
     ins_b(&mut m, "adv_two_pass", inner.adv_two_pass.is_active());
-    ins_f(&mut m, "adv_threads", inner.adv_threads.adjustment().value());
+    ins_f(
+        &mut m,
+        "adv_threads",
+        inner.adv_threads.adjustment().value(),
+    );
     ins_b(&mut m, "adv_tonemap", inner.adv_tonemap.is_active());
     ins_u(&mut m, "hw", inner.hw_row.selected());
-    ins_s(&mut m, "custom_global", &buffer_text(&inner.custom_global.buffer()));
-    ins_s(&mut m, "custom_input", &buffer_text(&inner.custom_input.buffer()));
-    ins_s(&mut m, "custom_output", &buffer_text(&inner.custom_output.buffer()));
+    ins_s(
+        &mut m,
+        "custom_global",
+        &buffer_text(&inner.custom_global.buffer()),
+    );
+    ins_s(
+        &mut m,
+        "custom_input",
+        &buffer_text(&inner.custom_input.buffer()),
+    );
+    ins_s(
+        &mut m,
+        "custom_output",
+        &buffer_text(&inner.custom_output.buffer()),
+    );
 
     Value::Object(m)
 }
@@ -1436,75 +1511,207 @@ fn apply_prefs(inner: &Inner, v: &serde_json::Value) {
 
     // 先恢复分类再恢复模式：图片/GIF 类模式会接管分类下拉，
     // 先设分类可让「退出模式后恢复的分类」捕获到用户真实的偏好值。
-    if let Some(n) = get_u("category") { inner.category_row.set_selected(n); }
-    if let Some(n) = get_u("mode") { inner.mode_row.set_selected(n); }
-    if let Some(s) = get_s("out_dir") { inner.out_dir_row.set_text(&s); }
+    if let Some(n) = get_u("category") {
+        inner.category_row.set_selected(n);
+    }
+    if let Some(n) = get_u("mode") {
+        inner.mode_row.set_selected(n);
+    }
+    if let Some(s) = get_s("out_dir") {
+        inner.out_dir_row.set_text(&s);
+    }
     // out_name 偏好键已废弃（见 persist 注释）：不再恢复全局默认名，
     // 保持为空让每项按自身文件名自动命名；旧 prefs 里残留的
     // 「首个文件 - output」也不会再被当作统一默认名。
-    if let Some(n) = get_u("v_codec") { inner.v_codec.set_selected(n); }
-    if let Some(n) = get_u("v_bitrate_mode") { inner.v_bitrate_mode.set_selected(n); }
-    if let Some(f) = get_f("v_crf") { inner.v_crf.adjustment().set_value(f); }
-    if let Some(f) = get_f("v_bitrate") { inner.v_bitrate.adjustment().set_value(f); }
-    if let Some(n) = get_u("v_res") { inner.v_res.set_selected(n); }
-    if let Some(f) = get_f("v_w") { inner.v_w.adjustment().set_value(f); }
-    if let Some(f) = get_f("v_h") { inner.v_h.adjustment().set_value(f); }
-    if let Some(b) = get_b("v_keep_aspect") { inner.v_keep_aspect.set_active(b); }
-    if let Some(n) = get_u("v_fps") { inner.v_fps.set_selected(n); }
-    if let Some(f) = get_f("v_fps_custom") { inner.v_fps_custom.adjustment().set_value(f); }
-    if let Some(n) = get_u("v_scale_algo") { inner.v_scale_algo.set_selected(n); }
-    if let Some(n) = get_u("v_colorspace") { inner.v_colorspace.set_selected(n); }
-    if let Some(n) = get_u("v_color_range") { inner.v_color_range.set_selected(n); }
-    if let Some(b) = get_b("v_hdr") { inner.v_hdr.set_active(b); }
-    if let Some(n) = get_u("a_codec") { inner.a_codec.set_selected(n); }
-    if let Some(n) = get_u("a_channels") { inner.a_channels.set_selected(n); }
-    if let Some(n) = get_u("a_sr") { inner.a_sr.set_selected(n); }
-    if let Some(f) = get_f("a_bitrate") { inner.a_bitrate.adjustment().set_value(f); }
-    if let Some(f) = get_f("a_gain") { inner.a_gain.adjustment().set_value(f); }
-    if let Some(f) = get_f("a_fade_in") { inner.a_fade_in.adjustment().set_value(f); }
-    if let Some(f) = get_f("a_fade_out") { inner.a_fade_out.adjustment().set_value(f); }
-    if let Some(f) = get_f("i_quality") { inner.i_quality.adjustment().set_value(f); }
-    if let Some(f) = get_f("i_compression") { inner.i_compression.adjustment().set_value(f); }
-    if let Some(b) = get_b("i_strip") { inner.i_strip.set_active(b); }
-    if let Some(f) = get_f("i_longest") { inner.i_longest.adjustment().set_value(f); }
-    if let Some(f) = get_f("i_percent") { inner.i_percent.adjustment().set_value(f); }
-    if let Some(f) = get_f("i_extract_fps") { inner.i_extract_fps.adjustment().set_value(f); }
-    if let Some(f) = get_f("i_gif_fps") { inner.i_gif_fps.adjustment().set_value(f); }
-    if let Some(f) = get_f("i_gif_w") { inner.i_gif_w.adjustment().set_value(f); }
-    if let Some(b) = get_b("clip_enabled") { inner.clip_enabled.set_active(b); }
-    if let Some(s) = get_s("clip_start") { inner.clip_start.set_text(&s); }
-    if let Some(s) = get_s("clip_end") { inner.clip_end.set_text(&s); }
-    if let Some(b) = get_b("adv_crop_en") { inner.adv_crop_en.set_active(b); }
-    if let Some(f) = get_f("adv_crop_w") { inner.adv_crop_w.adjustment().set_value(f); }
-    if let Some(f) = get_f("adv_crop_h") { inner.adv_crop_h.adjustment().set_value(f); }
-    if let Some(f) = get_f("adv_crop_x") { inner.adv_crop_x.adjustment().set_value(f); }
-    if let Some(f) = get_f("adv_crop_y") { inner.adv_crop_y.adjustment().set_value(f); }
-    if let Some(b) = get_b("adv_pad_en") { inner.adv_pad_en.set_active(b); }
-    if let Some(f) = get_f("adv_pad_w") { inner.adv_pad_w.adjustment().set_value(f); }
-    if let Some(f) = get_f("adv_pad_h") { inner.adv_pad_h.adjustment().set_value(f); }
-    if let Some(s) = get_s("adv_pad_color") { inner.adv_pad_color.set_text(&s); }
-    if let Some(n) = get_u("adv_rotate") { inner.adv_rotate.set_selected(n); }
-    if let Some(b) = get_b("adv_deinterlace") { inner.adv_deinterlace.set_active(b); }
-    if let Some(b) = get_b("adv_denoise") { inner.adv_denoise.set_active(b); }
-    if let Some(b) = get_b("adv_sharpen") { inner.adv_sharpen.set_active(b); }
-    if let Some(b) = get_b("adv_wm_en") { inner.adv_wm_en.set_active(b); }
-    if let Some(s) = get_s("adv_wm_path") { inner.adv_wm_path.set_text(&s); }
-    if let Some(n) = get_u("adv_wm_pos") { inner.adv_wm_pos.set_selected(n); }
-    if let Some(f) = get_f("adv_wm_op") { inner.adv_wm_op.adjustment().set_value(f); }
-    if let Some(b) = get_b("adv_audio_denoise") { inner.adv_audio_denoise.set_active(b); }
-    if let Some(s) = get_s("adv_preset") { inner.adv_preset.set_text(&s); }
-    if let Some(s) = get_s("adv_tune") { inner.adv_tune.set_text(&s); }
-    if let Some(s) = get_s("adv_profile") { inner.adv_profile.set_text(&s); }
-    if let Some(s) = get_s("adv_level") { inner.adv_level.set_text(&s); }
-    if let Some(s) = get_s("adv_pix_fmt") { inner.adv_pix_fmt.set_text(&s); }
-    if let Some(b) = get_b("adv_faststart") { inner.adv_faststart.set_active(b); }
-    if let Some(b) = get_b("adv_two_pass") { inner.adv_two_pass.set_active(b); }
-    if let Some(f) = get_f("adv_threads") { inner.adv_threads.adjustment().set_value(f); }
-    if let Some(b) = get_b("adv_tonemap") { inner.adv_tonemap.set_active(b); }
-    if let Some(n) = get_u("hw") { inner.hw_row.set_selected(n); }
-    if let Some(s) = get_s("custom_global") { inner.custom_global.buffer().set_text(&s); }
-    if let Some(s) = get_s("custom_input") { inner.custom_input.buffer().set_text(&s); }
-    if let Some(s) = get_s("custom_output") { inner.custom_output.buffer().set_text(&s); }
+    if let Some(n) = get_u("v_codec") {
+        inner.v_codec.set_selected(n);
+    }
+    if let Some(n) = get_u("v_bitrate_mode") {
+        inner.v_bitrate_mode.set_selected(n);
+    }
+    if let Some(f) = get_f("v_crf") {
+        inner.v_crf.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("v_bitrate") {
+        inner.v_bitrate.adjustment().set_value(f);
+    }
+    if let Some(n) = get_u("v_res") {
+        inner.v_res.set_selected(n);
+    }
+    if let Some(f) = get_f("v_w") {
+        inner.v_w.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("v_h") {
+        inner.v_h.adjustment().set_value(f);
+    }
+    if let Some(b) = get_b("v_keep_aspect") {
+        inner.v_keep_aspect.set_active(b);
+    }
+    if let Some(n) = get_u("v_fps") {
+        inner.v_fps.set_selected(n);
+    }
+    if let Some(f) = get_f("v_fps_custom") {
+        inner.v_fps_custom.adjustment().set_value(f);
+    }
+    if let Some(n) = get_u("v_scale_algo") {
+        inner.v_scale_algo.set_selected(n);
+    }
+    if let Some(n) = get_u("v_colorspace") {
+        inner.v_colorspace.set_selected(n);
+    }
+    if let Some(n) = get_u("v_color_range") {
+        inner.v_color_range.set_selected(n);
+    }
+    if let Some(b) = get_b("v_hdr") {
+        inner.v_hdr.set_active(b);
+    }
+    if let Some(n) = get_u("a_codec") {
+        inner.a_codec.set_selected(n);
+    }
+    if let Some(n) = get_u("a_channels") {
+        inner.a_channels.set_selected(n);
+    }
+    if let Some(n) = get_u("a_sr") {
+        inner.a_sr.set_selected(n);
+    }
+    if let Some(f) = get_f("a_bitrate") {
+        inner.a_bitrate.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("a_gain") {
+        inner.a_gain.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("a_fade_in") {
+        inner.a_fade_in.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("a_fade_out") {
+        inner.a_fade_out.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("i_quality") {
+        inner.i_quality.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("i_compression") {
+        inner.i_compression.adjustment().set_value(f);
+    }
+    if let Some(b) = get_b("i_strip") {
+        inner.i_strip.set_active(b);
+    }
+    if let Some(f) = get_f("i_longest") {
+        inner.i_longest.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("i_percent") {
+        inner.i_percent.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("i_extract_fps") {
+        inner.i_extract_fps.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("i_gif_fps") {
+        inner.i_gif_fps.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("i_gif_w") {
+        inner.i_gif_w.adjustment().set_value(f);
+    }
+    if let Some(b) = get_b("clip_enabled") {
+        inner.clip_enabled.set_active(b);
+    }
+    if let Some(s) = get_s("clip_start") {
+        inner.clip_start.set_text(&s);
+    }
+    if let Some(s) = get_s("clip_end") {
+        inner.clip_end.set_text(&s);
+    }
+    if let Some(b) = get_b("adv_crop_en") {
+        inner.adv_crop_en.set_active(b);
+    }
+    if let Some(f) = get_f("adv_crop_w") {
+        inner.adv_crop_w.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("adv_crop_h") {
+        inner.adv_crop_h.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("adv_crop_x") {
+        inner.adv_crop_x.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("adv_crop_y") {
+        inner.adv_crop_y.adjustment().set_value(f);
+    }
+    if let Some(b) = get_b("adv_pad_en") {
+        inner.adv_pad_en.set_active(b);
+    }
+    if let Some(f) = get_f("adv_pad_w") {
+        inner.adv_pad_w.adjustment().set_value(f);
+    }
+    if let Some(f) = get_f("adv_pad_h") {
+        inner.adv_pad_h.adjustment().set_value(f);
+    }
+    if let Some(s) = get_s("adv_pad_color") {
+        inner.adv_pad_color.set_text(&s);
+    }
+    if let Some(n) = get_u("adv_rotate") {
+        inner.adv_rotate.set_selected(n);
+    }
+    if let Some(b) = get_b("adv_deinterlace") {
+        inner.adv_deinterlace.set_active(b);
+    }
+    if let Some(b) = get_b("adv_denoise") {
+        inner.adv_denoise.set_active(b);
+    }
+    if let Some(b) = get_b("adv_sharpen") {
+        inner.adv_sharpen.set_active(b);
+    }
+    if let Some(b) = get_b("adv_wm_en") {
+        inner.adv_wm_en.set_active(b);
+    }
+    if let Some(s) = get_s("adv_wm_path") {
+        inner.adv_wm_path.set_text(&s);
+    }
+    if let Some(n) = get_u("adv_wm_pos") {
+        inner.adv_wm_pos.set_selected(n);
+    }
+    if let Some(f) = get_f("adv_wm_op") {
+        inner.adv_wm_op.adjustment().set_value(f);
+    }
+    if let Some(b) = get_b("adv_audio_denoise") {
+        inner.adv_audio_denoise.set_active(b);
+    }
+    if let Some(s) = get_s("adv_preset") {
+        inner.adv_preset.set_text(&s);
+    }
+    if let Some(s) = get_s("adv_tune") {
+        inner.adv_tune.set_text(&s);
+    }
+    if let Some(s) = get_s("adv_profile") {
+        inner.adv_profile.set_text(&s);
+    }
+    if let Some(s) = get_s("adv_level") {
+        inner.adv_level.set_text(&s);
+    }
+    if let Some(s) = get_s("adv_pix_fmt") {
+        inner.adv_pix_fmt.set_text(&s);
+    }
+    if let Some(b) = get_b("adv_faststart") {
+        inner.adv_faststart.set_active(b);
+    }
+    if let Some(b) = get_b("adv_two_pass") {
+        inner.adv_two_pass.set_active(b);
+    }
+    if let Some(f) = get_f("adv_threads") {
+        inner.adv_threads.adjustment().set_value(f);
+    }
+    if let Some(b) = get_b("adv_tonemap") {
+        inner.adv_tonemap.set_active(b);
+    }
+    if let Some(n) = get_u("hw") {
+        inner.hw_row.set_selected(n);
+    }
+    if let Some(s) = get_s("custom_global") {
+        inner.custom_global.buffer().set_text(&s);
+    }
+    if let Some(s) = get_s("custom_input") {
+        inner.custom_input.buffer().set_text(&s);
+    }
+    if let Some(s) = get_s("custom_output") {
+        inner.custom_output.buffer().set_text(&s);
+    }
 }
 
 /// 把当前偏好写入磁盘。
@@ -1570,13 +1777,17 @@ impl Inner {
 
     fn update_visibility(&self) {
         let mode = mode_from_index(self.mode_row.selected());
-        let is_image_mode = matches!(mode, JobMode::ImageExtract | JobMode::ImageToVideo | JobMode::VideoToGif);
+        let is_image_mode = matches!(
+            mode,
+            JobMode::ImageExtract | JobMode::ImageToVideo | JobMode::VideoToGif
+        );
 
         // 模式与分类联动：图片序列/GIF 类模式的输出大类由模式决定，
         // 分类下拉被锁定并跟随；退出时恢复用户原先手动选择的分类。
         if is_image_mode {
             if self.last_manual_category.get().is_none() {
-                self.last_manual_category.set(Some(self.category_row.selected()));
+                self.last_manual_category
+                    .set(Some(self.category_row.selected()));
             }
             self.category_row.set_sensitive(false);
             let want_cat = match mode {
@@ -1589,7 +1800,10 @@ impl Inner {
             if mode == JobMode::VideoToGif {
                 // GIF 是唯一合理的输出，锁定格式下拉
                 self.format_row.set_sensitive(false);
-                let gif_idx = image_format_labels().iter().position(|l| *l == "GIF").unwrap_or(5) as u32;
+                let gif_idx = image_format_labels()
+                    .iter()
+                    .position(|l| *l == "GIF")
+                    .unwrap_or(5) as u32;
                 if self.format_row.selected() != gif_idx {
                     self.format_row.set_selected(gif_idx);
                 }
@@ -1599,18 +1813,20 @@ impl Inner {
         } else {
             self.category_row.set_sensitive(true);
             self.format_row.set_sensitive(true);
-            if let Some(saved) = self.last_manual_category.take() {
-                if self.category_row.selected() != saved {
-                    self.category_row.set_selected(saved);
-                }
+            if let Some(saved) = self.last_manual_category.take()
+                && self.category_row.selected() != saved
+            {
+                self.category_row.set_selected(saved);
             }
         }
 
         let cat = self.effective_category();
 
         self.video_card.set_visible(cat == OutputCategory::Video);
-        self.audio_card.set_visible(cat == OutputCategory::Audio || cat == OutputCategory::Video);
-        self.image_card.set_visible(cat == OutputCategory::Image || is_image_mode);
+        self.audio_card
+            .set_visible(cat == OutputCategory::Audio || cat == OutputCategory::Video);
+        self.image_card
+            .set_visible(cat == OutputCategory::Image || is_image_mode);
 
         // CRF 仅在 CRF 模式、且编码器非 Copy 时可见
         let crf_mode = bitrate_mode_from_index(self.v_bitrate_mode.selected()) == BitrateMode::Crf;
@@ -1634,15 +1850,15 @@ impl Inner {
             let mut plan = CommandPlan::default();
             for (item, name) in items.iter().zip(names.iter()) {
                 let mut s = spec.clone();
-                s.inputs = vec![crate::utils::media::command::InputSpec { path: item.path.clone() }];
+                s.inputs = vec![crate::utils::media::command::InputSpec {
+                    path: item.path.clone(),
+                }];
                 s.output_filename = name.clone();
                 s.duration_sec = item.info.borrow().as_ref().map(|i| i.duration_sec);
-                match build_commands(&s) {
-                    Ok(p) => {
-                        plan.commands.extend(p.commands);
-                        plan.warnings.extend(p.warnings);
-                    }
-                    Err(e) => return Err(e),
+                {
+                    let p = build_commands(&s)?;
+                    plan.commands.extend(p.commands);
+                    plan.warnings.extend(p.warnings);
                 }
             }
             return Ok(plan);
@@ -1664,7 +1880,9 @@ impl Inner {
             .inputs
             .borrow()
             .iter()
-            .map(|i| crate::utils::media::command::InputSpec { path: i.path.clone() })
+            .map(|i| crate::utils::media::command::InputSpec {
+                path: i.path.clone(),
+            })
             .collect();
 
         let mut video = crate::utils::media::command::VideoSpec {
@@ -1863,7 +2081,11 @@ impl Inner {
         if let Some(row) = self.file_list.selected_row() {
             if let Some(item) = self.inputs.borrow().iter().find(|it| it.row == row) {
                 // 留空 = 跟随全局默认
-                *item.name_override.borrow_mut() = if trimmed.is_empty() { None } else { Some(trimmed) };
+                *item.name_override.borrow_mut() = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
             }
         } else {
             *self.default_name.borrow_mut() = trimmed;
@@ -1914,7 +2136,7 @@ impl Inner {
                 })
             })
             .collect();
-        dedupe_output_names(&bases, &ext, dir)
+        dedupe_output_names(&bases, ext, dir)
     }
 
     /// 刷新列表每行的最终输出名展示。
@@ -1942,7 +2164,8 @@ impl Inner {
             return;
         }
         if mode != JobMode::Single {
-            self.selection_hint.set_text("该作业模式以整个文件列表为单位，输出文件名统一使用下方默认值。");
+            self.selection_hint
+                .set_text("该作业模式以整个文件列表为单位，输出文件名统一使用下方默认值。");
             self.selection_hint.set_visible(true);
             self.override_clear.set_visible(false);
             return;
@@ -1959,7 +2182,9 @@ impl Inner {
                         .unwrap_or_default()
                 })
                 .unwrap_or_default();
-            let overridden = item.and_then(|it| it.name_override.borrow().clone()).is_some();
+            let overridden = item
+                .and_then(|it| it.name_override.borrow().clone())
+                .is_some();
             self.override_clear.set_visible(overridden);
             self.selection_hint.set_text(&format!(
                 "正在为「{}」单独设置输出文件名（留空 = 恢复自动命名；不影响列表其他文件）。",
@@ -2104,12 +2329,22 @@ impl Inner {
             let result = probe::probe_file(&path_for_thread);
             glib::source::idle_add(move || {
                 if let Some(inner) = INNER.with(|i| i.borrow().clone()) {
-                    if let Some(item) = inner.inputs.borrow().iter().find(|it| it.path == path_for_thread) {
+                    if let Some(item) = inner
+                        .inputs
+                        .borrow()
+                        .iter()
+                        .find(|it| it.path == path_for_thread)
+                    {
                         match &result {
                             Ok(info) => {
                                 let mut s = String::new();
                                 if let Some(v) = info.streams.iter().find(|s| s.kind == "video") {
-                                    s.push_str(&format!("视频 {} · {} · {}", v.codec, info.resolution_text(), v.frame_rate));
+                                    s.push_str(&format!(
+                                        "视频 {} · {} · {}",
+                                        v.codec,
+                                        info.resolution_text(),
+                                        v.frame_rate
+                                    ));
                                 }
                                 if let Some(a) = info.streams.iter().find(|s| s.kind == "audio") {
                                     s.push_str(&format!(" · 音频 {} {}ch", a.codec, a.channels));
@@ -2154,10 +2389,10 @@ impl Inner {
             self.file_list.append(r);
         }
         drop(inputs);
-        if let Some(sid) = sel_id {
-            if let Some(row) = self.inputs.borrow().iter().find(|it| it.id == sid) {
-                self.file_list.select_row(Some(&row.row));
-            }
+        if let Some(sid) = sel_id
+            && let Some(row) = self.inputs.borrow().iter().find(|it| it.id == sid)
+        {
+            self.file_list.select_row(Some(&row.row));
         }
         self.update_preview();
     }
@@ -2206,7 +2441,11 @@ impl Inner {
     // ---------- 滤镜链编辑器 ----------
 
     fn add_filter_card(&self, is_video: bool) {
-        let list = if is_video { &self.vf_list } else { &self.af_list };
+        let list = if is_video {
+            &self.vf_list
+        } else {
+            &self.af_list
+        };
         let name_entry = gtk::Entry::new();
         name_entry.set_placeholder_text(Some("滤镜名，如 scale / drawtext"));
         name_entry.set_hexpand(true);
@@ -2318,7 +2557,9 @@ impl Inner {
                                 let _ = std::fs::remove_file(&c.output);
                             }
                         }
-                        inner.status_label.set_text(&format!("完成：共 {} 条命令", total));
+                        inner
+                            .status_label
+                            .set_text(&format!("完成：共 {} 条命令", total));
                         inner.toast("转换完成");
                     } else {
                         inner.status_label.set_text(&format!("失败：{last_err}"));
@@ -2332,7 +2573,9 @@ impl Inner {
 
     fn copy_command(&self) {
         let buf = self.preview_text.buffer();
-        let text = buf.text(&buf.start_iter(), &buf.end_iter(), false).to_string();
+        let text = buf
+            .text(&buf.start_iter(), &buf.end_iter(), false)
+            .to_string();
         if text.trim().is_empty() {
             self.toast("暂无可复制的命令");
             return;
@@ -2372,30 +2615,30 @@ fn collect_filters(list: &gtk::ListBox) -> Vec<FilterEntry> {
     let mut out = Vec::new();
     let mut row: Option<gtk::Widget> = list.first_child();
     while let Some(w) = row {
-        if let Some(child) = w.first_child() {
-            if let Ok(box_) = child.downcast::<gtk::Box>() {
-                let mut entry_child = box_.first_child();
-                let mut name = String::new();
-                let mut params = String::new();
-                let mut count = 0;
-                while let Some(c) = entry_child {
-                    if let Ok(entry) = c.clone().downcast::<gtk::Entry>() {
-                        if count == 0 {
-                            name = entry.text().to_string();
-                        } else if count == 1 {
-                            params = entry.text().to_string();
-                        }
-                        count += 1;
+        if let Some(child) = w.first_child()
+            && let Ok(box_) = child.downcast::<gtk::Box>()
+        {
+            let mut entry_child = box_.first_child();
+            let mut name = String::new();
+            let mut params = String::new();
+            let mut count = 0;
+            while let Some(c) = entry_child {
+                if let Ok(entry) = c.clone().downcast::<gtk::Entry>() {
+                    if count == 0 {
+                        name = entry.text().to_string();
+                    } else if count == 1 {
+                        params = entry.text().to_string();
                     }
-                    entry_child = c.next_sibling();
+                    count += 1;
                 }
-                if !name.trim().is_empty() {
-                    out.push(FilterEntry {
-                        name: name.trim().to_string(),
-                        params: params.trim().to_string(),
-                        enabled: true,
-                    });
-                }
+                entry_child = c.next_sibling();
+            }
+            if !name.trim().is_empty() {
+                out.push(FilterEntry {
+                    name: name.trim().to_string(),
+                    params: params.trim().to_string(),
+                    enabled: true,
+                });
             }
         }
         row = w.next_sibling();
@@ -2404,9 +2647,12 @@ fn collect_filters(list: &gtk::ListBox) -> Vec<FilterEntry> {
 }
 
 /// 执行单条命令，解析 stderr 中的 time= 估算进度，返回 0..=1 的完成度。
-fn run_one(cmd: &crate::utils::media::command::Command, duration: Option<f64>) -> Result<f64, String> {
-    use std::process::{Command as Proc, Stdio};
+fn run_one(
+    cmd: &crate::utils::media::command::Command,
+    duration: Option<f64>,
+) -> Result<f64, String> {
     use std::io::BufRead;
+    use std::process::{Command as Proc, Stdio};
 
     let mut proc = Proc::new(&cmd.program);
     proc.args(&cmd.args);
@@ -2415,10 +2661,13 @@ fn run_one(cmd: &crate::utils::media::command::Command, duration: Option<f64>) -
 
     let mut child = proc.spawn().map_err(|e| format!("无法启动 ffmpeg：{e}"))?;
 
-    let stderr = child.stderr.take().ok_or_else(|| "无法获取 ffmpeg 输出".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法获取 ffmpeg 输出".to_string())?;
     let mut last_time = 0.0f64;
     let reader = std::io::BufReader::new(stderr);
-    for line in reader.lines().flatten() {
+    for line in reader.lines().map_while(Result::ok) {
         if let Some(pos) = line.find("time=") {
             let rest = &line[pos + 5..];
             if let Some(t) = parse_time(rest.trim()) {
@@ -2553,7 +2802,10 @@ mod tests {
     fn auto_stem_uses_own_filename() {
         // 每项默认名 = 自身文件名（去扩展名） - output
         assert_eq!(auto_output_stem("/data/我的视频.mp4"), "我的视频 - output");
-        assert_eq!(auto_output_stem("/data/会议记录 2026.mkv"), "会议记录 2026 - output");
+        assert_eq!(
+            auto_output_stem("/data/会议记录 2026.mkv"),
+            "会议记录 2026 - output"
+        );
     }
 
     #[test]

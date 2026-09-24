@@ -122,3 +122,29 @@ impl PowerAction {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_needs_root_and_args() {
+        assert!(Scope::System.needs_root());
+        assert!(!Scope::User.needs_root());
+        // systemctl 默认即 system 作用域，System 不加参数
+        assert_eq!(Scope::System.args(), &[] as &[&str]);
+        assert_eq!(Scope::User.args(), &["--user"]);
+    }
+
+    #[test]
+    fn power_action_verbs_and_labels() {
+        assert_eq!(PowerAction::Shutdown.systemctl_verb(), "poweroff");
+        assert_eq!(PowerAction::Reboot.systemctl_verb(), "reboot");
+        assert_eq!(PowerAction::Suspend.systemctl_verb(), "suspend");
+        assert_eq!(PowerAction::Hibernate.systemctl_verb(), "hibernate");
+        assert_eq!(PowerAction::Shutdown.label(), "关机");
+        assert_eq!(PowerAction::Reboot.label(), "重启");
+        assert_eq!(PowerAction::Suspend.label(), "挂起");
+        assert_eq!(PowerAction::Hibernate.label(), "休眠");
+    }
+}

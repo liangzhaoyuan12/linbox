@@ -133,7 +133,12 @@ impl HeaderList {
         self.rows
             .borrow()
             .iter()
-            .map(|r| (r.key.text().trim().to_string(), r.value.text().trim().to_string()))
+            .map(|r| {
+                (
+                    r.key.text().trim().to_string(),
+                    r.value.text().trim().to_string(),
+                )
+            })
             .filter(|(key, _)| !key.is_empty())
             .collect()
     }

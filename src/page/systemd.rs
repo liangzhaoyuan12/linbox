@@ -53,17 +53,17 @@ fn with_inner<F: FnOnce(&Inner)>(f: F) {
     let Some(inner) = INNER.with(|i| i.try_borrow().ok().and_then(|b| b.clone())) else {
         return;
     };
-    f(&*inner);
+    f(&inner);
 }
 
 pub fn shutdown() {
     INNER.with(|i| {
-        if let Ok(mut b) = i.try_borrow_mut() {
-            if let Some(inner) = b.take() {
-                // 杀掉可能仍在运行的 journalctl -f 子进程，避免孤儿进程
-                if let Some(mut c) = inner.j_follow_child.take() {
-                    let _ = c.kill();
-                }
+        if let Ok(mut b) = i.try_borrow_mut()
+            && let Some(inner) = b.take()
+        {
+            // 杀掉可能仍在运行的 journalctl -f 子进程，避免孤儿进程
+            if let Some(mut c) = inner.j_follow_child.take() {
+                let _ = c.kill();
             }
         }
     });
@@ -74,8 +74,18 @@ pub fn shutdown() {
 // ---------------------------------------------------------------------------
 
 const TYPE_OPTIONS: &[&str] = &[
-    "全部", "service", "timer", "socket", "mount", "swap", "target", "path", "device",
-    "automount", "scope", "slice",
+    "全部",
+    "service",
+    "timer",
+    "socket",
+    "mount",
+    "swap",
+    "target",
+    "path",
+    "device",
+    "automount",
+    "scope",
+    "slice",
 ];
 
 /// 作用域：系统级 / 当前用户级。索引即 [`Scope`] 的取值顺序。
@@ -473,12 +483,12 @@ impl Inner {
                 for t in timers.iter() {
                     self.t_list.append(&self.build_timer_row(t));
                 }
-                let next_soon = timers
-                    .iter()
-                    .filter(|t| !t.next_in.is_empty())
-                    .count();
-                self.t_status
-                    .set_text(&format!("共 {} 个定时器，其中 {} 个已排定", timers.len(), next_soon));
+                let next_soon = timers.iter().filter(|t| !t.next_in.is_empty()).count();
+                self.t_status.set_text(&format!(
+                    "共 {} 个定时器，其中 {} 个已排定",
+                    timers.len(),
+                    next_soon
+                ));
             }
             Err(e) => {
                 self.t_status.set_text("加载失败");
@@ -1126,11 +1136,11 @@ impl Inner {
         self.j_buffer.insert(&mut end, chunk);
         // 超长后从头丢：长时间跟随后内存不增长
         let over = self.j_buffer.line_count() - MAX_FOLLOW_LINES;
-        if over > 0 {
-            if let Some(mut cut) = self.j_buffer.iter_at_line(over) {
-                let mut start = self.j_buffer.start_iter();
-                self.j_buffer.delete(&mut start, &mut cut);
-            }
+        if over > 0
+            && let Some(mut cut) = self.j_buffer.iter_at_line(over)
+        {
+            let mut start = self.j_buffer.start_iter();
+            self.j_buffer.delete(&mut start, &mut cut);
         }
         self.scroll_journal_to_bottom();
     }
@@ -1683,49 +1693,95 @@ pub fn build() -> SystemdPage {
 
     // ---------- 信号 ----------
     // 过滤变化
-    inner
-        .type_row
-        .connect_selected_notify(clone!(#[weak] inner, move |_| inner.refresh()));
-    inner
-        .scope_row
-        .connect_selected_notify(clone!(#[weak] inner, move |_| inner.on_scope_changed()));
-    inner
-        .state_row
-        .connect_selected_notify(clone!(#[weak] inner, move |_| inner.rebuild_list()));
-    search.connect_search_changed(clone!(#[weak] inner, move |_| inner.rebuild_list()));
-    refresh_btn.connect_clicked(clone!(#[weak] inner, move |_| inner.refresh()));
-    reload_btn.connect_clicked(clone!(#[weak] inner, move |_| inner.do_daemon_reload()));
-    log_load_btn.connect_clicked(clone!(#[weak] inner, move |_| inner.load_logs()));
-    file_load_btn.connect_clicked(clone!(#[weak] inner, move |_| inner.load_unit_file()));
-    t_reload.connect_clicked(clone!(#[weak] inner, move |_| inner.load_timers()));
+    inner.type_row.connect_selected_notify(clone!(
+        #[weak]
+        inner,
+        move |_| inner.refresh()
+    ));
+    inner.scope_row.connect_selected_notify(clone!(
+        #[weak]
+        inner,
+        move |_| inner.on_scope_changed()
+    ));
+    inner.state_row.connect_selected_notify(clone!(
+        #[weak]
+        inner,
+        move |_| inner.rebuild_list()
+    ));
+    search.connect_search_changed(clone!(
+        #[weak]
+        inner,
+        move |_| inner.rebuild_list()
+    ));
+    refresh_btn.connect_clicked(clone!(
+        #[weak]
+        inner,
+        move |_| inner.refresh()
+    ));
+    reload_btn.connect_clicked(clone!(
+        #[weak]
+        inner,
+        move |_| inner.do_daemon_reload()
+    ));
+    log_load_btn.connect_clicked(clone!(
+        #[weak]
+        inner,
+        move |_| inner.load_logs()
+    ));
+    file_load_btn.connect_clicked(clone!(
+        #[weak]
+        inner,
+        move |_| inner.load_unit_file()
+    ));
+    t_reload.connect_clicked(clone!(
+        #[weak]
+        inner,
+        move |_| inner.load_timers()
+    ));
 
     // 系统日志
-    j_load.connect_clicked(clone!(#[weak] inner, move |_| {
-        // 切换实时跟踪时先停止，避免快照与实时混叠
-        if inner.j_follow.is_active() {
-            inner.j_follow.set_active(false);
-            inner.stop_follow();
+    j_load.connect_clicked(clone!(
+        #[weak]
+        inner,
+        move |_| {
+            // 切换实时跟踪时先停止，避免快照与实时混叠
+            if inner.j_follow.is_active() {
+                inner.j_follow.set_active(false);
+                inner.stop_follow();
+            }
+            inner.load_journal();
         }
-        inner.load_journal();
-    }));
-    j_follow.connect_toggled(clone!(#[weak] inner, move |_| inner.toggle_follow()));
-    j_clear.connect_clicked(clone!(#[weak] inner, move |_| {
-        inner.j_buffer.set_text("");
-        inner.j_status.set_text("已清除");
-    }));
+    ));
+    j_follow.connect_toggled(clone!(
+        #[weak]
+        inner,
+        move |_| inner.toggle_follow()
+    ));
+    j_clear.connect_clicked(clone!(
+        #[weak]
+        inner,
+        move |_| {
+            inner.j_buffer.set_text("");
+            inner.j_status.set_text("已清除");
+        }
+    ));
 
     // 列表选择 → 详情（用 row-selected：单击和键盘上下键都会立刻加载详情；
     // 重建列表导致的空选择（None）忽略，否则搜索时详情会被清空）
-    unit_list.connect_row_selected(clone!(#[weak] inner, move |_, row| {
-        let Some(row) = row else {
-            return;
-        };
-        let name = row.widget_name().to_string();
-        if name.is_empty() || inner.is_selected(&name) {
-            return;
+    unit_list.connect_row_selected(clone!(
+        #[weak]
+        inner,
+        move |_, row| {
+            let Some(row) = row else {
+                return;
+            };
+            let name = row.widget_name().to_string();
+            if name.is_empty() || inner.is_selected(&name) {
+                return;
+            }
+            inner.select_unit(&name);
         }
-        inner.select_unit(&name);
-    }));
+    ));
 
     INNER.with(|i| *i.borrow_mut() = Some(Rc::clone(&inner)));
 
@@ -1733,5 +1789,7 @@ pub fn build() -> SystemdPage {
     inner.refresh();
     inner.load_timers();
 
-    SystemdPage { root: toast_overlay }
+    SystemdPage {
+        root: toast_overlay,
+    }
 }

@@ -47,6 +47,27 @@ impl MonitorControl {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 分层采样开关（GOAL.md 2.1）：速率列可见 / 详情选中时才读 /proc/<pid>/io
+// ---------------------------------------------------------------------------
+
+static IO_COLUMNS: AtomicBool = AtomicBool::new(false);
+static IO_DETAIL: AtomicBool = AtomicBool::new(false);
+
+/// 读/写速率列是否可见（由列显隐开关调用）。
+pub fn set_io_columns(wanted: bool) {
+    IO_COLUMNS.store(wanted, Ordering::Relaxed);
+}
+
+/// 详情面板是否有选中进程（由选择变化调用；详情文本要用 io 累计值与速率）。
+pub fn set_io_detail(wanted: bool) {
+    IO_DETAIL.store(wanted, Ordering::Relaxed);
+}
+
+fn want_io() -> bool {
+    IO_COLUMNS.load(Ordering::Relaxed) || IO_DETAIL.load(Ordering::Relaxed)
+}
+
 /// 采样线程内部的跨周期状态。
 struct SamplerState {
     prev_cpu: proc::CpuJiffies,
@@ -61,6 +82,12 @@ struct SamplerState {
     fs: Vec<FsUsage>,
     ips: HashMap<String, (Vec<String>, Vec<String>)>,
     cpu_static: sensors::CpuStatic,
+    /// pid 级缓存：cmdline/cgroup/io_class（按 starttime 失效，进程消失即清理）。
+    pid_cache: HashMap<i32, proc::PidCache>,
+    /// 上一轮是否读过 io（关→开的第一轮差分基准无效）。
+    io_valid: bool,
+    /// 差分基准的复用槽（GOAL.md 2.2：clear + swap，不每轮新建 HashMap）。
+    prev_scratch: HashMap<i32, (u64, u64, u64)>,
 }
 
 impl SamplerState {
@@ -79,7 +106,35 @@ impl SamplerState {
             fs: Vec::new(),
             ips: HashMap::new(),
             cpu_static,
+            pid_cache: HashMap::new(),
+            io_valid: false,
+            prev_scratch: HashMap::new(),
         }
+    }
+}
+
+/// 基准测试用采样器：包住内部 [`SamplerState`],让 `benches/` 能对真实
+/// `/proc` 采集路径计时。隐藏 API，仅供基准测试使用。
+#[doc(hidden)]
+pub struct BenchSampler(SamplerState);
+
+#[doc(hidden)]
+impl Default for BenchSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BenchSampler {
+    pub fn new() -> Self {
+        BenchSampler(SamplerState::new())
+    }
+
+    /// 采集一次完整快照，返回纯采集耗时（不含 criterion 计时开销的自计时）。
+    pub fn collect_timed(&mut self) -> Duration {
+        let t = Instant::now();
+        collect(&mut self.0);
+        t.elapsed()
     }
 }
 
@@ -132,17 +187,21 @@ fn collect(state: &mut SamplerState) -> Snapshot {
     state.ticks += 1;
 
     // ---- CPU ----
-    let stat_text = std::fs::read_to_string("/proc/stat").unwrap_or_default();
-    let (cur_cpu, cur_cores, totals) = proc::parse_stat(&stat_text);
+    // GOAL.md 2.2：/proc 顺序读共享一个可复用缓冲（parse_* 都返回自有数据）
+    let mut text = String::with_capacity(16 * 1024);
+    read_into("/proc/stat", &mut text);
+    let (cur_cpu, cur_cores, totals) = proc::parse_stat(&text);
     let mut cpu = proc::cpu_stat_delta(&cur_cpu, &state.prev_cpu, &cur_cores, &state.prev_cores);
     state.prev_cpu = cur_cpu;
     state.prev_cores = cur_cores;
 
     // ---- 内存 / 负载 / 运行时间 ----
-    let mem = proc::parse_meminfo(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default());
-    let (load, running, nprocs) =
-        proc::parse_loadavg(&std::fs::read_to_string("/proc/loadavg").unwrap_or_default());
-    let uptime = proc::parse_uptime(&std::fs::read_to_string("/proc/uptime").unwrap_or_default());
+    read_into("/proc/meminfo", &mut text);
+    let mem = proc::parse_meminfo(&text);
+    read_into("/proc/loadavg", &mut text);
+    let (load, running, nprocs) = proc::parse_loadavg(&text);
+    read_into("/proc/uptime", &mut text);
+    let uptime = proc::parse_uptime(&text);
 
     cpu.model = state.cpu_static.model.clone();
     cpu.cores = state.cpu_static.cores;
@@ -157,15 +216,15 @@ fn collect(state: &mut SamplerState) -> Snapshot {
     cpu.intr = totals.intr;
 
     // ---- 网络 ----
-    let net_raw =
-        proc::parse_net_dev(&std::fs::read_to_string("/proc/net/dev").unwrap_or_default());
+    read_into("/proc/net/dev", &mut text);
+    let net_raw = proc::parse_net_dev(&text);
     let mut net = proc::net_delta(&net_raw, &state.prev_net, dt);
     state.prev_net = net_raw;
     sensors::enrich_net(&mut net);
 
     // ---- 磁盘 ----
-    let disk_raw =
-        proc::parse_diskstats(&std::fs::read_to_string("/proc/diskstats").unwrap_or_default());
+    read_into("/proc/diskstats", &mut text);
+    let disk_raw = proc::parse_diskstats(&text);
     let mut disks = proc::disk_delta(&disk_raw, &state.prev_disks, dt);
     state.prev_disks = disk_raw;
     sensors::enrich_disks(&mut disks);
@@ -176,10 +235,10 @@ fn collect(state: &mut SamplerState) -> Snapshot {
     let batteries = sensors::collect_batteries();
 
     // ---- 变化慢的：文件系统（每 5 次）/ IP（每 10 次）----
-    if state.fs.is_empty() || state.ticks % 5 == 0 {
+    if state.fs.is_empty() || state.ticks.is_multiple_of(5) {
         state.fs = sensors::collect_fs();
     }
-    if state.ips.is_empty() || state.ticks % 10 == 0 {
+    if state.ips.is_empty() || state.ticks.is_multiple_of(10) {
         state.ips = sensors::collect_ips();
     }
     for i in net.iter_mut() {
@@ -199,6 +258,7 @@ fn collect(state: &mut SamplerState) -> Snapshot {
 
     // ---- 进程 ----
     let ticks_per_sec = proc::clock_ticks();
+    let want_io_now = want_io();
     let mut processes = proc::collect_processes(
         &state.prev_procs,
         ticks_per_sec,
@@ -207,19 +267,29 @@ fn collect(state: &mut SamplerState) -> Snapshot {
         totals.btime,
         uptime,
         &state.users,
+        &mut state.pid_cache,
+        want_io_now,
+        state.io_valid,
     );
-    // 更新差分基准
-    let mut next: HashMap<i32, (u64, u64, u64)> = HashMap::with_capacity(processes.len());
+    state.io_valid = want_io_now;
+    // 更新差分基准（缓冲复用：clear + swap，不每轮新建 HashMap）
+    state.prev_scratch.clear();
     for p in processes.iter_mut() {
-        next.insert(p.pid, (p.cpu_ticks(), p.read_bytes, p.write_bytes));
+        state
+            .prev_scratch
+            .insert(p.pid, (p.cpu_ticks(), p.read_bytes, p.write_bytes));
     }
-    state.prev_procs = next;
+    std::mem::swap(&mut state.prev_procs, &mut state.prev_scratch);
+    // 清掉已退出进程的缓存
+    state
+        .pid_cache
+        .retain(|pid, _| state.prev_procs.contains_key(pid));
     let threads: u64 = processes.iter().map(|p| p.threads.max(0) as u64).sum();
 
     let sys = SysInfo {
-        hostname: read_trim("/proc/sys/kernel/hostname"),
-        kernel: read_trim("/proc/sys/kernel/osrelease"),
-        distro: distro_name(),
+        hostname: hostname_cached().to_string(),
+        kernel: kernel_cached().to_string(),
+        distro: distro_cached().to_string(),
         uptime,
         procs: processes.len() as u64,
         threads,
@@ -248,6 +318,34 @@ fn read_trim(path: &str) -> String {
     std::fs::read_to_string(path)
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
+}
+
+/// 把文件读进可复用缓冲（GOAL.md 2.2）：失败时 buf 为空。
+/// 调用方必须在下一次读之前完成解析（parse 返回的都是自有数据）。
+fn read_into(path: &str, buf: &mut String) {
+    use std::io::Read as _;
+    buf.clear();
+    if let Ok(mut f) = std::fs::File::open(path) {
+        let _ = f.read_to_string(buf);
+    }
+}
+
+/// 主机名（不变，缓存避免每轮读盘）。
+fn hostname_cached() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| read_trim("/proc/sys/kernel/hostname"))
+}
+
+/// 内核版本（不变，缓存）。
+fn kernel_cached() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| read_trim("/proc/sys/kernel/osrelease"))
+}
+
+/// 发行版（不变，缓存）。
+fn distro_cached() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(distro_name)
 }
 
 /// `/etc/os-release` 的 PRETTY_NAME。
@@ -428,7 +526,7 @@ pub fn fmt_thousands(v: u64) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*c as char);
@@ -576,12 +674,15 @@ mod tests {
     #[test]
     fn sample_once_real_values() {
         let s = sample_once();
-        // 本机 32 线程、内存 32G、AMD 显卡
+        // 环境自适应断言（GOAL.md 4.6）：只断言真实硬件上恒成立的不变量，
+        // 依赖具体平台能力的（cpufreq sysfs 等）按「有该能力才断言」处理。
         assert!(s.cpu.cores >= 4);
         assert!(s.cpu.threads >= s.cpu.cores);
         assert_eq!(s.cpu.per_core.len(), s.cpu.threads);
         assert!(s.cpu.per_core.iter().all(|v| (0.0..=100.0).contains(v)));
-        assert!(s.cpu.freq_mhz > 0.0);
+        if std::path::Path::new("/sys/devices/system/cpu/cpu0/cpufreq").exists() {
+            assert!(s.cpu.freq_mhz > 0.0, "有 cpufreq 却读不到当前主频");
+        }
         assert!(s.mem.total > 1024 * 1024 * 1024);
         assert!(s.sys.uptime > 0);
         assert!(s.sys.procs > 50);
@@ -603,5 +704,79 @@ mod tests {
         let (r, w) = disk_total_io(&s.disks);
         assert!(r >= 0.0 && w >= 0.0);
         let _ = RecvTimeoutError::Timeout;
+    }
+
+    #[test]
+    fn human_bytes_unit_boundaries() {
+        assert_eq!(human_bytes(1023), "1023 B", "未满 1KB 不缩放");
+        assert_eq!(
+            human_bytes(1024 * 1024 - 1),
+            "1024 KB",
+            "KB 上探到 1024 不进位的旧行为"
+        );
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB", "正好 1MB");
+        assert_eq!(human_bytes(1024u64.pow(4)), "1.0 TB");
+        assert_eq!(human_bytes(1024u64.pow(5)), "1.0 PB");
+        assert!(
+            human_bytes(u64::MAX).ends_with(" PB"),
+            "封顶到 PB 不溢出：{}",
+            human_bytes(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn human_rate_small_and_negative() {
+        assert_eq!(human_rate(0.04), "0 B/s", "小于阈值归零");
+        assert_eq!(human_rate(-100.0), "0 B/s", "负数（采样回绕）不得出现 -xxx");
+        assert_eq!(human_rate(1.0), "1 B/s");
+        assert_eq!(human_rate(1536.0), "1.5 KB/s");
+    }
+
+    #[test]
+    fn human_duration_minute_display_rules() {
+        // 分钟段只在 <10 分且有秒时才显示「x 分 y 秒」
+        assert_eq!(human_duration(59), "59 秒");
+        assert_eq!(human_duration(599), "9 分 59 秒");
+        assert_eq!(human_duration(600), "10 分", "满 10 分不再带秒");
+        assert_eq!(human_duration(90), "1 分 30 秒");
+        assert_eq!(human_duration(86400 + 3600), "1 天 1 小时");
+        assert_eq!(human_duration(3600 * 5), "5 小时");
+    }
+
+    #[test]
+    fn level_class_thresholds() {
+        assert_eq!(level_class(69.99), "success");
+        assert_eq!(level_class(70.0), "warning");
+        assert_eq!(level_class(89.99), "warning");
+        assert_eq!(level_class(90.0), "error");
+        assert_eq!(level_class(0.0), "success");
+    }
+
+    #[test]
+    fn pct_formatting_edges() {
+        assert_eq!(pct(42.5), "42.5%");
+        assert_eq!(pct(-3.25), "-3.2%", "负值（理论不出现）走同格式不 panic");
+        assert_eq!(pct(99.95), "100%", "封顶边界");
+        assert_eq!(pct(99.9), "99.9%");
+        assert_eq!(pct0(99.6), "100%");
+        assert_eq!(pct0(0.0), "0%");
+    }
+
+    #[test]
+    fn temp_text_some_and_none() {
+        assert_eq!(temp_text(Some(45.6)), "46°C");
+        assert_eq!(temp_text(Some(0.0)), "0°C");
+        assert_eq!(temp_text(None), "—", "读不到温度显示破折号");
+    }
+
+    #[test]
+    fn monitor_control_interval_floor() {
+        let (rx, ctl) = start(1);
+        assert!(ctl.interval_ms() >= 200, "周期下限 200ms");
+        ctl.set_interval_ms(10);
+        assert!(ctl.interval_ms() >= 200, "set 同样被下限钳制");
+        ctl.stop();
+        drop(rx);
+        assert!(ctl.is_stopped());
     }
 }

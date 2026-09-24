@@ -54,7 +54,7 @@ impl HwCapabilities {
             crate::model::media::HwAccelPreference::Vaapi
         } else if self.qsv {
             crate::model::media::HwAccelPreference::Qsv
-        } else         if self.amf {
+        } else if self.amf {
             crate::model::media::HwAccelPreference::Amf
         } else if self.videotoolbox {
             crate::model::media::HwAccelPreference::Videotoolbox
@@ -93,10 +93,10 @@ impl HwCapabilities {
                 "opencl" => Some("OpenCL 解码"),
                 _ => None,
             };
-            if let Some(l) = label {
-                if !names.iter().any(|n| n.eq_ignore_ascii_case(l)) {
-                    names.push(l.to_string());
-                }
+            if let Some(l) = label
+                && !names.iter().any(|n| n.eq_ignore_ascii_case(l))
+            {
+                names.push(l.to_string());
             }
         }
         if names.is_empty() {
@@ -182,13 +182,19 @@ pub fn age_text(detected_at: u64) -> String {
 /// 探测系统硬件加速能力。应在后台线程调用。
 pub fn detect() -> HwCapabilities {
     let has_dri_render = std::fs::read_dir("/dev")
-        .map(|d| d.filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().starts_with("render")))
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with("render"))
+        })
         .unwrap_or(false)
         || std::path::Path::new("/dev/dri/renderD128").exists();
 
     let has_nvidia = std::path::Path::new("/dev/nvidia0").exists()
         || std::fs::read_dir("/dev")
-            .map(|d| d.filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().starts_with("nvidia")))
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_string_lossy().starts_with("nvidia"))
+            })
             .unwrap_or(false);
 
     let encoders = run_ffmpeg_encoders();
@@ -220,7 +226,12 @@ fn run_ffmpeg_encoders() -> Vec<String> {
         .arg("-hide_banner")
         .arg("-encoders")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|l| l.to_string()).collect())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.to_string())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -248,6 +259,103 @@ mod tests {
     #[test]
     fn auto_preference_falls_back_to_software() {
         let caps = HwCapabilities::default();
-        assert_eq!(caps.auto_preference(), crate::model::media::HwAccelPreference::Software);
+        assert_eq!(
+            caps.auto_preference(),
+            crate::model::media::HwAccelPreference::Software
+        );
+    }
+
+    #[test]
+    fn auto_preference_priority_chain() {
+        use crate::model::media::HwAccelPreference as P;
+        // 多个同时可用时按 NVENC > VAAPI > QSV > AMF > VideoToolbox 取首个
+        let caps = HwCapabilities {
+            nvenc: true,
+            vaapi: true,
+            qsv: true,
+            ..Default::default()
+        };
+        assert_eq!(caps.auto_preference(), P::Nvenc);
+        let caps = HwCapabilities {
+            vaapi: true,
+            qsv: true,
+            amf: true,
+            ..Default::default()
+        };
+        assert_eq!(caps.auto_preference(), P::Vaapi);
+        let caps = HwCapabilities {
+            qsv: true,
+            amf: true,
+            ..Default::default()
+        };
+        assert_eq!(caps.auto_preference(), P::Qsv);
+        let caps = HwCapabilities {
+            amf: true,
+            videotoolbox: true,
+            ..Default::default()
+        };
+        assert_eq!(caps.auto_preference(), P::Amf);
+        let caps = HwCapabilities {
+            videotoolbox: true,
+            ..Default::default()
+        };
+        assert_eq!(caps.auto_preference(), P::Videotoolbox);
+        // 只有解码方法、没有编码后端 → 仍然软件编码
+        let caps = HwCapabilities {
+            decode_methods: vec!["cuda".into(), "vulkan".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            caps.auto_preference(),
+            P::Software,
+            "解码加速不参与编码偏好"
+        );
+    }
+
+    #[test]
+    fn summary_without_accel_is_friendly() {
+        let s = HwCapabilities::default().summary();
+        assert!(s.contains("未检测到"), "{s}");
+        assert!(s.contains("软件编码"), "{s}");
+    }
+
+    #[test]
+    fn summary_encoders_in_priority_order() {
+        let caps = HwCapabilities {
+            nvenc: true,
+            vaapi: true,
+            qsv: true,
+            ..Default::default()
+        };
+        assert_eq!(caps.summary(), "可用：NVENC、VAAPI、QSV");
+        let caps = HwCapabilities {
+            vaapi: true,
+            videotoolbox: true,
+            ..Default::default()
+        };
+        assert_eq!(caps.summary(), "可用：VAAPI、VideoToolbox");
+    }
+
+    #[test]
+    fn summary_decode_labels_and_unknown_ignored() {
+        let caps = HwCapabilities {
+            decode_methods: vec!["cuda".into(), "vulkan".into(), "weird".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            caps.summary(),
+            "可用：CUDA 解码、Vulkan 解码",
+            "未知方法被忽略"
+        );
+        // 编码后端与同名解码方法不重复
+        let caps = HwCapabilities {
+            nvenc: true,
+            decode_methods: vec!["cuda".into(), "opencl".into()],
+            ..Default::default()
+        };
+        let s = caps.summary();
+        assert!(s.contains("NVENC"), "{s}");
+        assert!(s.contains("CUDA 解码"), "{s}");
+        assert!(s.contains("OpenCL 解码"), "{s}");
     }
 }

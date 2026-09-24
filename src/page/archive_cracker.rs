@@ -62,10 +62,6 @@ fn card(title: &str, subtitle: &str) -> (adw::PreferencesGroup, adw::Preferences
     (g.clone(), g)
 }
 
-fn entry_row(title: &str) -> adw::EntryRow {
-    adw::EntryRow::builder().title(title).build()
-}
-
 fn spin_row(title: &str, min: f64, max: f64, step: f64, digits: u32, value: f64) -> adw::SpinRow {
     let adj = gtk::Adjustment::new(value, min, max, step, step * 10.0, 0.0);
     let r = adw::SpinRow::builder()
@@ -84,16 +80,6 @@ fn combo_row(title: &str, labels: &[&str], init: u32) -> adw::ComboRow {
         .selected(init)
         .title(title)
         .build()
-}
-
-fn switch_row(title: &str, subtitle: &str, active: bool) -> adw::SwitchRow {
-    let r = adw::SwitchRow::new();
-    r.set_title(title);
-    if !subtitle.is_empty() {
-        r.set_subtitle(subtitle);
-    }
-    r.set_active(active);
-    r
 }
 
 fn button_row(buttons: &[&gtk::Button]) -> gtk::Box {
@@ -329,7 +315,7 @@ impl Inner {
 // ---------------------------------------------------------------------------
 
 fn g_add_archive() {
-    let Some(s) = self_rc() else { return };
+    let Some(_s) = self_rc() else { return };
     let dialog = gtk::FileDialog::builder()
         .title("选择压缩包（zip / 7z）")
         .build();
@@ -342,14 +328,16 @@ fn g_add_archive() {
             if let Ok(files) = result {
                 let n = files.n_items();
                 for i in 0..n {
-                    if let Some(file) = files.item(i).and_then(|f| f.downcast::<gtk::gio::File>().ok()) {
-                        if let Some(path) = file.path() {
-                            let path_str = path.to_string_lossy();
-                            if let Some(config) = ArchiveConfig::new(&path_str) {
-                                if let Some(s) = s_weak.as_ref().and_then(|w| w.upgrade()) {
-                                    g_add_archive_inner(&s, config);
-                                }
-                            }
+                    if let Some(file) = files
+                        .item(i)
+                        .and_then(|f| f.downcast::<gtk::gio::File>().ok())
+                        && let Some(path) = file.path()
+                    {
+                        let path_str = path.to_string_lossy();
+                        if let Some(config) = ArchiveConfig::new(&path_str)
+                            && let Some(s) = s_weak.as_ref().and_then(|w| w.upgrade())
+                        {
+                            g_add_archive_inner(&s, config);
                         }
                     }
                 }
@@ -450,16 +438,13 @@ fn g_remove_selected() {
     for i in to_remove {
         if let Some(r) = rows.get(i) {
             // 从 ListBox 移除对应行
-            if let Some(parent) = r.label.parent() {
-                if let Some(row) = parent.parent() {
-                    if let Ok(listbox) = row.downcast::<gtk::ListBoxRow>() {
-                        if let Some(listbox_parent) = listbox.parent() {
-                            if let Ok(lb) = listbox_parent.downcast::<gtk::ListBox>() {
-                                lb.remove(&listbox);
-                            }
-                        }
-                    }
-                }
+            if let Some(parent) = r.label.parent()
+                && let Some(row) = parent.parent()
+                && let Ok(listbox) = row.downcast::<gtk::ListBoxRow>()
+                && let Some(listbox_parent) = listbox.parent()
+                && let Ok(lb) = listbox_parent.downcast::<gtk::ListBox>()
+            {
+                lb.remove(&listbox);
             }
         }
         rows.remove(i);
@@ -530,8 +515,7 @@ fn g_start() {
 
     s.append_log(&format!(
         "开始爆破，共 {} 个压缩包，{:.0} 个候选密码",
-        total_candidates.min(u128::MAX),
-        total_candidates.min(u128::MAX),
+        total_candidates, total_candidates,
     ));
 }
 
@@ -686,11 +670,12 @@ fn tick() -> glib::ControlFlow {
             "爆破完成：找到 {found} 个密码，测试 {total} 次，耗时 {}",
             duration_text(elapsed)
         ));
-    } else if s.running.get() {
-        if let Some(ref started_at) = *s.started_at.borrow() {
-            let elapsed = started_at.elapsed().as_secs();
-            s.stat_label.set_text(&format!("爆破中... 已运行 {}", duration_text(elapsed)));
-        }
+    } else if s.running.get()
+        && let Some(ref started_at) = *s.started_at.borrow()
+    {
+        let elapsed = started_at.elapsed().as_secs();
+        s.stat_label
+            .set_text(&format!("爆破中... 已运行 {}", duration_text(elapsed)));
     }
 
     glib::ControlFlow::Continue
@@ -741,9 +726,7 @@ pub fn build() -> ArchiveCrackerPage {
     subtitle.set_wrap(true);
     root_box.append(&subtitle);
 
-    let notice = gtk::Label::new(Some(
-        "请仅对你自己拥有或已获得明确授权的文件使用本模块。",
-    ));
+    let notice = gtk::Label::new(Some("请仅对你自己拥有或已获得明确授权的文件使用本模块。"));
     notice.add_css_class("dim-label");
     notice.add_css_class("caption");
     notice.set_halign(gtk::Align::Start);
@@ -947,18 +930,19 @@ pub fn build() -> ArchiveCrackerPage {
     // 事件循环
     glib::source::timeout_add(Duration::from_millis(100), tick);
 
-    ArchiveCrackerPage { root: toast_overlay }
+    ArchiveCrackerPage {
+        root: toast_overlay,
+    }
 }
 
 /// 关闭时清理。
 pub fn shutdown() {
     INNER.with(|i| {
-        if let Some(weak) = i.borrow().as_ref() {
-            if let Some(s) = weak.upgrade() {
-                if let Some(ctrl) = s.control.borrow().as_ref() {
-                    ctrl.stop();
-                }
-            }
+        if let Some(weak) = i.borrow().as_ref()
+            && let Some(s) = weak.upgrade()
+            && let Some(ctrl) = s.control.borrow().as_ref()
+        {
+            ctrl.stop();
         }
         *i.borrow_mut() = None;
     });

@@ -100,3 +100,56 @@ pub struct LoadResult {
     /// 当前进程能否直接写入该文件（无需提权）。
     pub writable_direct: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rc_file_paths_per_shell() {
+        let home = "/home/u";
+        assert_eq!(ShellKind::Bash.rc_file(home), "/home/u/.bashrc");
+        assert_eq!(ShellKind::Zsh.rc_file(home), "/home/u/.zshrc");
+        assert_eq!(
+            ShellKind::Fish.rc_file(home),
+            "/home/u/.config/fish/config.fish",
+            "fish 走 XDG 配置目录"
+        );
+        assert_eq!(
+            ShellKind::Other.rc_file(home),
+            "/home/u/.bashrc",
+            "未知 shell 按 bash 处理（界面给提示）"
+        );
+    }
+
+    #[test]
+    fn shell_from_path_matrix() {
+        assert_eq!(shell_from_path("/bin/bash"), ShellKind::Bash);
+        assert_eq!(shell_from_path("/usr/bin/zsh"), ShellKind::Zsh);
+        assert_eq!(shell_from_path("/usr/local/bin/fish"), ShellKind::Fish);
+        assert_eq!(shell_from_path("bash"), ShellKind::Bash, "无斜杠取全串");
+        assert_eq!(shell_from_path(""), ShellKind::Other, "空值 → Other");
+        assert_eq!(shell_from_path("/usr/bin/nu"), ShellKind::Other);
+        // 大小写敏感：BASH 不是 bash
+        assert_eq!(shell_from_path("/bin/BASH"), ShellKind::Other);
+    }
+
+    #[test]
+    fn line_kind_detection() {
+        let env = Line::Env {
+            key: "PATH".into(),
+            value: "/usr/bin".into(),
+            exported: true,
+            raw: None,
+        };
+        assert!(env.is_env() && !env.is_alias());
+        let alias = Line::Alias {
+            name: "ll".into(),
+            command: "ls -l".into(),
+            raw: None,
+        };
+        assert!(alias.is_alias() && !alias.is_env());
+        let other = Line::Other("# 注释".into());
+        assert!(!other.is_env() && !other.is_alias());
+    }
+}

@@ -12,11 +12,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 
-use super::storage;
 use super::git_store::GitConfig;
+use super::storage;
 
 // ── 配置 ──────────────────────────────────────────────────────────────────
 
@@ -462,11 +462,11 @@ pub fn do_sync(configs: &[BackendConfig]) -> Result<SyncSummary, String> {
         let ok = match backend {
             BackendConfig::Http(config) => {
                 sync_http_backend(config, &local_metas, &deleted_ids, &mut state, &mut summary);
-                !summary.per_server.last().map_or(false, |(_, r)| r.is_err())
+                !summary.per_server.last().is_some_and(|(_, r)| r.is_err())
             }
             BackendConfig::Git(config) => {
                 sync_git_backend(config, &local_metas, &deleted_ids, &mut summary);
-                !summary.per_server.last().map_or(false, |(_, r)| r.is_err())
+                !summary.per_server.last().is_some_and(|(_, r)| r.is_err())
             }
         };
         if !ok {
@@ -510,11 +510,7 @@ pub fn pull_only(configs: &[BackendConfig]) -> Result<SyncSummary, String> {
             BackendConfig::Git(config) => {
                 let name = format!(
                     "Git: {}",
-                    config
-                        .url
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(&config.url)
+                    config.url.rsplit('/').next().unwrap_or(&config.url)
                 );
                 match super::git_store::pull_only(config) {
                     Ok(downloaded) => {
@@ -554,7 +550,7 @@ pub fn push_only(configs: &[BackendConfig]) -> Result<SyncSummary, String> {
         let ok = match backend {
             BackendConfig::Http(config) => {
                 push_http_only(config, &local_metas, &deleted_ids, &mut state, &mut summary);
-                !summary.per_server.last().map_or(false, |(_, r)| r.is_err())
+                !summary.per_server.last().is_some_and(|(_, r)| r.is_err())
             }
             BackendConfig::Git(config) => {
                 let name = format!(
@@ -593,11 +589,7 @@ pub fn push_only(configs: &[BackendConfig]) -> Result<SyncSummary, String> {
 }
 
 /// HTTP 后端只拉取。
-fn pull_http_only(
-    config: &CloudConfig,
-    state: &mut SyncState,
-    summary: &mut SyncSummary,
-) {
+fn pull_http_only(config: &CloudConfig, state: &mut SyncState, summary: &mut SyncSummary) {
     let client = ApiClient::new(config);
     let server_name = client.server_name().to_string();
     let last_sync = state.server_sync.get(&config.url).copied().unwrap_or(0);
@@ -620,7 +612,9 @@ fn pull_http_only(
                         let local_ts = parse_ts(&local_m.modified_at);
                         if ts > local_ts {
                             if let Err(e) = cloud_to_local(entry) {
-                                summary.errors.push(format!("写入条目 {} 失败：{e}", entry.id));
+                                summary
+                                    .errors
+                                    .push(format!("写入条目 {} 失败：{e}", entry.id));
                             } else {
                                 summary.downloaded += 1;
                             }
@@ -628,7 +622,9 @@ fn pull_http_only(
                     }
                     None => {
                         if let Err(e) = cloud_to_local(entry) {
-                            summary.errors.push(format!("写入条目 {} 失败：{e}", entry.id));
+                            summary
+                                .errors
+                                .push(format!("写入条目 {} 失败：{e}", entry.id));
                         } else {
                             summary.downloaded += 1;
                         }
@@ -640,7 +636,9 @@ fn pull_http_only(
             summary.per_server.push((server_name, Ok(())));
         }
         Err(e) => {
-            summary.errors.push(format!("[{server_name}] 拉取失败：{e}"));
+            summary
+                .errors
+                .push(format!("[{server_name}] 拉取失败：{e}"));
             summary.per_server.push((server_name, Err(e)));
         }
     }
@@ -662,7 +660,7 @@ fn push_http_only(
         return;
     }
 
-    let changed: Vec<CloudEntry> = local_metas.iter().map(|m| local_to_cloud(m)).collect();
+    let changed: Vec<CloudEntry> = local_metas.iter().map(local_to_cloud).collect();
     match client.push_changes(&changed, deleted_ids) {
         Ok(()) => {
             summary.uploaded += changed.len();
@@ -670,7 +668,9 @@ fn push_http_only(
             summary.per_server.push((server_name, Ok(())));
         }
         Err(e) => {
-            summary.errors.push(format!("[{server_name}] 推送失败：{e}"));
+            summary
+                .errors
+                .push(format!("[{server_name}] 推送失败：{e}"));
             summary.per_server.push((server_name, Err(e)));
         }
     }
@@ -690,14 +690,16 @@ fn sync_http_backend(
 
     // 推送本地变更（推送所有本地条目，不依赖时间戳过滤）
     if !local_metas.is_empty() || !deleted_ids.is_empty() {
-        let changed: Vec<CloudEntry> = local_metas.iter().map(|m| local_to_cloud(m)).collect();
+        let changed: Vec<CloudEntry> = local_metas.iter().map(local_to_cloud).collect();
         match client.push_changes(&changed, deleted_ids) {
             Ok(()) => {
                 summary.uploaded += changed.len();
                 summary.deleted_remote += deleted_ids.len();
             }
             Err(e) => {
-                summary.errors.push(format!("[{server_name}] 推送失败：{e}"));
+                summary
+                    .errors
+                    .push(format!("[{server_name}] 推送失败：{e}"));
                 summary.per_server.push((server_name, Err(e)));
                 return;
             }
@@ -718,7 +720,8 @@ fn sync_http_backend(
                     // #9: 远端删除 + 本地有修改 → 保留本地
                     if let Some(local_m) = local_meta(&entry.id) {
                         let local_ts = parse_ts(&local_m.modified_at);
-                        let remote_deleted_ts = parse_ts(entry.deleted_at.as_deref().unwrap_or("0"));
+                        let remote_deleted_ts =
+                            parse_ts(entry.deleted_at.as_deref().unwrap_or("0"));
                         if local_ts > remote_deleted_ts {
                             continue; // 本地更新，不删
                         }
@@ -732,7 +735,9 @@ fn sync_http_backend(
                         let local_ts = parse_ts(&local_m.modified_at);
                         if ts > local_ts {
                             if let Err(e) = cloud_to_local(entry) {
-                                summary.errors.push(format!("写入条目 {} 失败：{e}", entry.id));
+                                summary
+                                    .errors
+                                    .push(format!("写入条目 {} 失败：{e}", entry.id));
                             } else {
                                 summary.downloaded += 1;
                             }
@@ -740,7 +745,9 @@ fn sync_http_backend(
                     }
                     None => {
                         if let Err(e) = cloud_to_local(entry) {
-                            summary.errors.push(format!("写入条目 {} 失败：{e}", entry.id));
+                            summary
+                                .errors
+                                .push(format!("写入条目 {} 失败：{e}", entry.id));
                         } else {
                             summary.downloaded += 1;
                         }
@@ -771,7 +778,9 @@ fn sync_http_backend(
             summary.per_server.push((server_name, Ok(())));
         }
         Err(e) => {
-            summary.errors.push(format!("[{server_name}] 拉取失败：{e}"));
+            summary
+                .errors
+                .push(format!("[{server_name}] 拉取失败：{e}"));
             summary.per_server.push((server_name, Err(e)));
         }
     }
@@ -786,11 +795,7 @@ fn sync_git_backend(
 ) {
     let name = format!(
         "Git: {}",
-        config
-            .url
-            .rsplit('/')
-            .next()
-            .unwrap_or(&config.url)
+        config.url.rsplit('/').next().unwrap_or(&config.url)
     );
     match super::git_store::sync_git_backend(config, local_metas, deleted_ids) {
         Ok((uploaded, downloaded)) => {
@@ -834,5 +839,195 @@ pub fn record_deletion(id: &str) {
     if !ids.contains(&id.to_string()) {
         ids.push(id.to_string());
         save_deleted_ids(&ids);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cloud(url: &str) -> CloudConfig {
+        CloudConfig {
+            url: url.to_string(),
+            username: "u".into(),
+            password: "p".into(),
+        }
+    }
+
+    fn git(url: &str) -> GitConfig {
+        GitConfig {
+            url: url.to_string(),
+            branch: "main".into(),
+            user_name: String::new(),
+            user_email: String::new(),
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+
+    // ── BackendConfig 展示 ──────────────────────────────────────────────
+
+    #[test]
+    fn unique_key_is_url_for_both_kinds() {
+        let h = BackendConfig::Http(cloud("http://10.0.0.1:8080"));
+        assert_eq!(h.unique_key(), "http://10.0.0.1:8080");
+        let g = BackendConfig::Git(git("https://github.com/u/r.git"));
+        assert_eq!(g.unique_key(), "https://github.com/u/r.git");
+    }
+
+    #[test]
+    fn display_name_http_strips_scheme_and_path() {
+        assert_eq!(
+            BackendConfig::Http(cloud("http://192.168.1.100:8080")).display_name(),
+            "HTTP: 192.168.1.100:8080"
+        );
+        assert_eq!(
+            BackendConfig::Http(cloud("https://api.example.com/v1/")).display_name(),
+            "HTTP: api.example.com",
+            "路径不进显示名"
+        );
+    }
+
+    #[test]
+    fn display_name_git_strips_suffix_and_path() {
+        assert_eq!(
+            BackendConfig::Git(git("https://github.com/u/memo.git")).display_name(),
+            "Git: memo"
+        );
+        assert_eq!(
+            BackendConfig::Git(git("https://github.com/u/memo")).display_name(),
+            "Git: memo"
+        );
+        assert_eq!(
+            BackendConfig::Git(git("git@github.com:u/memo.git")).display_name(),
+            "Git: memo"
+        );
+    }
+
+    // ── serde 金样（GOAL 4.2）──────────────────────────────────────────
+
+    #[test]
+    fn serde_http_backend_uses_type_tag() {
+        let b = BackendConfig::Http(cloud("http://10.0.0.1:8080"));
+        let s = serde_json::to_string(&b).unwrap();
+        assert!(s.contains(r#""type":"http""#), "缺少 type 标签：{s}");
+        let back: BackendConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, b);
+    }
+
+    #[test]
+    fn serde_git_backend_uses_type_tag() {
+        let b = BackendConfig::Git(git("https://github.com/u/r.git"));
+        let s = serde_json::to_string(&b).unwrap();
+        assert!(s.contains(r#""type":"git""#), "缺少 type 标签：{s}");
+        let back: BackendConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, b);
+    }
+
+    #[test]
+    fn serde_sync_state_defaults_missing_server_sync() {
+        let st: SyncState = serde_json::from_str(r#"{"device_id":"abc"}"#).unwrap();
+        assert_eq!(st.device_id, "abc");
+        assert!(st.server_sync.is_empty(), "server_sync 缺失应默认空表");
+        let s = serde_json::to_string(&st).unwrap();
+        let back: SyncState = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.device_id, st.device_id);
+        assert_eq!(back.server_sync, st.server_sync);
+    }
+
+    #[test]
+    fn cloud_entry_minimal_json_defaults() {
+        // 旧云端不发 inline_images/attachments/deleted_at 也能解析（serde default）
+        let e: CloudEntry = serde_json::from_str(
+            r#"{"id":"a1","title":"t","content":"c","created_at":"1","modified_at":"2"}"#,
+        )
+        .unwrap();
+        assert_eq!(e.id, "a1");
+        assert!(e.inline_images.is_empty());
+        assert!(e.attachments.is_empty());
+        assert!(e.deleted_at.is_none());
+    }
+
+    #[test]
+    fn cloud_entry_serializes_none_deleted_at_away() {
+        let mut e: CloudEntry = serde_json::from_str(
+            r#"{"id":"a1","title":"t","content":"c","created_at":"1","modified_at":"2"}"#,
+        )
+        .unwrap();
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(!s.contains("deleted_at"), "None 不应出现该键：{s}");
+        e.deleted_at = Some("2026-01-01T00:00:00Z".into());
+        let s2 = serde_json::to_string(&e).unwrap();
+        assert!(s2.contains("deleted_at"), "Some 应序列化该键：{s2}");
+    }
+
+    #[test]
+    fn cloud_entry_roundtrip_with_attachments() {
+        let mut e: CloudEntry = serde_json::from_str(
+            r#"{"id":"x","title":"T","content":"body","created_at":"1","modified_at":"2"}"#,
+        )
+        .unwrap();
+        e.inline_images.push("aGVsbG8=".into());
+        e.attachments.push(CloudAttachment {
+            name: "a.txt".into(),
+            data: "aGVsbG8=".into(),
+        });
+        e.deleted_at = Some("now".into());
+        let s = serde_json::to_string(&e).unwrap();
+        let back: CloudEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.inline_images, e.inline_images);
+        assert_eq!(back.attachments.len(), 1);
+        assert_eq!(back.attachments[0].name, "a.txt");
+        assert_eq!(back.deleted_at, e.deleted_at);
+    }
+
+    #[test]
+    fn sync_request_defaults_deleted_ids() {
+        let r: SyncRequest = serde_json::from_str(r#"{"entries":[]}"#).unwrap();
+        assert!(r.deleted_ids.is_empty());
+        let s = serde_json::to_string(&r).unwrap();
+        let back: SyncRequest = serde_json::from_str(&s).unwrap();
+        assert!(back.deleted_ids.is_empty());
+    }
+
+    // ── 工具函数 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_ts_valid_number() {
+        assert_eq!(parse_ts("1712345678"), 1712345678);
+        assert_eq!(parse_ts("0"), 0);
+    }
+
+    #[test]
+    fn parse_ts_invalid_is_zero() {
+        assert_eq!(parse_ts(""), 0);
+        assert_eq!(parse_ts("not-a-number"), 0);
+        assert_eq!(
+            parse_ts("2026-01-01T00:00:00Z"),
+            0,
+            "ISO 文本不是合法 unix 秒"
+        );
+        assert_eq!(parse_ts("-1"), 0);
+    }
+
+    #[test]
+    fn device_id_is_16_hex() {
+        let id = generate_device_id();
+        assert_eq!(id.len(), 16);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn cloud_attachment_serde_golden() {
+        let a = CloudAttachment {
+            name: "报告.docx".into(),
+            data: "5Lit5paH".into(),
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(s.contains(r#""name":"报告.docx""#));
+        assert!(s.contains(r#""data":"5Lit5paH""#));
+        let back: CloudAttachment = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.name, a.name);
+        assert_eq!(back.data, a.data);
     }
 }

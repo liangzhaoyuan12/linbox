@@ -112,7 +112,10 @@ fn whitespace() -> Vec<char> {
 
 /// 从全集里挖掉 `excluded`。
 fn complement(excluded: &[char]) -> Vec<char> {
-    universe().into_iter().filter(|c| !excluded.contains(c)).collect()
+    universe()
+        .into_iter()
+        .filter(|c| !excluded.contains(c))
+        .collect()
 }
 
 /// 正则元字符：字面串遇到它们即停止。
@@ -120,7 +123,10 @@ fn complement(excluded: &[char]) -> Vec<char> {
 /// 注意 `]` 与 `}` 不在其中 —— 它们在字符类 / 量词之外就是普通字符，
 /// 这样 `a]b`、`a}b` 才能按字面量解析。
 fn is_meta(c: char) -> bool {
-    matches!(c, '(' | ')' | '[' | '{' | '*' | '+' | '?' | '|' | '.' | '^' | '$' | '\\')
+    matches!(
+        c,
+        '(' | ')' | '[' | '{' | '*' | '+' | '?' | '|' | '.' | '^' | '$' | '\\'
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +156,10 @@ impl Parser {
     fn parse(&mut self) -> Result<Node, String> {
         let node = self.parse_alternate()?;
         if let Some(c) = self.peek() {
-            return Err(format!("模式第 {} 个字符 `{c}` 无法解析（多余的右括号？）", self.pos + 1));
+            return Err(format!(
+                "模式第 {} 个字符 `{c}` 无法解析（多余的右括号？）",
+                self.pos + 1
+            ));
         }
         Ok(node)
     }
@@ -191,7 +200,9 @@ impl Parser {
         match self.parse_quantifier()? {
             Some((min, max)) => {
                 if max < min {
-                    return Err(format!("量词范围非法（{{ {min},{max} }}），最小值不能大于最大值"));
+                    return Err(format!(
+                        "量词范围非法（{{ {min},{max} }}），最小值不能大于最大值"
+                    ));
                 }
                 if max > MAX_REPEAT {
                     return Err(format!(
@@ -468,7 +479,9 @@ impl Parser {
             return Err("不是转义序列".into());
         }
         self.pos += 1;
-        let c = self.peek().ok_or_else(|| "模式以单个反斜杠结尾".to_string())?;
+        let c = self
+            .peek()
+            .ok_or_else(|| "模式以单个反斜杠结尾".to_string())?;
         self.pos += 1;
         Ok(match c {
             'd' => (digits(), true),
@@ -598,8 +611,14 @@ fn count(node: &Node) -> u128 {
     match node {
         Node::Literal(_) => 1,
         Node::Set(chars) => chars.len() as u128,
-        Node::Alternate(branches) => branches.iter().map(count).fold(0u128, |a, b| a.saturating_add(b)),
-        Node::Concat(parts) => parts.iter().map(count).fold(1u128, |a, b| a.saturating_mul(b)),
+        Node::Alternate(branches) => branches
+            .iter()
+            .map(count)
+            .fold(0u128, |a, b| a.saturating_add(b)),
+        Node::Concat(parts) => parts
+            .iter()
+            .map(count)
+            .fold(1u128, |a, b| a.saturating_mul(b)),
         Node::Repeat(inner, min, max) => {
             let n = count(inner);
             let mut total = 0u128;
@@ -661,7 +680,10 @@ fn estimate_key_bytes_upper(node: &Node) -> u128 {
             Node::Literal(s) => s.len() as u128,
             Node::Set(_) => 1,
             Node::Alternate(branches) => branches.iter().map(bound).max().unwrap_or(1),
-            Node::Concat(parts) => parts.iter().map(bound).fold(0u128, |a, b| a.saturating_add(b)),
+            Node::Concat(parts) => parts
+                .iter()
+                .map(bound)
+                .fold(0u128, |a, b| a.saturating_add(b)),
             Node::Repeat(inner, _, max) => bound(inner).saturating_mul(*max as u128),
         }
     }
@@ -732,9 +754,9 @@ pub fn generate(pattern: &str, opts: &GenerateOptions) -> Result<Dictionary, Str
             keys.push(k);
         }
         if keys.len() > 1 {
+            use rand::SeedableRng;
             use rand::rngs::StdRng;
             use rand::seq::SliceRandom;
-            use rand::SeedableRng;
             keys.shuffle(&mut StdRng::seed_from_u64(opts.seed));
         }
     } else {
@@ -806,8 +828,8 @@ fn sample_one(node: &Node, rng: &mut rand::rngs::StdRng, out: &mut String) -> bo
 
 /// 单个随机流采样：固定尝试预算，重复只消耗预算不占容量。
 fn sample_chunk(node: &Node, want: usize, seed: u64, budget: usize, out: &mut Vec<String>) {
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
     let mut rng = StdRng::seed_from_u64(seed);
     let mut attempts = 0usize;
     while out.len() < want && attempts < budget {
@@ -825,8 +847,8 @@ fn sample_chunk(node: &Node, want: usize, seed: u64, budget: usize, out: &mut Ve
 /// 内存占用 ≈ 最终字典本身（无重复副本）；不足部分用新种子流补采；
 /// 最后再用种子洗牌恢复乱序（排序把顺序破坏了，必须洗回来）。
 fn sample_dict(node: &Node, want: usize, seed: u64, total_usize: usize) -> Vec<String> {
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
     let threads = want.div_ceil(4096).clamp(1, 16);
     let budget = want.saturating_mul(8).max(4096);
 
@@ -902,7 +924,7 @@ pub fn format_count(n: u128) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -959,7 +981,10 @@ mod tests {
 
     #[test]
     fn non_capturing_group() {
-        assert_eq!(gen_keys(r"sk-(?:a|b)"), vec!["sk-a".to_string(), "sk-b".to_string()]);
+        assert_eq!(
+            gen_keys(r"sk-(?:a|b)"),
+            vec!["sk-a".to_string(), "sk-b".to_string()]
+        );
     }
 
     #[test]
@@ -1130,7 +1155,7 @@ mod tests {
     #[test]
     fn space_estimation() {
         assert_eq!(estimate_space(r"sk-[0-9]{6}", 3).unwrap(), 1_000_000);
-        assert_eq!(estimate_space(r"sk-[A-Za-z0-9]{48}", 3).unwrap() >= 1u128 << 100, true);
+        assert!(estimate_space(r"sk-[A-Za-z0-9]{48}", 3).unwrap() >= 1u128 << 100);
     }
 
     #[test]
@@ -1204,16 +1229,11 @@ mod tests {
         for k in &dict.keys {
             assert_eq!(k.len(), 35);
             assert!(k.starts_with("sk-"));
-            assert!(k[3..]
-                .chars()
-                .all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+            assert!(k[3..].chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
         }
         // 最高位在 4000 个样本里应几乎必然覆盖全部 16 个字符；宽松断言 ≥ 8 个
-        let first: std::collections::HashSet<char> = dict
-            .keys
-            .iter()
-            .filter_map(|k| k.chars().nth(3))
-            .collect();
+        let first: std::collections::HashSet<char> =
+            dict.keys.iter().filter_map(|k| k.chars().nth(3)).collect();
         assert!(first.len() >= 8, "高位分布应均匀，实际仅有 {first:?}");
         // 同一种子 → 完全相同（断点续跑依赖这个）
         let again = generate(
@@ -1259,11 +1279,8 @@ mod tests {
         let uniq: std::collections::HashSet<&String> = dict.keys.iter().collect();
         assert_eq!(uniq.len(), dict.keys.len());
         // 第一位（十万位上的数字）不应只出现 0-5 这类前缀 —— 应覆盖全部 10 个数字
-        let first: std::collections::HashSet<char> = dict
-            .keys
-            .iter()
-            .filter_map(|k| k.chars().nth(3))
-            .collect();
+        let first: std::collections::HashSet<char> =
+            dict.keys.iter().filter_map(|k| k.chars().nth(3)).collect();
         assert_eq!(first.len(), 10, "十万位分布应覆盖全部数字，实际 {first:?}");
         // 同一种子 → 完全相同（多线程结果也必须可复现）
         let again = generate(

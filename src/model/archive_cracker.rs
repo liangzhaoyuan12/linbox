@@ -235,15 +235,112 @@ pub enum ScanEvent {
         elapsed_secs: u64,
     },
     /// 某个压缩包出错。
-    Error {
-        path: String,
-        message: String,
-    },
+    Error { path: String, message: String },
     /// 日志。
     Log(String),
     /// 全部完成。
-    Finished {
-        found: usize,
-        total: usize,
-    },
+    Finished { found: usize, total: usize },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dict_type_labels_and_all() {
+        assert_eq!(DictType::Digits.label(), "纯数字 (0-9)");
+        assert_eq!(DictType::Mixed.label(), "全部混合");
+        assert_eq!(DictType::ALL.len(), 9);
+        for t in DictType::ALL {
+            assert!(!t.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn charset_sizes_and_order() {
+        assert_eq!(DictType::Digits.charset().len(), 10);
+        assert_eq!(DictType::Lowercase.charset().len(), 26);
+        assert_eq!(DictType::Uppercase.charset().len(), 26);
+        assert_eq!(DictType::DigitsLower.charset().len(), 36);
+        assert_eq!(DictType::DigitsUpper.charset().len(), 36);
+        assert_eq!(DictType::LowerUpper.charset().len(), 52);
+        assert_eq!(DictType::DigitsLowerUpper.charset().len(), 62);
+        // 组合类型顺序：数字 → 小写 → 大写 → 特殊
+        let dl = DictType::DigitsLower.charset();
+        assert_eq!(&dl[..10], b"0123456789");
+        assert_eq!(&dl[10..], b"abcdefghijklmnopqrstuvwxyz");
+        let m = DictType::Mixed.charset();
+        let sp = DictType::Special.charset();
+        assert_eq!(m.len(), 10 + 26 + 26 + sp.len(), "混合=数字+小写+大写+特殊");
+        assert_eq!(&m[..10], b"0123456789");
+        assert_eq!(&m[10..36], b"abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(&m[36..62], b"ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+        assert_eq!(&m[62..], &sp[..], "特殊符号必须完整在末尾");
+    }
+
+    #[test]
+    fn candidates_math() {
+        let c = DictConfig {
+            dict_type: DictType::Digits,
+            min_len: 3,
+            max_len: 3,
+        };
+        assert_eq!(c.candidates_for_len(3), 1000);
+        let c = DictConfig {
+            dict_type: DictType::Lowercase,
+            min_len: 2,
+            max_len: 2,
+        };
+        assert_eq!(c.candidates_for_len(2), 676);
+        // 默认：数字 1..6 位 = 10+100+…+1,000,000
+        let d = DictConfig::default();
+        assert_eq!(d.total_candidates(), 1_111_110);
+        // 内存估算 = total * (avg_len + 24)
+        assert_eq!(d.estimate_memory(), 1_111_110 * (3 + 24));
+    }
+
+    #[test]
+    fn archive_format_from_path() {
+        assert_eq!(
+            ArchiveFormat::from_path("/a/b.zip"),
+            Some(ArchiveFormat::Zip)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path("/a/b.ZIP"),
+            Some(ArchiveFormat::Zip),
+            "大小写不敏感"
+        );
+        assert_eq!(
+            ArchiveFormat::from_path("x.7z"),
+            Some(ArchiveFormat::SevenZip)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path("x.7Z"),
+            Some(ArchiveFormat::SevenZip)
+        );
+        assert_eq!(ArchiveFormat::from_path("x.rar"), None);
+        assert_eq!(ArchiveFormat::from_path("noext"), None);
+        assert_eq!(ArchiveFormat::Zip.label(), "ZIP");
+        assert_eq!(ArchiveFormat::SevenZip.label(), "7Z");
+    }
+
+    #[test]
+    fn archive_config_rejects_unsupported() {
+        assert!(
+            ArchiveConfig::new("/tmp/no-such-thing.rar").is_none(),
+            "rar 不在支持范围，必须返回 None"
+        );
+        assert!(ArchiveConfig::new("/tmp/no-ext").is_none());
+    }
+
+    #[test]
+    fn archive_config_new_fields() {
+        // 文件不存在时也能构造：file_size=0、file_name=路径末段
+        let c = ArchiveConfig::new("/nonexistent/dir/secret.7z").expect("7z 应识别");
+        assert_eq!(c.format, ArchiveFormat::SevenZip);
+        assert_eq!(c.file_name, "secret.7z");
+        assert_eq!(c.file_size, 0);
+        assert!(c.use_global_dict, "默认走全局字典");
+        assert_eq!(c.path, "/nonexistent/dir/secret.7z");
+    }
 }

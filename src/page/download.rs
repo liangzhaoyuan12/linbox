@@ -142,7 +142,7 @@ struct Inner {
 }
 
 thread_local! {
-    static INNER: RefCell<Option<Rc<Inner>>> = RefCell::new(None);
+    static INNER: RefCell<Option<Rc<Inner>>> = const { RefCell::new(None) };
 }
 
 fn with_inner<F: FnOnce(&Inner)>(f: F) {
@@ -416,10 +416,10 @@ pub fn build() -> gtk::Widget {
     // 页面可能被重建：先停掉上一轮定时器，避免多个 tick 并发刷新
     INNER.with(|c| {
         let mut slot = c.borrow_mut();
-        if let Some(old) = slot.as_ref() {
-            if let Some(src) = old.tick_source.borrow_mut().take() {
-                src.remove();
-            }
+        if let Some(old) = slot.as_ref()
+            && let Some(src) = old.tick_source.borrow_mut().take()
+        {
+            src.remove();
         }
         *slot = Some(inner.clone());
     });
@@ -537,12 +537,12 @@ impl Inner {
             None::<&gtk::Window>,
             None::<&gio::Cancellable>,
             move |res| {
-                if let Ok(folder) = res {
-                    if let Some(path) = folder.path() {
-                        call_inner(&weak, move |i| {
-                            i.dir_entry.set_text(&path.to_string_lossy());
-                        });
-                    }
+                if let Ok(folder) = res
+                    && let Some(path) = folder.path()
+                {
+                    call_inner(&weak, move |i| {
+                        i.dir_entry.set_text(&path.to_string_lossy());
+                    });
                 }
             },
         );
@@ -604,10 +604,10 @@ impl Inner {
             .filter(|id| !seen.contains(id))
             .collect();
         for id in dead {
-            if let Some(row) = self.rows.borrow_mut().remove(&id) {
-                if row.row.parent().is_some() {
-                    self.list.remove(&row.row);
-                }
+            if let Some(row) = self.rows.borrow_mut().remove(&id)
+                && row.row.parent().is_some()
+            {
+                self.list.remove(&row.row);
             }
         }
 
@@ -653,7 +653,7 @@ impl Inner {
         if !css.is_empty() {
             row.status_lbl.add_css_class(css);
         }
-        row.status_lbl.set_text(&status_text);
+        row.status_lbl.set_text(status_text);
 
         let total = s.total_size;
         let pct = match total {
@@ -676,12 +676,12 @@ impl Inner {
 
         if s.status == TaskStatus::Downloading || s.status == TaskStatus::Pending {
             let mut txt = format!("{} · {} 线程", format_speed(s.speed), s.threads);
-            if let Some(t) = total {
-                if t > s.downloaded {
-                    let eta = format_eta(t - s.downloaded, s.speed);
-                    if !eta.is_empty() {
-                        txt.push_str(&format!(" · {eta}"));
-                    }
+            if let Some(t) = total
+                && t > s.downloaded
+            {
+                let eta = format_eta(t - s.downloaded, s.speed);
+                if !eta.is_empty() {
+                    txt.push_str(&format!(" · {eta}"));
                 }
             }
             row.speed_lbl.set_text(&txt);
@@ -706,9 +706,12 @@ impl Inner {
             let id = s.id;
             match group {
                 1 => {
-                    Self::row_btn(&row.btnbox, "media-playback-pause-symbolic", "暂停", move |i| {
-                        i.mgr.pause(id)
-                    });
+                    Self::row_btn(
+                        &row.btnbox,
+                        "media-playback-pause-symbolic",
+                        "暂停",
+                        move |i| i.mgr.pause(id),
+                    );
                     Self::row_btn(&row.btnbox, "edit-delete-symbolic", "删除", move |i| {
                         i.mgr.cancel_and_remove(id)
                     });
@@ -733,14 +736,20 @@ impl Inner {
                         "打开所在目录",
                         move |_i| Self::open_dir(&dir, &file),
                     );
-                    Self::row_btn(&row.btnbox, "edit-delete-symbolic", "移除记录", move |i| {
-                        i.mgr.remove(id)
-                    });
+                    Self::row_btn(
+                        &row.btnbox,
+                        "edit-delete-symbolic",
+                        "移除记录",
+                        move |i| i.mgr.remove(id),
+                    );
                 }
                 4 => {
-                    Self::row_btn(&row.btnbox, "edit-delete-symbolic", "移除记录", move |i| {
-                        i.mgr.remove(id)
-                    });
+                    Self::row_btn(
+                        &row.btnbox,
+                        "edit-delete-symbolic",
+                        "移除记录",
+                        move |i| i.mgr.remove(id),
+                    );
                 }
                 _ => {}
             }
@@ -791,17 +800,17 @@ pub fn shutdown() {
     INNER.with(|c| {
         let mut inner = c.borrow_mut();
         // 取消定时刷新 timer，避免空转
-        if let Some(ref inner) = *inner {
-            if let Some(src) = inner.tick_source.borrow_mut().take() {
-                src.remove();
-            }
+        if let Some(ref inner) = *inner
+            && let Some(src) = inner.tick_source.borrow_mut().take()
+        {
+            src.remove();
         }
         *inner = None;
     });
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::download::TaskStatus;
 
@@ -834,8 +843,9 @@ mod tests {
     /// 回归防护：曾经用 `Widget::unparent()` 删除隐式生成的 ListBoxRow，
     /// 会导致 ListBox 内部状态错乱（行数不减、指针失效），后续追加行时
     /// 触发 `instance_of::<ListBoxRow>` 断言崩溃，且新行渲染不出来。
-    #[test]
-    fn row_add_remove_keeps_listbox_consistent() {
+    /// 场景体（非独立 `#[test]`）：gtk4-rs 要求全进程只在一个线程初始化
+    /// GTK，本场景统一由 `notepad::tests::gtk_scenarios` 串行调用（GOAL.md 4.x 教训）。
+    pub(crate) fn row_add_remove_keeps_listbox_consistent() {
         if gtk::init().is_err() {
             // 无显示环境（CI/无头）时跳过，本用例只在有 GTK 时有效
             return;
@@ -852,7 +862,10 @@ mod tests {
             assert_eq!(row_count(&i.list), 3, "ListBox 行数与任务数不符");
 
             // 删掉中间一个 → 两行，且剩余行仍可用
-            i.sync_rows(&[snap(1, TaskStatus::Downloading), snap(3, TaskStatus::Completed)]);
+            i.sync_rows(&[
+                snap(1, TaskStatus::Downloading),
+                snap(3, TaskStatus::Completed),
+            ]);
             assert_eq!(i.rows.borrow().len(), 2);
             assert_eq!(row_count(&i.list), 2, "删除后 ListBox 行数未同步");
             assert!(i.list.row_at_index(0).is_some());

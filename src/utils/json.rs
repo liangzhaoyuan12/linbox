@@ -55,4 +55,48 @@ mod tests {
         let v = parse(r#"{"a":1}"#).unwrap();
         assert_eq!(format_compact(&v), r#"{"a":1}"#);
     }
+
+    #[test]
+    fn parses_top_level_scalars() {
+        assert_eq!(parse("42").unwrap(), serde_json::json!(42));
+        assert_eq!(parse(" true ").unwrap(), serde_json::json!(true));
+        assert_eq!(parse(r#""hi""#).unwrap(), serde_json::json!("hi"));
+        assert!(parse("null").unwrap().is_null());
+    }
+
+    #[test]
+    fn rejects_trailing_garbage_and_comma() {
+        assert!(
+            parse(r#"{"a":1} trailing"#).is_err(),
+            "尾部多余内容必须拒绝"
+        );
+        assert!(parse(r#"{"a":1,}"#).is_err(), "尾逗号必须拒绝");
+        assert!(parse("[1,2").is_err(), "未闭合数组必须拒绝");
+    }
+
+    #[test]
+    fn error_message_is_readable() {
+        let err = parse("{oops").unwrap_err();
+        assert!(err.starts_with("JSON 解析失败："), "{err}");
+        let err = parse("   ").unwrap_err();
+        assert!(err.contains("输入为空"), "{err}");
+    }
+
+    #[test]
+    fn pretty_compact_parse_roundtrip() {
+        let src = r#"{"n":[1,2,{"x":"y"}],"s":"中文","b":null}"#;
+        let v = parse(src).unwrap();
+        let compact = format_compact(&v);
+        let v2 = parse(&compact).expect("compact 输出必须能再解析");
+        assert_eq!(v, v2, "pretty/compact 往返后值必须相等");
+        assert_eq!(format_pretty(&v2), format_pretty(&v));
+        assert!(!compact.contains('\n'), "compact 必须单行");
+    }
+
+    #[test]
+    fn parses_deep_nesting() {
+        let deep = format!("{}1{}", "[".repeat(64), "]".repeat(64));
+        let v = parse(&deep).expect("64 层嵌套应可解析");
+        assert!(v.is_array());
+    }
 }

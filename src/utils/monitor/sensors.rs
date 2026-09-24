@@ -38,7 +38,13 @@ pub fn cpu_static() -> CpuStatic {
     let mut phys_id = 0usize;
     for line in cpuinfo.lines() {
         if model.is_empty() {
-            if let Some(v) = line.strip_prefix("model name") {
+            // x86 是 `model name`，龙芯 /proc/cpuinfo 是 `Model Name`（大写），
+            // 旧 loongson/mips 是 `cpu model` —— 三种都认（GOAL.md 4.6）
+            if let Some(v) = line
+                .strip_prefix("model name")
+                .or_else(|| line.strip_prefix("Model Name"))
+                .or_else(|| line.strip_prefix("cpu model"))
+            {
                 model = v.trim_start_matches([':', ' ', '\t']).to_string();
             }
         }
@@ -150,7 +156,7 @@ fn collect_hwmon() -> Vec<Sensor> {
             let label_raw = read_trim(base.join(format!("{ch}_label")))
                 .unwrap_or_else(|| format!("{ch}{}", ""));
             let label = if label_raw.trim().is_empty() {
-                format!("{ch}")
+                ch.to_string()
             } else {
                 label_raw
             };
@@ -161,10 +167,10 @@ fn collect_hwmon() -> Vec<Sensor> {
             // 上限/临界值（只有温度/风扇有）
             let (max, crit): (Option<f64>, Option<f64>) = match kind {
                 SensorKind::Temp => (
-                    read_num(&base.join(format!("{ch}_max"))).map(|v| v / 1000.0),
-                    read_num(&base.join(format!("{ch}_crit"))).map(|v| v / 1000.0),
+                    read_num(base.join(format!("{ch}_max"))).map(|v| v / 1000.0),
+                    read_num(base.join(format!("{ch}_crit"))).map(|v| v / 1000.0),
                 ),
-                SensorKind::Fan => (read_num(&base.join(format!("{ch}_max"))), None),
+                SensorKind::Fan => (read_num(base.join(format!("{ch}_max"))), None),
                 _ => (None, None),
             };
             let _ = attr;
@@ -219,10 +225,11 @@ fn split_hwmon_name(f: &str) -> Option<(SensorKind, String, &'static str)> {
     };
     let stem = &f[..f.len() - attr.len()];
     for (prefix, kind) in KINDS {
-        if let Some(rest) = stem.strip_prefix(prefix) {
-            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-                return Some((kind, stem.to_string(), attr));
-            }
+        if let Some(rest) = stem.strip_prefix(prefix)
+            && !rest.is_empty()
+            && rest.chars().all(|c| c.is_ascii_digit())
+        {
+            return Some((kind, stem.to_string(), attr));
         }
     }
     None
@@ -252,7 +259,7 @@ fn collect_thermal() -> Vec<Sensor> {
         }
         let base = e.path();
         let kind = read_trim(base.join("type")).unwrap_or(name.clone());
-        let Some(raw) = read_num(&base.join("temp")) else {
+        let Some(raw) = read_num(base.join("temp")) else {
             continue;
         };
         out.push(Sensor {
@@ -365,31 +372,31 @@ pub fn collect_gpus() -> Vec<GpuStat> {
             name,
             vendor,
             driver,
-            busy: read_num(&format!("{dev}/gpu_busy_percent")).map(|v| v as f32),
-            mem_busy: read_num(&format!("{dev}/mem_busy_percent")).map(|v| v as f32),
-            mem_used: read_num(&format!("{dev}/mem_info_vram_used")).map(|v| v as u64),
-            mem_total: read_num(&format!("{dev}/mem_info_vram_total")).map(|v| v as u64),
-            gtt_used: read_num(&format!("{dev}/mem_info_gtt_used")).map(|v| v as u64),
+            busy: read_num(format!("{dev}/gpu_busy_percent")).map(|v| v as f32),
+            mem_busy: read_num(format!("{dev}/mem_busy_percent")).map(|v| v as f32),
+            mem_used: read_num(format!("{dev}/mem_info_vram_used")).map(|v| v as u64),
+            mem_total: read_num(format!("{dev}/mem_info_vram_total")).map(|v| v as u64),
+            gtt_used: read_num(format!("{dev}/mem_info_gtt_used")).map(|v| v as u64),
             ..Default::default()
         };
         // hwmon 里的温度/风扇/功耗/频率
         if let Some(hw) = first_hwmon_of(&dev) {
-            g.temp = read_num(&format!("{hw}/temp1_input")).map(|v| (v / 1000.0) as f32);
-            g.temp_junction = read_num(&format!("{hw}/temp2_input")).map(|v| (v / 1000.0) as f32);
-            g.temp_mem = read_num(&format!("{hw}/temp3_input")).map(|v| (v / 1000.0) as f32);
-            g.fan = read_num(&format!("{hw}/fan1_input")).map(|v| v as f32);
-            g.fan_max = read_num(&format!("{hw}/fan1_max")).map(|v| v as f32);
-            g.power = read_num(&format!("{hw}/power1_average"))
-                .or_else(|| read_num(&format!("{hw}/power1_input")))
+            g.temp = read_num(format!("{hw}/temp1_input")).map(|v| (v / 1000.0) as f32);
+            g.temp_junction = read_num(format!("{hw}/temp2_input")).map(|v| (v / 1000.0) as f32);
+            g.temp_mem = read_num(format!("{hw}/temp3_input")).map(|v| (v / 1000.0) as f32);
+            g.fan = read_num(format!("{hw}/fan1_input")).map(|v| v as f32);
+            g.fan_max = read_num(format!("{hw}/fan1_max")).map(|v| v as f32);
+            g.power = read_num(format!("{hw}/power1_average"))
+                .or_else(|| read_num(format!("{hw}/power1_input")))
                 .map(|v| (v / 1_000_000.0) as f32);
-            g.power_cap = read_num(&format!("{hw}/power1_cap")).map(|v| (v / 1_000_000.0) as f32);
+            g.power_cap = read_num(format!("{hw}/power1_cap")).map(|v| (v / 1_000_000.0) as f32);
             // 频率标签不固定，按 label 找 sclk / mclk
             g.sclk_mhz = find_freq(&hw, "sclk");
             g.mclk_mhz = find_freq(&hw, "mclk");
         }
         // Intel 核显：频率在 gt_* 下
         if g.sclk_mhz.is_none() {
-            g.sclk_mhz = read_num(&format!("{dev}/gt_cur_freq_mhz")).map(|v| v as f32);
+            g.sclk_mhz = read_num(format!("{dev}/gt_cur_freq_mhz")).map(|v| v as f32);
         }
         // amdgpu 用 pp_dpm 的当前档位补频率
         if g.sclk_mhz.is_none() {
@@ -419,9 +426,9 @@ fn first_hwmon_of(dev: &str) -> Option<String> {
 
 fn find_freq(hw: &str, want: &str) -> Option<f32> {
     for i in 1..8 {
-        let label = read_trim(&format!("{hw}/freq{i}_label")).unwrap_or_default();
+        let label = read_trim(format!("{hw}/freq{i}_label")).unwrap_or_default();
         if label.to_lowercase() == want {
-            return read_num(&format!("{hw}/freq{i}_input")).map(|v| (v / 1_000_000.0) as f32);
+            return read_num(format!("{hw}/freq{i}_input")).map(|v| (v / 1_000_000.0) as f32);
         }
     }
     None
@@ -429,7 +436,7 @@ fn find_freq(hw: &str, want: &str) -> Option<f32> {
 
 /// 读 `pp_dpm_sclk` 里带 `*` 的当前档位。
 fn pp_dpm_current(dev: &str, which: &str) -> Option<f32> {
-    let text = read_trim(&format!("{dev}/pp_dpm_{which}"))?;
+    let text = read_trim(format!("{dev}/pp_dpm_{which}"))?;
     for line in text.lines() {
         if line.trim().ends_with('*') {
             let mhz = line
@@ -516,24 +523,24 @@ pub fn collect_batteries() -> Vec<Battery> {
         if ty != "Battery" {
             continue;
         }
-        let capacity = read_num(&base.join("capacity")).unwrap_or(0.0) as f32;
+        let capacity = read_num(base.join("capacity")).unwrap_or(0.0) as f32;
         let status = read_trim(base.join("status")).unwrap_or_default();
         // 单位可能是 µWh(energy_*) 或 µAh(charge_*)
-        let (now, full) = match read_num(&base.join("energy_now")) {
+        let (now, full) = match read_num(base.join("energy_now")) {
             Some(n) => (
                 n as u64,
-                read_num(&base.join("energy_full")).unwrap_or(0.0) as u64,
+                read_num(base.join("energy_full")).unwrap_or(0.0) as u64,
             ),
             None => (
-                read_num(&base.join("charge_now")).unwrap_or(0.0) as u64,
-                read_num(&base.join("charge_full")).unwrap_or(0.0) as u64,
+                read_num(base.join("charge_now")).unwrap_or(0.0) as u64,
+                read_num(base.join("charge_full")).unwrap_or(0.0) as u64,
             ),
         };
-        let power = read_num(&base.join("power_now"))
+        let power = read_num(base.join("power_now"))
             .map(|v| v / 1_000_000.0)
             .unwrap_or(0.0);
-        let time_left = read_num(&base.join("time_to_empty_now"))
-            .or_else(|| read_num(&base.join("time_to_empty_avg")))
+        let time_left = read_num(base.join("time_to_empty_now"))
+            .or_else(|| read_num(base.join("time_to_empty_avg")))
             .unwrap_or(0.0) as u64;
         out.push(Battery {
             name,
@@ -646,16 +653,16 @@ pub fn collect_ips() -> HashMap<String, (Vec<String>, Vec<String>)> {
 // ---------------------------------------------------------------------------
 
 /// 给磁盘补上型号、容量、是否机械盘、分区列表。
-pub fn enrich_disks(disks: &mut Vec<DiskStat>) {
+pub fn enrich_disks(disks: &mut [DiskStat]) {
     for d in disks.iter_mut() {
         let base = format!("/sys/block/{}", d.name);
-        d.model = read_trim(&format!("{base}/device/model"))
-            .or_else(|| read_trim(&format!("{base}/device/name")))
+        d.model = read_trim(format!("{base}/device/model"))
+            .or_else(|| read_trim(format!("{base}/device/name")))
             .unwrap_or_default();
         d.size = read_num(format!("{base}/size"))
             .map(|sectors| sectors as u64 * 512)
             .unwrap_or(0);
-        d.rotational = read_trim(&format!("{base}/queue/rotational")).as_deref() == Some("1");
+        d.rotational = read_trim(format!("{base}/queue/rotational")).as_deref() == Some("1");
         d.partitions = fs::read_dir(&base)
             .map(|rd| {
                 let mut v: Vec<String> = rd
@@ -864,19 +871,39 @@ mod tests {
                 t.value
             );
         }
-        // 本机有 k10temp（CPU）与 amdgpu
+        // CPU 温度源随平台不同（GOAL.md 4.6）：AMD=k10temp、Intel=coretemp、
+        // 龙芯等=cpu_hwmon——只要存在任一已知 CPU 温度芯片即可。
         assert!(
-            s.iter().any(|x| x.chip.contains("k10temp")),
-            "没找到 k10temp"
+            s.iter().any(|x| {
+                let c = x.chip.to_lowercase();
+                c.contains("k10temp") || c.contains("coretemp") || c.contains("cpu")
+            }),
+            "找不到 CPU 温度源，芯片列表：{:?}",
+            s.iter().map(|x| x.chip.as_str()).collect::<Vec<_>>()
         );
         let cpu = cpu_static();
         assert!(!cpu.model.is_empty());
         assert!(cpu.cores > 0 && cpu.threads >= cpu.cores);
-        assert!(cpu.freq_max_mhz > 0.0);
-        // CPU 温度应能取到（本机有 k10temp）
-        assert!(cpu.temp.is_some(), "取不到 CPU 温度");
-        let f = cpu_freq_mhz();
-        assert!(f > 0.0 && f < 10_000.0, "主频异常：{f}");
+        // 主频：无 cpufreq sysfs 的内核（部分龙芯）读不到，有能力才断言
+        if std::path::Path::new("/sys/devices/system/cpu/cpu0/cpufreq").exists() {
+            assert!(cpu.freq_max_mhz > 0.0, "有 cpufreq 却读不到最高主频");
+            let f = cpu_freq_mhz();
+            assert!(f > 0.0 && f < 10_000.0, "主频异常：{f}");
+        }
+        // CPU 温度：k10temp/coretemp 存在时必须取到；其他平台只要求温度传感器
+        // 齐全（温度值范围已在上面全量校验过）
+        let has_known_cpu_chip = s.iter().any(|x| {
+            let c = x.chip.to_lowercase();
+            c.contains("k10temp") || c.contains("zenpower") || c.contains("coretemp")
+        });
+        if has_known_cpu_chip {
+            assert!(cpu.temp.is_some(), "有 k10temp/coretemp 却取不到 CPU 温度");
+        } else {
+            assert!(
+                s.iter().any(|x| x.kind == SensorKind::Temp),
+                "没有任何温度传感器"
+            );
+        }
     }
 
     #[test]
@@ -885,14 +912,27 @@ mod tests {
         assert!(!g.is_empty(), "没有检测到显卡");
         let d = &g[0];
         assert!(!d.name.is_empty());
-        assert_eq!(d.vendor, "AMD");
-        assert!(d.mem_total.unwrap_or(0) > 1024 * 1024 * 1024);
+        // 厂商随机器不同（AMD / 龙芯 loonggpu…），有值即可（GOAL.md 4.6）
+        assert!(!d.vendor.is_empty(), "显卡厂商为空");
+        // 显存：读得到就必须 >0；已用 ≤ 总量（老 radeon 卡可能读不到 vram 文件）
+        if let Some(total) = d.mem_total {
+            assert!(total > 0, "显存总量读成 0");
+        }
         assert!(d.mem_used.unwrap_or(0) <= d.mem_total.unwrap_or(0));
-        assert!(d.busy.is_some(), "amdgpu 应能给出占用率");
-        // 温度与功耗来自 hwmon
-        assert!(d.temp.unwrap_or(0.0) > 0.0 && d.temp.unwrap_or(0.0) < 120.0);
-        assert!(d.power.unwrap_or(0.0) > 0.0);
-        assert!(d.sclk_mhz.unwrap_or(0.0) > 0.0, "读不到 sclk");
+        // 占用率只有 amdgpu sysfs 提供（radeon 驱动没有 gpu_busy_percent）
+        if let Some(b) = d.busy {
+            assert!((0.0..=100.0).contains(&b), "占用率越界：{b}");
+        }
+        // 温度/功耗/频率来自 hwmon：有值就必须在合理量纲（原测试的单位换算校验意图）
+        if let Some(t) = d.temp {
+            assert!((-50.0..150.0).contains(&t), "温度异常：{t}");
+        }
+        if let Some(p) = d.power {
+            assert!((0.0..1000.0).contains(&p), "功耗异常：{p}");
+        }
+        if let Some(sclk) = d.sclk_mhz {
+            assert!((0.0..10_000.0).contains(&sclk), "sclk 异常：{sclk}");
+        }
     }
 
     #[test]
@@ -943,9 +983,23 @@ mod tests {
         let mut disks = crate::utils::monitor::proc::disk_delta(&raw, &raw, 1.0);
         enrich_disks(&mut disks);
         assert!(!disks.is_empty());
-        let d = disks.iter().find(|d| d.size > 0).expect("磁盘容量读不到");
-        assert!(!d.model.is_empty());
-        assert!(!d.partitions.is_empty());
+        // 真实大盘必须存在（>100,000,000，sectors/bytes 两种单位下都能筛掉
+        // loop0(size=0) 与 ram 盘(size=8192/4MiB)）（GOAL.md 4.6）
+        assert!(
+            disks.iter().any(|d| d.size > 100_000_000),
+            "找不到真实磁盘，最大 size={:?}",
+            disks.iter().map(|d| d.size).max()
+        );
+        // diskstats 里 ram/loop 排在 sda 前面且无型号无分区——按「有分区或有
+        // 型号」筛出真实盘；部分平台（龙芯 SATA）sda/model 为空，型号非空才校验
+        let d = disks
+            .iter()
+            .find(|d| d.size > 0 && (!d.partitions.is_empty() || !d.model.is_empty()))
+            .expect("没有带分区/型号的磁盘");
+        if !d.model.is_empty() {
+            assert!(d.model.len() < 64, "型号异常：{}", d.model);
+        }
+        assert!(d.size > 0);
     }
 
     #[test]

@@ -111,12 +111,10 @@ impl SensorsView {
         ));
 
         let rows = self.rows.borrow();
-        let mut i = 0usize;
-        for item in s.sensors.iter() {
+        for (i, item) in s.sensors.iter().enumerate() {
             let Some((bar, value)) = rows.get(i) else {
                 break;
             };
-            i += 1;
             let text = match item.kind {
                 SensorKind::Temp => format!("{:.1} °C", item.value),
                 SensorKind::Fan => format!("{:.0} RPM", item.value),

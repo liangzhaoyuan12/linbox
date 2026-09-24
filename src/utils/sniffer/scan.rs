@@ -194,7 +194,10 @@ pub fn start(params: ScanParams, tx: Sender<ScanEvent>) -> Control {
         .build()
         .expect("构建异步 HTTP 客户端失败");
     let ctx = Arc::new(Ctx {
-        params: ScanParams { start_index, ..params },
+        params: ScanParams {
+            start_index,
+            ..params
+        },
         shared: Arc::clone(&shared),
         interval,
         client,
@@ -219,8 +222,7 @@ async fn worker(ctx: Arc<Ctx>, tx: Sender<ScanEvent>) {
             break;
         }
         // 暂停：轮询等待，期间仍可被 stop 打断
-        while ctx.shared.pause.load(Ordering::Relaxed) && !ctx.shared.stop.load(Ordering::Relaxed)
-        {
+        while ctx.shared.pause.load(Ordering::Relaxed) && !ctx.shared.stop.load(Ordering::Relaxed) {
             tokio::time::sleep(PAUSE_POLL).await;
         }
         if ctx.shared.stop.load(Ordering::Relaxed) {
@@ -364,10 +366,10 @@ async fn write_checkpoint(ctx: &Ctx) {
         valid: ctx.shared.valid.load(Ordering::Relaxed),
         updated_at: probe::now_unix(),
     };
-    if ctx.params.write_checkpoint {
-        if let Err(e) = store::save_checkpoint(&cp) {
-            eprintln!("[linbox] 断点写入失败：{e}");
-        }
+    if ctx.params.write_checkpoint
+        && let Err(e) = store::save_checkpoint(&cp)
+    {
+        eprintln!("[linbox] 断点写入失败：{e}");
     }
 }
 
@@ -420,7 +422,10 @@ mod tests {
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 let (status_line, body) = if request.contains("Bearer sk-good") {
-                    ("HTTP/1.1 200 OK", r#"{"choices":[{"message":{"content":"hi"}}]}"#)
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"choices":[{"message":{"content":"hi"}}]}"#,
+                    )
                 } else {
                     (
                         "HTTP/1.1 401 Unauthorized",
@@ -447,7 +452,7 @@ mod tests {
             .collect();
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let control = start(
+        let _control = start(
             ScanParams {
                 platform: "本地假 API".into(),
                 fingerprint: "test".into(),

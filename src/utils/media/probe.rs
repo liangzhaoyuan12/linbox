@@ -71,7 +71,11 @@ pub fn parse(json: &str) -> Result<MediaInfo, String> {
     let mut info = MediaInfo::default();
 
     if let Some(fmt) = v.get("format") {
-        info.format_name = fmt.get("format_name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        info.format_name = fmt
+            .get("format_name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         info.duration_sec = fmt
             .get("duration")
             .and_then(|x| x.as_str())
@@ -91,9 +95,19 @@ pub fn parse(json: &str) -> Result<MediaInfo, String> {
 
     if let Some(streams) = v.get("streams").and_then(|x| x.as_array()) {
         for s in streams {
-            let mut st = StreamInfo::default();
-            st.kind = s.get("codec_type").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            st.codec = s.get("codec_name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let mut st = StreamInfo {
+                kind: s
+                    .get("codec_type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                ..Default::default()
+            };
+            st.codec = s
+                .get("codec_name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             st.width = s.get("width").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             st.height = s.get("height").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             st.frame_rate = s
@@ -165,5 +179,51 @@ mod tests {
         assert_eq!(info.duration_sec, 12.5);
         assert!(info.duration_text().starts_with("00:00:12"));
         assert_eq!(info.streams[1].language, "eng");
+    }
+
+    #[test]
+    fn rejects_garbage_json() {
+        let err = parse("{oops").unwrap_err();
+        assert!(err.contains("JSON 解析失败"), "{err}");
+        assert!(parse("").is_err());
+    }
+
+    #[test]
+    fn missing_fields_fall_back_to_defaults() {
+        let info = parse("{}").expect("空对象应给默认值");
+        assert_eq!(info.format_name, "");
+        assert_eq!(info.duration_sec, 0.0);
+        assert!(info.streams.is_empty());
+        assert_eq!(info.duration_text(), "00:00:00");
+        assert_eq!(info.resolution_text(), "");
+        assert_eq!(info.video_codec(), "");
+    }
+
+    #[test]
+    fn duration_text_hours_minutes_seconds() {
+        let info = MediaInfo {
+            duration_sec: 3723.7,
+            ..Default::default()
+        };
+        assert_eq!(info.duration_text(), "01:02:03");
+        let info = MediaInfo {
+            duration_sec: 3600.0 * 100.0,
+            ..Default::default()
+        };
+        assert!(info.duration_text().starts_with("100:"), "超小时不留零");
+    }
+
+    #[test]
+    fn resolution_and_codec_edge_cases() {
+        // 分辨率为 0 的视频流不算分辨率
+        let j = r#"{"streams":[{"codec_type":"video","codec_name":"png","width":0,"height":0}]}"#;
+        let info = parse(j).unwrap();
+        assert_eq!(info.resolution_text(), "");
+        assert_eq!(info.video_codec(), "png");
+        // 没有视频流
+        let j = r#"{"streams":[{"codec_type":"audio","codec_name":"aac"}]}"#;
+        let info = parse(j).unwrap();
+        assert_eq!(info.video_codec(), "");
+        assert_eq!(info.resolution_text(), "");
     }
 }

@@ -35,7 +35,7 @@ fn with_inner<F: FnOnce(&Inner)>(f: F) {
     let Some(inner) = INNER.with(|i| i.try_borrow().ok().and_then(|b| b.clone())) else {
         return;
     };
-    f(&*inner);
+    f(&inner);
 }
 
 pub fn shutdown() {
@@ -236,11 +236,11 @@ impl Inner {
         let lines = self.lines.borrow();
         let mut all_paths: Vec<String> = Vec::new();
         for line in lines.iter() {
-            if let Line::Env { key, value, .. } = line {
-                if key == "PATH" {
-                    let (ps, _) = env_editor::parse_path_value(value);
-                    all_paths.extend(ps);
-                }
+            if let Line::Env { key, value, .. } = line
+                && key == "PATH"
+            {
+                let (ps, _) = env_editor::parse_path_value(value);
+                all_paths.extend(ps);
             }
         }
         drop(lines);
@@ -309,10 +309,8 @@ impl Inner {
         self.path_rows.borrow_mut().push(handle);
         self.path_empty
             .set_visible(self.path_rows.borrow().is_empty());
-        if focus {
-            if let Some(h) = self.path_rows.borrow().last() {
-                h.path.grab_focus();
-            }
+        if focus && let Some(h) = self.path_rows.borrow().last() {
+            h.path.grab_focus();
         }
         self.mark_dirty();
     }
@@ -469,10 +467,8 @@ impl Inner {
             exported: true,
             raw: None,
         });
-        if focus {
-            if let Some(h) = self.env_rows.borrow().last() {
-                h.key.grab_focus();
-            }
+        if focus && let Some(h) = self.env_rows.borrow().last() {
+            h.key.grab_focus();
         }
     }
 
@@ -482,10 +478,8 @@ impl Inner {
             command: String::new(),
             raw: None,
         });
-        if focus {
-            if let Some(h) = self.alias_rows.borrow().last() {
-                h.key.grab_focus();
-            }
+        if focus && let Some(h) = self.alias_rows.borrow().last() {
+            h.key.grab_focus();
         }
     }
 
@@ -627,7 +621,7 @@ impl Inner {
                 return;
             }
         };
-        let shell = self.shell.borrow().clone();
+        let shell = *self.shell.borrow();
         let content = env_editor::serialize(&lines, &shell);
         let Some(user) = self.current_user.borrow().clone() else {
             self.toast("尚未选择用户");
@@ -662,7 +656,7 @@ impl Inner {
             Ok(()) => {
                 self.file_exists.set(true);
                 // 以刚写入的内容重新解析，保证列表与磁盘一致
-                let shell = self.shell.borrow().clone();
+                let shell = *self.shell.borrow();
                 *self.lines.borrow_mut() = env_editor::parse(content, &shell);
                 self.rebuild_all();
                 self.mark_clean();

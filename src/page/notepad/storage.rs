@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -87,13 +87,12 @@ fn write_map_to_zip(path: &Path, map: &HashMap<String, Vec<u8>>) -> Result<(), S
     let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     // 按路径排序保证 ZIP 内容稳定
     let mut entries: Vec<(&String, &Vec<u8>)> = map.iter().collect();
-    entries.sort_by_key(|(k, _)| k.clone());
+    entries.sort_by_key(|(k, _)| (*k).clone());
     for (name, data) in entries {
-        zip.start_file(name, opts)
-            .map_err(|e| e.to_string())?;
+        zip.start_file(name, opts).map_err(|e| e.to_string())?;
         zip.write_all(data).map_err(|e| e.to_string())?;
     }
-    let mut f = zip.finish().map_err(|e| format!("写入 ZIP 失败：{e}"))?;
+    let f = zip.finish().map_err(|e| format!("写入 ZIP 失败：{e}"))?;
     f.sync_all().map_err(|e| format!("fsync 失败：{e}"))?;
     drop(f);
     fs::rename(&tmp_path, path).map_err(|e| format!("原子重命名失败：{e}"))
@@ -183,12 +182,12 @@ fn collect_dir_recursive(base: &Path, prefix: &str, map: &mut HashMap<String, Ve
 fn migrate_all_dirs() {
     if let Ok(dir) = fs::read_dir(entries_dir()) {
         for e in dir.flatten() {
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                if let Some(name) = e.file_name().to_str() {
-                    // 只处理看起来像 hex ID 的目录
-                    if name.len() == 32 && name.chars().all(|c| c.is_ascii_hexdigit()) {
-                        migrate_dir_to_zip(name);
-                    }
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && let Some(name) = e.file_name().to_str()
+            {
+                // 只处理看起来像 hex ID 的目录
+                if name.len() == 32 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+                    migrate_dir_to_zip(name);
                 }
             }
         }
@@ -218,10 +217,10 @@ pub fn load_all() -> Vec<MemoMeta> {
             if !path.extension().map(|ext| ext == "zip").unwrap_or(false) {
                 continue;
             }
-            if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
-                if let Some(meta) = load_meta(id) {
-                    list.push(meta);
-                }
+            if let Some(id) = path.file_stem().and_then(|s| s.to_str())
+                && let Some(meta) = load_meta(id)
+            {
+                list.push(meta);
             }
         }
     }
@@ -583,7 +582,9 @@ pub fn import_zip(path: &Path) -> Result<(usize, usize), String> {
             continue;
         }
         // 读取条目 ZIP 的字节并写到本地
-        let Some(mut entry) = outer.by_index(i).ok() else { continue };
+        let Some(mut entry) = outer.by_index(i).ok() else {
+            continue;
+        };
         let mut data = Vec::new();
         entry.read_to_end(&mut data).map_err(|e| e.to_string())?;
         fs::write(entry_zip(id), data).map_err(|e| format!("写入条目失败：{e}"))?;
@@ -601,16 +602,16 @@ pub fn import_zip(path: &Path) -> Result<(usize, usize), String> {
             }
             Err(_) => continue,
         };
-        if let Some(rest) = name.strip_prefix("entry-") {
-            if let Some(id) = rest.split('/').next() {
-                let id = id.to_string();
-                let prefix = format!("entry-{id}");
-                if !prefixes.iter().any(|(p, _)| p == &prefix)
-                    && id.len() == 32
-                    && id.chars().all(|c| c.is_ascii_hexdigit())
-                {
-                    prefixes.push((prefix, id));
-                }
+        if let Some(rest) = name.strip_prefix("entry-")
+            && let Some(id) = rest.split('/').next()
+        {
+            let id = id.to_string();
+            let prefix = format!("entry-{id}");
+            if !prefixes.iter().any(|(p, _)| p == &prefix)
+                && id.len() == 32
+                && id.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                prefixes.push((prefix, id));
             }
         }
     }
@@ -641,7 +642,9 @@ pub fn import_zip(path: &Path) -> Result<(usize, usize), String> {
         for dir in ["inline", "files", "images"] {
             let head = format!("{prefix}/{dir}/");
             for i in 0..outer.len() {
-                let Some(entry) = outer.by_index(i).ok() else { continue };
+                let Some(entry) = outer.by_index(i).ok() else {
+                    continue;
+                };
                 let name = entry.name().to_string();
                 let Some(rest) = name.strip_prefix(&head) else {
                     continue;
@@ -669,10 +672,7 @@ pub fn import_zip(path: &Path) -> Result<(usize, usize), String> {
 }
 
 /// 从外层 ZIP 读取指定条目的原始字节。
-fn read_zip_entry_bytes(
-    archive: &mut zip::ZipArchive<fs::File>,
-    name: &str,
-) -> Option<Vec<u8>> {
+fn read_zip_entry_bytes(archive: &mut zip::ZipArchive<fs::File>, name: &str) -> Option<Vec<u8>> {
     let mut entry = archive.by_name(name).ok()?;
     let mut data = Vec::new();
     entry.read_to_end(&mut data).ok();

@@ -154,10 +154,135 @@ pub fn restart_fcitx5() -> Result<String, String> {
         .map_err(|e| format!("无法启动 fcitx5：{e}（请确认已安装）"))?;
 
     if !status.success() {
-        return Err(format!(
-            "fcitx5 -rd 退出码 {}",
-            status.code().unwrap_or(-1)
-        ));
+        return Err(format!("fcitx5 -rd 退出码 {}", status.code().unwrap_or(-1)));
     }
     Ok("fcitx5 -rd 已执行，输入法进程已重启。".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_set() -> String {
+        REQUIRED.iter().map(|(n, v)| format!("{n}={v}\n")).collect()
+    }
+
+    #[test]
+    fn missing_all_when_empty() {
+        let (configured, missing) = compute_missing("");
+        assert_eq!(configured, 0);
+        assert_eq!(missing.len(), REQUIRED.len());
+        // 顺序即 REQUIRED 顺序，首个是 GTK_IM_MODULE
+        assert_eq!(missing[0].0, "GTK_IM_MODULE");
+        assert_eq!(missing[0].1, "fcitx");
+        // 值含 @ 的不能被转义/截断
+        let xm = missing.iter().find(|(n, _)| n == "XMODIFIERS").unwrap();
+        assert_eq!(xm.1, "@im=fcitx");
+    }
+
+    #[test]
+    fn counts_configured_partial() {
+        let content = "GTK_IM_MODULE=fcitx\nQT_IM_MODULE=ibus\n";
+        let (configured, missing) = compute_missing(content);
+        assert_eq!(configured, 2);
+        assert_eq!(missing.len(), REQUIRED.len() - 2);
+        assert!(!missing.iter().any(|(n, _)| n == "GTK_IM_MODULE"));
+    }
+
+    #[test]
+    fn indented_line_counts() {
+        let (configured, _) = compute_missing("    GTK_IM_MODULE=fcitx\n");
+        assert_eq!(configured, 1, "前导空白应被忽略");
+    }
+
+    #[test]
+    fn longer_name_with_suffix_not_counted() {
+        // `GTK_IM_MODULE_EXTRA=1` 不是以 `GTK_IM_MODULE=` 开头，不能算已配置
+        let (configured, missing) = compute_missing("GTK_IM_MODULE_EXTRA=1\n");
+        assert_eq!(configured, 0);
+        assert_eq!(missing.len(), REQUIRED.len());
+    }
+
+    #[test]
+    fn case_sensitive() {
+        let (configured, _) = compute_missing("gtk_im_module=fcitx\n");
+        assert_eq!(configured, 0, "变量名区分大小写");
+    }
+
+    #[test]
+    fn no_equals_not_counted() {
+        let (configured, _) = compute_missing("GTK_IM_MODULE\n");
+        assert_eq!(configured, 0, "没有 = 的行不算已配置");
+    }
+
+    #[test]
+    fn comment_not_counted() {
+        let (configured, _) = compute_missing("# GTK_IM_MODULE=fcitx\n");
+        assert_eq!(configured, 0, "注释行不算已配置");
+    }
+
+    #[test]
+    fn all_configured_yields_no_missing() {
+        let (configured, missing) = compute_missing(&all_set());
+        assert_eq!(configured, REQUIRED.len());
+        assert!(missing.is_empty());
+    }
+
+    /// GOAL 4.2：真实样本 —— 本机 /etc/environment 全文（fcitx 输入法七件套），
+    /// 逐字节抄录为测试常量（不依赖运行时读文件）。
+    const REAL_ETC_ENVIRONMENT: &str = "GTK_IM_MODULE=fcitx\nQT_IM_MODULE=fcitx\nXMODIFIERS=@im=fcitx\nINPUT_METHOD=fcitx\nSDL_IM_MODULE=fcitx\nGLFW_IM_MODULE=fcitx\nXIM=fcitx\n";
+
+    #[test]
+    fn real_etc_environment_fully_configured() {
+        let (configured, missing) = compute_missing(REAL_ETC_ENVIRONMENT);
+        assert_eq!(configured, 7, "7 行 KEY=VALUE 全部计为已配置");
+        let names: Vec<&str> = missing.iter().map(|(n, _)| n.as_str()).collect();
+        // 本机七项全是 fcitx：REQUIRED 里的输入法三项必须已配置
+        for present in ["GTK_IM_MODULE", "QT_IM_MODULE", "XMODIFIERS"] {
+            assert!(
+                !names.contains(&present),
+                "{present} 本机已配置不该进缺失列表"
+            );
+        }
+        // 已配置齐的环境再生成追加内容应为空
+        assert!(build_additions(&missing).is_empty(), "缺失为空则不追加");
+    }
+
+    #[test]
+    fn build_additions_empty_is_empty() {
+        assert_eq!(build_additions(&[]), "");
+    }
+
+    #[test]
+    fn build_additions_header_and_lines() {
+        let s = build_additions(&[("A".into(), "1".into()), ("B".into(), "2".into())]);
+        assert!(s.contains("linbox 添加"), "应带说明注释头");
+        assert!(s.contains("\nA=1\n"));
+        assert!(s.contains("\nB=2\n"));
+        assert!(s.ends_with('\n'));
+    }
+
+    #[test]
+    fn build_additions_keeps_at_sign() {
+        let s = build_additions(&[("XMODIFIERS".into(), "@im=fcitx".into())]);
+        assert!(s.contains("XMODIFIERS=@im=fcitx"), "@ 不能被转义");
+    }
+
+    #[test]
+    fn roundtrip_missing_to_content_then_clean() {
+        // 空内容 → 算缺失 → 生成追加 → 再算应全部配置（GOAL 4.2 golden 往返）
+        let (configured0, missing) = compute_missing("");
+        assert_eq!(configured0, 0);
+        let additions = build_additions(&missing);
+        let full = format!("{}{}", all_set_already_absent(&additions), additions);
+        let (configured1, missing1) = compute_missing(&full);
+        assert_eq!(configured1, REQUIRED.len());
+        assert!(missing1.is_empty());
+    }
+
+    /// 测试辅助：原内容为空时就是追加文本本身。
+    fn all_set_already_absent(additions: &str) -> String {
+        let _ = additions;
+        String::new()
+    }
 }

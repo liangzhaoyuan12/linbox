@@ -234,15 +234,15 @@ impl ExcludeSizeRange {
     }
 
     pub fn is_excluded(&self, size: usize) -> bool {
-        if let Some(min) = self.min {
-            if size < min {
-                return false;
-            }
+        if let Some(min) = self.min
+            && size < min
+        {
+            return false;
         }
-        if let Some(max) = self.max {
-            if size > max {
-                return false;
-            }
+        if let Some(max) = self.max
+            && size > max
+        {
+            return false;
         }
         self.min.is_some() || self.max.is_some()
     }
@@ -339,8 +339,10 @@ mod tests {
 
     #[test]
     fn config_validation() {
-        let mut c = PathScanConfig::default();
-        c.target_url = "http://example.com".into();
+        let mut c = PathScanConfig {
+            target_url: "http://example.com".into(),
+            ..Default::default()
+        };
         assert!(c.validate().is_ok());
 
         c.target_url = "".into();
@@ -356,8 +358,10 @@ mod tests {
 
     #[test]
     fn exclude_status_parsing() {
-        let mut c = PathScanConfig::default();
-        c.exclude_status = "404,403, 301".into();
+        let c = PathScanConfig {
+            exclude_status: "404,403, 301".into(),
+            ..Default::default()
+        };
         let excluded = c.parse_exclude_status();
         assert_eq!(excluded, vec![404, 403, 301]);
     }

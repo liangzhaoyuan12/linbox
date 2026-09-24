@@ -397,16 +397,20 @@ mod tests {
 
         let mut procs: Vec<crate::model::monitor::Process> = Vec::new();
         for (i, k) in kids.iter().enumerate() {
-            let mut p = crate::model::monitor::Process::default();
-            p.pid = *k;
-            p.ppid = pid;
-            p.name = format!("sleep{i}");
+            let p = crate::model::monitor::Process {
+                pid: *k,
+                ppid: pid,
+                name: format!("sleep{i}"),
+                ..Default::default()
+            };
             procs.push(p);
         }
-        let mut sh = crate::model::monitor::Process::default();
-        sh.pid = pid;
-        sh.ppid = 0;
-        sh.name = "sh".into();
+        let sh = crate::model::monitor::Process {
+            pid,
+            ppid: 0,
+            name: "sh".into(),
+            ..Default::default()
+        };
         procs.push(sh);
 
         // descendants_of 顺序：父 + 子
@@ -448,8 +452,10 @@ mod tests {
         // 当前用户/ root 判断必须自洽
         assert_eq!(is_root(), current_uid() == 0);
         // 自己的进程一定可控制
-        let mut p = crate::model::monitor::Process::default();
-        p.uid = current_uid();
+        let mut p = crate::model::monitor::Process {
+            uid: current_uid(),
+            ..Default::default()
+        };
         assert!(can_control(&p));
         // pid 1（root）在普通用户下不可控制
         p.uid = 0;

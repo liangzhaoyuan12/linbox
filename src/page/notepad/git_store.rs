@@ -66,6 +66,9 @@ impl GitConfig {
 
 impl GitConfig {
     /// 带认证的 URL（HTTPS 时嵌入用户名密码；SSH 时原样返回）。
+    // 仅由单测断言格式（askpass 流程当前走 plain URL + 环境变量注入，
+    // 见文件头注释）；页面接线自定义凭证时恢复调用。
+    #[allow(dead_code)]
     fn auth_url(&self) -> String {
         if self.url.starts_with("https://") && !self.username.is_empty() {
             // https://user:pass@github.com/user/repo.git
@@ -270,8 +273,7 @@ fn git_exec_auth_raw(args: &[&str], config: &GitConfig) -> (i32, String, String)
 pub fn verify_access(config: &GitConfig) -> GitResult<()> {
     if !config.username.is_empty() {
         let plain = config.plain_url();
-        let (code, _, _) =
-            git_exec_auth_raw(&["ls-remote", "--exit-code", plain, "HEAD"], config);
+        let (code, _, _) = git_exec_auth_raw(&["ls-remote", "--exit-code", plain, "HEAD"], config);
         if code == 0 || code == 2 {
             return Ok(());
         }
@@ -306,9 +308,7 @@ fn verify_url(url: &str) -> GitResult<()> {
 fn ssh_to_https(ssh_url: &str) -> String {
     // git@github.com:user/repo.git → https://github.com/user/repo.git
     // git@gitee.com:user/repo.git → https://gitee.com/user/repo.git
-    let rest = ssh_url
-        .strip_prefix("git@")
-        .unwrap_or(ssh_url);
+    let rest = ssh_url.strip_prefix("git@").unwrap_or(ssh_url);
     if let Some((host, path)) = rest.split_once(':') {
         format!("https://{host}/{path}")
     } else {
@@ -355,14 +355,17 @@ pub fn ensure_repo(config: &GitConfig) -> GitResult<PathBuf> {
 
     // 尝试 clone（用 plain_url，认证通过 GIT_ASKPASS 传递）
     let plain = config.plain_url();
-    let (code, _, stderr) = git_exec_auth_raw(&[
-        "clone",
-        "--branch",
-        &config.branch,
-        "--single-branch",
-        plain,
-        dir.to_str().unwrap_or("."),
-    ], config);
+    let (code, _, stderr) = git_exec_auth_raw(
+        &[
+            "clone",
+            "--branch",
+            &config.branch,
+            "--single-branch",
+            plain,
+            dir.to_str().unwrap_or("."),
+        ],
+        config,
+    );
     if code != 0 {
         // clone 失败 → 可能是空仓库，尝试初始化
         // 中文 git: "远程分支 main 在上游 origin 未发现"
@@ -411,7 +414,10 @@ fn init_empty_repo(dir: &Path, config: &GitConfig) -> GitResult<()> {
     let _ = git_exec_auth(dir, &["remote", "add", "origin", &plain], config);
     // 设置本地 git 用户信息（commit 需要）
     let _ = git_exec(dir, &["config", "user.name", config.effective_user_name()]);
-    let _ = git_exec(dir, &["config", "user.email", config.effective_user_email()]);
+    let _ = git_exec(
+        dir,
+        &["config", "user.email", config.effective_user_email()],
+    );
     // 创建 .gitignore 避免空仓库无法 commit
     let gitignore = dir.join(".gitignore");
     if !gitignore.exists() {
@@ -505,7 +511,10 @@ fn commit_and_push(dir: &Path, config: &GitConfig, message: &str) -> GitResult<(
     if has_changes {
         // 确保本地有 git 用户信息（commit 需要）
         let _ = git_exec(dir, &["config", "user.name", config.effective_user_name()]);
-        let _ = git_exec(dir, &["config", "user.email", config.effective_user_email()]);
+        let _ = git_exec(
+            dir,
+            &["config", "user.email", config.effective_user_email()],
+        );
         let (code, _, stderr) = git_exec(dir, &["commit", "-m", message]);
         if code != 0 && !stderr.contains("nothing to commit") {
             return Err(format!("commit 失败：{stderr}"));
@@ -553,10 +562,10 @@ pub fn read_all_entries(dir: &Path) -> Vec<super::storage::MemoMeta> {
                 continue;
             }
             let meta_path = e.path().join("meta.json");
-            if let Ok(text) = fs::read_to_string(&meta_path) {
-                if let Ok(m) = serde_json::from_str::<super::storage::MemoMeta>(&text) {
-                    list.push(m);
-                }
+            if let Ok(text) = fs::read_to_string(&meta_path)
+                && let Ok(m) = serde_json::from_str::<super::storage::MemoMeta>(&text)
+            {
+                list.push(m);
             }
         }
     }
@@ -587,10 +596,10 @@ pub fn list_inline(dir: &Path, id: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&inline_dir) {
         for e in entries.flatten() {
-            if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                if let Some(name) = e.file_name().to_str() {
-                    out.push(name.to_string());
-                }
+            if e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && let Some(name) = e.file_name().to_str()
+            {
+                out.push(name.to_string());
             }
         }
     }
@@ -604,10 +613,10 @@ pub fn list_files(dir: &Path, id: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(&files_dir) {
         for e in entries.flatten() {
-            if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                if let Some(name) = e.file_name().to_str() {
-                    out.push(name.to_string());
-                }
+            if e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && let Some(name) = e.file_name().to_str()
+            {
+                out.push(name.to_string());
             }
         }
     }
@@ -704,8 +713,10 @@ pub fn sync_git_backend(
 
     // 2. 读取远端所有条目
     let remote_entries = read_all_entries(&work_dir);
-    let remote_map: std::collections::HashMap<String, super::storage::MemoMeta> =
-        remote_entries.into_iter().map(|m| (m.id.clone(), m)).collect();
+    let remote_map: std::collections::HashMap<String, super::storage::MemoMeta> = remote_entries
+        .into_iter()
+        .map(|m| (m.id.clone(), m))
+        .collect();
 
     // 3. 处理远端删除
     for id in deleted_ids {
@@ -790,8 +801,10 @@ pub fn pull_only(config: &GitConfig) -> Result<usize, String> {
 
     // 读取远端所有条目
     let remote_entries = read_all_entries(&work_dir);
-    let remote_map: std::collections::HashMap<String, super::storage::MemoMeta> =
-        remote_entries.into_iter().map(|m| (m.id.clone(), m)).collect();
+    let remote_map: std::collections::HashMap<String, super::storage::MemoMeta> = remote_entries
+        .into_iter()
+        .map(|m| (m.id.clone(), m))
+        .collect();
 
     // 读取本地条目
     let local_metas = super::storage::load_all();
@@ -852,7 +865,14 @@ pub fn push_only(
                 Some((n.clone(), data))
             })
             .collect();
-        write_entry(&work_dir, &local_meta.id, local_meta, &content, &inline, &attachments);
+        write_entry(
+            &work_dir,
+            &local_meta.id,
+            local_meta,
+            &content,
+            &inline,
+            &attachments,
+        );
     }
 
     // commit + push
@@ -864,4 +884,127 @@ pub fn push_only(
     commit_and_push(&work_dir, config, &msg)?;
 
     Ok(local_metas.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(url: &str) -> GitConfig {
+        GitConfig {
+            url: url.to_string(),
+            branch: "main".to_string(),
+            user_name: String::new(),
+            user_email: String::new(),
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+
+    #[test]
+    fn default_branch_is_main() {
+        assert_eq!(default_branch(), "main");
+    }
+
+    #[test]
+    fn effective_user_name_defaults_and_custom() {
+        let c = cfg("https://github.com/u/r.git");
+        assert_eq!(c.effective_user_name(), "linbox");
+        let mut c2 = c.clone();
+        c2.user_name = "张三".into();
+        assert_eq!(c2.effective_user_name(), "张三");
+    }
+
+    #[test]
+    fn effective_user_email_defaults_and_custom() {
+        let c = cfg("https://github.com/u/r.git");
+        assert_eq!(c.effective_user_email(), "linbox@notepad.local");
+        let mut c2 = c.clone();
+        c2.user_email = "me@example.com".into();
+        assert_eq!(c2.effective_user_email(), "me@example.com");
+    }
+
+    #[test]
+    fn auth_url_embeds_credentials_for_https() {
+        let mut c = cfg("https://github.com/u/r.git");
+        c.username = "alice".into();
+        c.password = "s3cr3t".into();
+        assert_eq!(c.auth_url(), "https://alice:s3cr3t@github.com/u/r.git");
+    }
+
+    #[test]
+    fn auth_url_plain_without_username() {
+        let c = cfg("https://github.com/u/r.git");
+        assert_eq!(c.auth_url(), "https://github.com/u/r.git");
+    }
+
+    #[test]
+    fn auth_url_plain_for_non_https() {
+        // 非 https（http:// 或 ssh）都不嵌凭证
+        let mut c = cfg("http://git.local/u/r.git");
+        c.username = "bob".into();
+        assert_eq!(c.auth_url(), "http://git.local/u/r.git");
+        let mut s = cfg("git@github.com:u/r.git");
+        s.username = "bob".into();
+        assert_eq!(s.auth_url(), "git@github.com:u/r.git");
+    }
+
+    #[test]
+    fn needs_askpass_only_https_with_user() {
+        let mut c = cfg("https://github.com/u/r.git");
+        assert!(!c.needs_askpass());
+        c.username = "u".into();
+        assert!(c.needs_askpass());
+        let mut h = cfg("http://x/y.git");
+        h.username = "u".into();
+        assert!(!h.needs_askpass(), "http 不走 askpass");
+        let mut ssh = cfg("git@github.com:u/r.git");
+        ssh.username = "u".into();
+        assert!(!ssh.needs_askpass(), "ssh 不走 askpass");
+    }
+
+    #[test]
+    fn plain_url_never_contains_credentials() {
+        let mut c = cfg("https://github.com/u/r.git");
+        c.username = "alice".into();
+        c.password = "s3cr3t".into();
+        assert_eq!(c.plain_url(), "https://github.com/u/r.git");
+    }
+
+    #[test]
+    fn serde_defaults_for_missing_fields() {
+        let c: GitConfig = serde_json::from_str(r#"{"url":"https://github.com/u/r.git"}"#).unwrap();
+        assert_eq!(c.branch, "main", "branch 缺省应为 main");
+        assert_eq!(c.user_name, "");
+        assert_eq!(c.user_email, "");
+        assert_eq!(c.username, "");
+        assert_eq!(c.password, "");
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_all_fields() {
+        let mut c = cfg("https://github.com/u/r.git");
+        c.branch = "dev".into();
+        c.user_name = "n".into();
+        c.user_email = "e@x".into();
+        c.username = "u".into();
+        c.password = "p".into();
+        let s = serde_json::to_string(&c).unwrap();
+        let back: GitConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn repo_work_dir_is_stable_hex_named() {
+        let url = "https://github.com/u/stable-test.git";
+        let a = repo_work_dir(url);
+        let b = repo_work_dir(url);
+        assert_eq!(a, b, "同 URL 必须映射到同一目录");
+        let other = repo_work_dir("https://github.com/u/other.git");
+        assert_ne!(a, other, "不同 URL 不能撞目录");
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name.len(), 16, "目录名应为16 位十六进制 hash");
+        assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(a.to_string_lossy().contains("git-repos"));
+    }
 }

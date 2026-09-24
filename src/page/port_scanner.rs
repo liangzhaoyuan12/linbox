@@ -86,13 +86,22 @@ fn button_row(buttons: &[&gtk::Button]) -> gtk::Box {
 
 fn now_text() -> String {
     glib::DateTime::now_local()
-        .map(|dt| dt.format("%H:%M:%S").map(|s| s.to_string()).unwrap_or_default())
+        .map(|dt| {
+            dt.format("%H:%M:%S")
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        })
         .unwrap_or_default()
 }
 
 fn duration_text(secs: u64) -> String {
     if secs >= 3600 {
-        format!("{}h{:02}m{:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+        format!(
+            "{}h{:02}m{:02}s",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
     } else if secs >= 60 {
         format!("{}m{:02}s", secs / 60, secs % 60)
     } else {
@@ -136,7 +145,6 @@ struct Inner {
     log_view: gtk::TextView,
 
     receiver: RefCell<Option<mpsc::Receiver<ScanEvent>>>,
-    control: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     running: Cell<bool>,
     started_at: RefCell<Option<Instant>>,
     open_ports: Cell<usize>,
@@ -246,7 +254,7 @@ fn g_start() {
     let custom_ports_str = s.custom_ports_row.text().to_string();
     let custom_ports: Vec<u16> = if !custom_ports_str.trim().is_empty() {
         custom_ports_str
-            .split(|c: char| c == ',' || c == ' ')
+            .split([',', ' '])
             .filter_map(|p| p.trim().parse().ok())
             .collect()
     } else {
@@ -283,7 +291,10 @@ fn g_start() {
     s.set_running(true);
     *s.started_at.borrow_mut() = Some(Instant::now());
 
-    s.append_log(&format!("开始扫描 {}，共 {} 个端口", config.target, port_count));
+    s.append_log(&format!(
+        "开始扫描 {}，共 {} 个端口",
+        config.target, port_count
+    ));
 
     // 启动扫描线程
     std::thread::spawn(move || {
@@ -329,10 +340,13 @@ fn tick() -> glib::ControlFlow {
                     }
                 }
                 Ok(ScanEvent::Progress { done }) => {
-                    s.progress
-                        .set_text(Some(&format!("{done} / ...")));
+                    s.progress.set_text(Some(&format!("{done} / ...")));
                 }
-                Ok(ScanEvent::Finished { total, open: _, elapsed_secs }) => {
+                Ok(ScanEvent::Finished {
+                    total,
+                    open: _,
+                    elapsed_secs,
+                }) => {
                     scan_finished = Some((total, elapsed_secs));
                     break;
                 }
@@ -361,13 +375,15 @@ fn tick() -> glib::ControlFlow {
             "扫描完成：{total} 个端口，开放 {open} 个，耗时 {}",
             duration_text(elapsed)
         ));
-    } else if s.running.get() {
-        if let Some(ref started_at) = *s.started_at.borrow() {
-            let elapsed = started_at.elapsed().as_secs();
-            let open = s.open_ports.get();
-            s.stat_label
-                .set_text(&format!("扫描中... 已发现 {open} 个开放端口，已运行 {}", duration_text(elapsed)));
-        }
+    } else if s.running.get()
+        && let Some(ref started_at) = *s.started_at.borrow()
+    {
+        let elapsed = started_at.elapsed().as_secs();
+        let open = s.open_ports.get();
+        s.stat_label.set_text(&format!(
+            "扫描中... 已发现 {open} 个开放端口，已运行 {}",
+            duration_text(elapsed)
+        ));
     }
 
     glib::ControlFlow::Continue
@@ -566,7 +582,6 @@ pub fn build() -> PortScannerPage {
         result_empty: result_empty.clone(),
         log_view: log_view.clone(),
         receiver: RefCell::new(None),
-        control: RefCell::new(None),
         running: Cell::new(false),
         started_at: RefCell::new(None),
         open_ports: Cell::new(0),
@@ -579,7 +594,9 @@ pub fn build() -> PortScannerPage {
 
     glib::source::timeout_add(Duration::from_millis(80), tick);
 
-    PortScannerPage { root: toast_overlay }
+    PortScannerPage {
+        root: toast_overlay,
+    }
 }
 
 pub fn shutdown() {

@@ -190,7 +190,9 @@ async fn worker(ctx: Arc<Ctx>, tx: Sender<PathScanEvent>) {
     }
 
     // 所有路径扫完，发最终事件
-    if ctx.shared.completed.load(Ordering::Relaxed) >= paths.len() || ctx.shared.stop.load(Ordering::Relaxed) {
+    if ctx.shared.completed.load(Ordering::Relaxed) >= paths.len()
+        || ctx.shared.stop.load(Ordering::Relaxed)
+    {
         let _ = tx.send(PathScanEvent::Finished {
             tested: ctx.shared.completed.load(Ordering::Relaxed),
             found: ctx.shared.found.load(Ordering::Relaxed),
@@ -199,15 +201,18 @@ async fn worker(ctx: Arc<Ctx>, tx: Sender<PathScanEvent>) {
 }
 
 /// 单次探测。
-async fn probe_once(client: &reqwest::Client, params: &PathScanParams, url: &str, path: &str) -> PathProbeResult {
+async fn probe_once(
+    client: &reqwest::Client,
+    params: &PathScanParams,
+    url: &str,
+    path: &str,
+) -> PathProbeResult {
     let method = match params.method.to_ascii_uppercase().as_str() {
         "HEAD" => reqwest::Method::HEAD,
         _ => reqwest::Method::GET,
     };
 
-    let mut request = client
-        .request(method, url)
-        .timeout(params.timeout);
+    let mut request = client.request(method, url).timeout(params.timeout);
 
     for (k, v) in &params.headers {
         if !k.trim().is_empty() {
@@ -220,10 +225,7 @@ async fn probe_once(client: &reqwest::Client, params: &PathScanParams, url: &str
     match result {
         Ok(response) => {
             let status = response.status();
-            let status_text = status
-                .canonical_reason()
-                .unwrap_or_default()
-                .to_string();
+            let status_text = status.canonical_reason().unwrap_or_default().to_string();
 
             let redirect_url = if status.is_redirection() {
                 response
@@ -260,7 +262,7 @@ async fn probe_once(client: &reqwest::Client, params: &PathScanParams, url: &str
 }
 
 /// 拼接 base URL 与路径。
-fn join_url(base: &str, path: &str) -> String {
+pub fn join_url(base: &str, path: &str) -> String {
     let base = base.trim().trim_end_matches('/');
     let path = path.trim();
     if path.is_empty() {
@@ -294,9 +296,18 @@ mod tests {
 
     #[test]
     fn joins_url_correctly() {
-        assert_eq!(join_url("http://example.com", "/admin"), "http://example.com/admin");
-        assert_eq!(join_url("http://example.com/", "/admin"), "http://example.com/admin");
-        assert_eq!(join_url("http://example.com/api", "/admin"), "http://example.com/api/admin");
+        assert_eq!(
+            join_url("http://example.com", "/admin"),
+            "http://example.com/admin"
+        );
+        assert_eq!(
+            join_url("http://example.com/", "/admin"),
+            "http://example.com/admin"
+        );
+        assert_eq!(
+            join_url("http://example.com/api", "/admin"),
+            "http://example.com/api/admin"
+        );
         assert_eq!(join_url("http://example.com", ""), "http://example.com");
     }
 
@@ -338,7 +349,11 @@ mod tests {
                 let response = format!(
                     "{status_line}\r\nContent-Type: text/html\r\nContent-Length: {}{}\r\nConnection: close\r\n\r\n{body}",
                     body.len(),
-                    if status_line.contains("301") { "\r\nLocation: /admin/login" } else { "" }
+                    if status_line.contains("301") {
+                        "\r\nLocation: /admin/login"
+                    } else {
+                        ""
+                    }
                 );
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
@@ -380,7 +395,13 @@ mod tests {
 
         assert!(finished, "扫描未正常结束");
         assert!(found_paths.contains(&"/admin".to_string()), "应找到 /admin");
-        assert!(found_paths.contains(&"/secret".to_string()), "应找到 /secret");
-        assert!(!found_paths.contains(&"/notexist".to_string()), "不应包含 404");
+        assert!(
+            found_paths.contains(&"/secret".to_string()),
+            "应找到 /secret"
+        );
+        assert!(
+            !found_paths.contains(&"/notexist".to_string()),
+            "不应包含 404"
+        );
     }
 }

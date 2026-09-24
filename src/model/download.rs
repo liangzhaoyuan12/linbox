@@ -132,7 +132,7 @@ impl Default for DownloadConfig {
     }
 }
 
-/// 下载事件：本实现采用轮询快照（`DownloadManager::snapshot`），事件机制暂缺省。
+// 下载事件：本实现采用轮询快照（`DownloadManager::snapshot`），事件机制暂缺省。
 
 /// 任务快照（UI 渲染用）。
 #[derive(Debug, Clone)]
@@ -149,4 +149,157 @@ pub struct TaskSnapshot {
     pub threads: u32,
     pub error: Option<String>,
     pub created_at: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(dir: &str, filename: &str) -> DownloadTask {
+        DownloadTask {
+            id: 1,
+            url: "http://example.com/f.bin".into(),
+            dir: dir.into(),
+            filename: filename.into(),
+            status: TaskStatus::Pending,
+            total_size: Some(1024),
+            downloaded: Arc::new(AtomicU64::new(0)),
+            segments: vec![Segment {
+                start: 0,
+                end: 1023,
+            }],
+            threads: 4,
+            error: None,
+            pause_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            range_supported: true,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn task_status_labels_cover_all_variants() {
+        assert_eq!(TaskStatus::Pending.label(), "排队中");
+        assert_eq!(TaskStatus::Downloading.label(), "下载中");
+        assert_eq!(TaskStatus::Paused.label(), "已暂停");
+        assert_eq!(TaskStatus::Completed.label(), "已完成");
+        assert_eq!(TaskStatus::Failed.label(), "失败");
+        assert_eq!(TaskStatus::Cancelled.label(), "已取消");
+    }
+
+    #[test]
+    fn task_status_serde_roundtrip_all() {
+        for st in [
+            TaskStatus::Pending,
+            TaskStatus::Downloading,
+            TaskStatus::Paused,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            let s = serde_json::to_string(&st).unwrap();
+            let back: TaskStatus = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, st, "{s}");
+        }
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::Completed).unwrap(),
+            r#""Completed""#
+        );
+    }
+
+    #[test]
+    fn segment_serde_and_copy() {
+        let seg = Segment { start: 10, end: 20 };
+        let copy = seg; // Copy
+        assert_eq!(copy.start, 10);
+        let s = serde_json::to_string(&seg).unwrap();
+        assert!(s.contains(r#""start":10"#));
+        assert!(s.contains(r#""end":20"#));
+        let back: Segment = serde_json::from_str(&s).unwrap();
+        assert_eq!((back.start, back.end), (10, 20));
+    }
+
+    #[test]
+    fn task_path_helpers() {
+        let t = task("/tmp/dl", "file.bin");
+        assert_eq!(
+            t.final_path().to_string_lossy(),
+            "/tmp/dl/file.bin",
+            "最终文件路径"
+        );
+        assert_eq!(
+            t.seg_path(0).to_string_lossy(),
+            "/tmp/dl/.file.bin.part.0",
+            "分片0"
+        );
+        assert_eq!(
+            t.seg_path(7).to_string_lossy(),
+            "/tmp/dl/.file.bin.part.7",
+            "分片7"
+        );
+        assert_eq!(
+            t.meta_path().to_string_lossy(),
+            "/tmp/dl/.file.bin.lbm.json",
+            "断点续传 meta"
+        );
+    }
+
+    #[test]
+    fn download_config_default_sane() {
+        let d = DownloadConfig::default();
+        assert_eq!(d.timeout_secs, 30);
+        assert_eq!(d.max_concurrent_tasks, 3);
+        assert_eq!(d.retries, 3);
+        assert_eq!(d.threads_per_task, 8);
+        assert_eq!(d.min_chunk_bytes, 8 * 1024 * 1024);
+        assert!(d.user_agent.contains("Mozilla"));
+        assert!(!d.dir.is_empty());
+    }
+
+    #[test]
+    fn download_config_serde_roundtrip() {
+        let d = DownloadConfig::default();
+        let s = serde_json::to_string(&d).unwrap();
+        let back: DownloadConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.dir, d.dir);
+        assert_eq!(back.timeout_secs, d.timeout_secs);
+        assert_eq!(back.retries, d.retries);
+        assert_eq!(back.threads_per_task, d.threads_per_task);
+        assert_eq!(back.min_chunk_bytes, d.min_chunk_bytes);
+        assert_eq!(back.max_concurrent_tasks, d.max_concurrent_tasks);
+        assert_eq!(back.user_agent, d.user_agent);
+    }
+
+    #[test]
+    fn download_config_from_golden_json() {
+        let json = r#"{"dir":"/tmp/d","user_agent":"UA-Test","timeout_secs":10,"max_concurrent_tasks":2,"retries":1,"threads_per_task":4,"min_chunk_bytes":1024}"#;
+        let d: DownloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(d.dir, "/tmp/d");
+        assert_eq!(d.user_agent, "UA-Test");
+        assert_eq!(d.timeout_secs, 10);
+        assert_eq!(d.max_concurrent_tasks, 2);
+        assert_eq!(d.retries, 1);
+        assert_eq!(d.threads_per_task, 4);
+        assert_eq!(d.min_chunk_bytes, 1024);
+    }
+
+    #[test]
+    fn task_snapshot_fields_round() {
+        let snap = TaskSnapshot {
+            id: 9,
+            url: "u".into(),
+            dir: "d".into(),
+            filename: "f".into(),
+            status: TaskStatus::Downloading,
+            total_size: None,
+            downloaded: 55,
+            speed: 1024,
+            threads: 2,
+            error: None,
+            created_at: 7,
+        };
+        assert_eq!(snap.status, TaskStatus::Downloading);
+        assert!(snap.total_size.is_none(), "None = 服务器未给大小");
+        assert_eq!(snap.downloaded + snap.speed, 55 + 1024);
+    }
 }

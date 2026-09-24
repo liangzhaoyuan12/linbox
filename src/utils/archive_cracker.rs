@@ -5,9 +5,9 @@
 //!
 //! 页面层（`page::archive_cracker`）负责把这些能力拼成界面。
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::model::archive_cracker::{ArchiveConfig, ArchiveFormat, DictConfig, ScanEvent};
@@ -21,7 +21,6 @@ pub struct Dictionary {
     charset: Vec<u8>,
     charset_len: usize,
     min_len: usize,
-    max_len: usize,
     /// 各长度的起始索引（prefix sum）。
     offsets: Vec<u128>,
     total: u128,
@@ -41,7 +40,6 @@ impl Dictionary {
             charset,
             charset_len,
             min_len: config.min_len,
-            max_len: config.max_len,
             offsets,
             total: cumulative,
         }
@@ -57,7 +55,7 @@ impl Dictionary {
         // 确定该索引落在哪个长度区间
         let mut local = index;
         let mut length = self.min_len;
-        for (i, &off) in self.offsets.iter().enumerate() {
+        for (i, &_off) in self.offsets.iter().enumerate() {
             let count = self.charset_len.pow((self.min_len + i) as u32) as u128;
             if local < count {
                 length = self.min_len + i;
@@ -88,8 +86,7 @@ fn verify_zip(path: &str, password: &str) -> Result<bool, String> {
     use zip::read::ZipArchive;
 
     let file = File::open(path).map_err(|e| format!("打开 zip 失败：{e}"))?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|e| format!("解析 zip 失败：{e}"))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("解析 zip 失败：{e}"))?;
 
     if archive.is_empty() {
         return Err("zip 压缩包为空".into());
@@ -98,11 +95,12 @@ fn verify_zip(path: &str, password: &str) -> Result<bool, String> {
     // 找到第一个非目录的加密条目
     let mut target_index = None;
     for i in 0..archive.len() {
-        if let Ok(entry) = archive.by_index(i) {
-            if !entry.is_dir() && entry.encrypted() {
-                target_index = Some(i);
-                break;
-            }
+        if let Ok(entry) = archive.by_index(i)
+            && !entry.is_dir()
+            && entry.encrypted()
+        {
+            target_index = Some(i);
+            break;
         }
     }
 
@@ -118,6 +116,9 @@ fn verify_zip(path: &str, password: &str) -> Result<bool, String> {
 
     let mut buf = [0u8; 1024];
     match entry.read(&mut buf) {
+        // 读到数据说明密码正确（解密头 + CRC 校验在读取中完成）
+        Ok(n) if n > 0 => Ok(true),
+        // 空条目（0 字节 EOF）同样说明密码正确
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
     }
@@ -128,15 +129,14 @@ fn verify_zip(path: &str, password: &str) -> Result<bool, String> {
 // ---------------------------------------------------------------------------
 
 fn verify_7z(path: &str, password: &str) -> Result<bool, String> {
-    use std::io::Cursor;
     use sevenz_rust2::{ArchiveReader, Password};
+    use std::io::Cursor;
 
     let data = std::fs::read(path).map_err(|e| format!("读取 7z 文件失败：{e}"))?;
     let pwd = Password::from(password);
     let cursor = Cursor::new(&data);
 
-    let mut reader = ArchiveReader::new(cursor, pwd)
-        .map_err(|e| format!("打开 7z 失败：{e}"))?;
+    let mut reader = ArchiveReader::new(cursor, pwd).map_err(|e| format!("打开 7z 失败：{e}"))?;
 
     let mut found_file = false;
     let mut password_ok = true;
@@ -144,8 +144,11 @@ fn verify_7z(path: &str, password: &str) -> Result<bool, String> {
     let result = reader.for_each_entries(|_entry, reader| {
         found_file = true;
         let mut buf = [0u8; 512];
-        // 尝试读取解密数据
+        // 尝试读取解密数据：读到字节或 EOF（空条目）都算密码通过
         match reader.read(&mut buf) {
+            // 读到字节说明密码通过
+            Ok(n) if n > 0 => Ok(true),
+            // 空条目同样通过
             Ok(_) => Ok(true),
             Err(_) => {
                 password_ok = false;
@@ -165,8 +168,11 @@ fn verify_7z(path: &str, password: &str) -> Result<bool, String> {
         Err(e) => {
             let msg = format!("{e}");
             // 7z 库在密码错误时可能在 header 阶段就报错
-            if msg.contains("password") || msg.contains("decrypt") || msg.contains("bad")
-                || msg.contains("wrong") || msg.contains("invalid")
+            if msg.contains("password")
+                || msg.contains("decrypt")
+                || msg.contains("bad")
+                || msg.contains("wrong")
+                || msg.contains("invalid")
                 || msg.contains("Decryption")
             {
                 Ok(false)
@@ -351,13 +357,12 @@ fn crack_archive(
 fn monitor_loop(
     shared: &Shared,
     archives: &[ArchiveConfig],
-    archive_count: usize,
+    _archive_count: usize,
     tx: &Sender<ScanEvent>,
 ) {
-    let total: usize = archives
+    let _total: usize = archives
         .iter()
-        .enumerate()
-        .map(|(i, _)| {
+        .map(|_| {
             // 需要字典的 total，但这里没有字典引用
             // 改用 shared.completed vs 估算总候选数
             0usize
@@ -385,7 +390,11 @@ fn monitor_loop(
     }
 
     let _ = tx.send(ScanEvent::Finished {
-        found: if shared.found.load(Ordering::Relaxed) { 1 } else { 0 },
+        found: if shared.found.load(Ordering::Relaxed) {
+            1
+        } else {
+            0
+        },
         total: shared.completed.load(Ordering::Relaxed),
     });
 }

@@ -231,7 +231,12 @@ fn parse_timers_json(text: &str, now_us: u64) -> Result<Vec<Timer>, String> {
     let arr = v.as_array().ok_or("list-timers 输出不是数组")?;
     let mut out = Vec::new();
     for item in arr {
-        let s = |k: &str| item.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let s = |k: &str| {
+            item.get(k)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
         let num = |k: &str| item.get(k).and_then(Value::as_u64).unwrap_or(0);
         let next = num("next");
         let last = num("last");
@@ -349,7 +354,7 @@ fn fill_descriptions(scope: Scope, units: &mut [Unit]) {
         };
         for (names, desc) in parse_show_names_desc(&out) {
             // Description 恰好等于某个单元名 ⇒ 该单元文件其实没有 Description
-            if desc.is_empty() || names.iter().any(|n| *n == desc) {
+            if desc.is_empty() || names.contains(&desc) {
                 continue;
             }
             // 别名单元：Description 要挂到它的每一个名字上
@@ -734,10 +739,11 @@ mod tests {
         assert_eq!(v[0].1, "alsa-utils.service");
         // 别名：Id 是真实单元名，Names 里既有真实名也有别名
         assert_eq!(v[1].0[0], "systemd-logind.service");
-        assert!(v[1]
-            .0
-            .iter()
-            .any(|n| n == "dbus-org.freedesktop.login1.service"));
+        assert!(
+            v[1].0
+                .iter()
+                .any(|n| n == "dbus-org.freedesktop.login1.service")
+        );
         assert_eq!(v[1].1, "User Login Management");
     }
 
@@ -774,11 +780,14 @@ mod tests {
     #[test]
     fn scope_args_come_first() {
         let args = vec!["list-units".to_string(), "--all".to_string()];
-        assert_eq!(systemctl_args(Scope::User, &args), vec![
-            "--user".to_string(),
-            "list-units".to_string(),
-            "--all".to_string()
-        ]);
+        assert_eq!(
+            systemctl_args(Scope::User, &args),
+            vec![
+                "--user".to_string(),
+                "list-units".to_string(),
+                "--all".to_string()
+            ]
+        );
         assert_eq!(systemctl_args(Scope::System, &args), args);
     }
 
@@ -800,7 +809,10 @@ mod tests {
             let total = units.len();
             println!("{scope:?}: service 单元 {total} 个，其中有描述 {with_desc} 个");
             for u in units.iter().take(3) {
-                println!("   {} [{} / {}] {}", u.name, u.load, u.active, u.description);
+                println!(
+                    "   {} [{} / {}] {}",
+                    u.name, u.load, u.active, u.description
+                );
             }
             // 系统作用域的单元文件大多自带 Description；用户作用域几乎全部是
             // transient/generated（没有 unit file），所以只对系统作用域要求覆盖率。

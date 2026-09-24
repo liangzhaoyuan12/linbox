@@ -15,6 +15,11 @@ use crate::utils::monitor as mon;
 use crate::utils::monitor::proc as mproc;
 use crate::utils::monitor::signal as msig;
 
+/// ListStore 里装的元素：`Rc<RefCell<Process>>` 包在 BoxedAnyObject 里。
+/// 每轮采样就地改内容、保持对象身份不变——GTK 对「同身份」的 items-changed
+/// 只 rebind 单元格，对「全量新对象」会销毁重建全部 ~2200 个 widget（GOAL.md 2.5）。
+type ProcObj = Rc<RefCell<Process>>;
+
 /// 状态下拉选项。
 const STATE_FILTERS: &[(&str, char)] = &[
     ("全部状态", '\0'),
@@ -46,7 +51,6 @@ pub struct ProcsTab {
     store: gio::ListStore,
     sort_model: gtk::SortListModel,
     selection: gtk::SingleSelection,
-    col_map: Rc<RefCell<Vec<(ProcColumn, gtk::ColumnViewColumn)>>>,
     // ---- 详情 ----
     d_overview: gtk::Label,
     d_mem: gtk::Label,
@@ -67,6 +71,8 @@ pub struct ProcsTab {
     update_count: Cell<u64>,
     /// 已排入 idle 的重建请求（同一轮主循环里多次请求合并成一次）。
     rebuild_pending: Cell<bool>,
+    /// pid → 列表元素对象（身份缓存；内容就地更新，见 [`ProcObj`]）。
+    objs: RefCell<HashMap<i32, glib::BoxedAnyObject>>,
 }
 
 impl ProcsTab {
@@ -226,7 +232,8 @@ impl ProcsTab {
                 let Some(l) = item.child().and_then(|c| c.downcast::<gtk::Label>().ok()) else {
                     return;
                 };
-                let p = obj.borrow::<Process>();
+                let rc = obj.borrow::<ProcObj>().clone();
+                let p = rc.borrow();
                 let pid = p.pid;
                 l.set_text(&cell_text(&p, col, &collapsed_for_bind.borrow()));
                 l.set_tooltip_text(Some(&cell_tooltip(&p, col)));
@@ -255,8 +262,10 @@ impl ProcsTab {
                 ) else {
                     return gtk::Ordering::Equal;
                 };
-                let pa = a.borrow::<Process>();
-                let pb = b.borrow::<Process>();
+                let ra = a.borrow::<ProcObj>();
+                let pa = ra.borrow();
+                let rb = b.borrow::<ProcObj>();
+                let pb = rb.borrow();
                 match mproc::compare_by(&pa, &pb, col, false) {
                     std::cmp::Ordering::Less => gtk::Ordering::Smaller,
                     std::cmp::Ordering::Equal => gtk::Ordering::Equal,
@@ -280,7 +289,15 @@ impl ProcsTab {
             let cb = gtk::CheckButton::with_label(col.label());
             cb.set_active(cvc.is_visible());
             let cvc2 = cvc.clone();
-            cb.connect_toggled(move |b| cvc2.set_visible(b.is_active()));
+            // 速率列（读/写速率）可见时，采样线程才需要每轮读 /proc/<pid>/io
+            let col_map2 = col_map.clone();
+            cb.connect_toggled(move |b| {
+                cvc2.set_visible(b.is_active());
+                let want = col_map2.borrow().iter().any(|(c, x)| {
+                    matches!(c, ProcColumn::ReadRate | ProcColumn::WriteRate) && x.is_visible()
+                });
+                mon::set_io_columns(want);
+            });
             col_box.append(&cb);
         }
         col_menu.set_child(Some(&col_box));
@@ -334,7 +351,6 @@ impl ProcsTab {
             store,
             sort_model,
             selection: selection.clone(),
-            col_map: col_map.clone(),
             d_overview,
             d_mem,
             d_threads,
@@ -352,6 +368,7 @@ impl ProcsTab {
             detail_pid: Cell::new(-1),
             update_count: Cell::new(0),
             rebuild_pending: Cell::new(false),
+            objs: RefCell::new(HashMap::new()),
         });
 
         // ==================== 交互接线 ====================
@@ -404,6 +421,14 @@ impl ProcsTab {
             move |_, _, _| tab.on_selection_changed()
         ));
 
+        // GOAL.md 2.5：进程表只在可见时才被 update 重建；切回「进程」标签
+        // （或首次显示）时补一次完整刷新。
+        tab.view.connect_map(clone!(
+            #[weak]
+            tab,
+            move |_| tab.refresh_all()
+        ));
+
         // 双击行：树形模式下折叠 / 展开子树（重建同样推迟，见 schedule_rebuild）
         tab.view.connect_activate(clone!(
             #[weak]
@@ -422,17 +447,17 @@ impl ProcsTab {
                         return;
                     };
                     let order = cs.primary_sort_order();
-                    if let Some(col) = cs.primary_sort_column() {
-                        if let Some((pc, _)) = map.borrow().iter().find(|(_, c)| *c == col) {
-                            tab.sort_col.set(*pc);
-                            tab.sort_desc.set(order == gtk::SortType::Descending);
-                            // 树形 / 固定顺序模式：排序键决定同级顺序，需要重建。
-                            // 但绝不能在这个信号里同步改 ListStore —— GTK 的列视图
-                            // 正处在处理本次排序变更的过程中，同步 splice 会把它打
-                            // 进不一致状态（实测 SIGSEGV，崩在 GtkColumnView 的
-                            // items-changed 处理器里），必须挪到下一轮主循环。
-                            tab.schedule_rebuild();
-                        }
+                    if let Some(col) = cs.primary_sort_column()
+                        && let Some((pc, _)) = map.borrow().iter().find(|(_, c)| *c == col)
+                    {
+                        tab.sort_col.set(*pc);
+                        tab.sort_desc.set(order == gtk::SortType::Descending);
+                        // 树形 / 固定顺序模式：排序键决定同级顺序，需要重建。
+                        // 但绝不能在这个信号里同步改 ListStore —— GTK 的列视图
+                        // 正处在处理本次排序变更的过程中，同步 splice 会把它打
+                        // 进不一致状态（实测 SIGSEGV，崩在 GtkColumnView 的
+                        // items-changed 处理器里），必须挪到下一轮主循环。
+                        tab.schedule_rebuild();
                     }
                 }
             ));
@@ -566,19 +591,35 @@ impl ProcsTab {
     // -----------------------------------------------------------------------
 
     /// 每轮采样：更新进程集合 → 重建显示 → 刷新详情。
+    ///
+    /// 进程表所在的 `view` 不可见（外层页面切走 / 内层切到别的标签）时
+    /// 只存数据不重建：实测每次 splice 会让 GtkColumnView 全量销毁重建
+    /// ~2200 个单元格 widget（GOAL.md 2.5，概览标签挂机 73% CPU 的主因）。
+    /// `view` 重新 map 时由 connect_map 补一次完整刷新。
     pub fn update(&self, s: &Snapshot) {
-        self.refresh_users(s);
         *self.procs.borrow_mut() = s.processes.clone();
         self.update_count.set(self.update_count.get() + 1);
+        if !self.view.is_mapped() {
+            return;
+        }
+        self.refresh_users();
         self.rebuild();
         self.refresh_detail(false);
     }
 
+    /// 视图重新可见时补一次完整刷新（期间的快照只存了数据没画）。
+    pub(crate) fn refresh_all(&self) {
+        self.refresh_users();
+        self.rebuild();
+        self.refresh_detail(true);
+    }
+
     /// 用户下拉框：收录快照里出现的 uid（集合不变就不动，避免每次采样重建模型）。
-    fn refresh_users(&self, s: &Snapshot) {
+    fn refresh_users(&self) {
         let me = msig::current_uid();
+        let procs = self.procs.borrow();
         let mut seen: Vec<(u32, String)> = Vec::new();
-        for p in s.processes.iter() {
+        for p in procs.iter() {
             if !seen.iter().any(|(u, _)| *u == p.uid) {
                 seen.push((p.uid, p.user.clone()));
             }
@@ -663,7 +704,7 @@ impl ProcsTab {
         let desc = self.sort_desc.get();
         let cmp = move |a: &Process, b: &Process| mproc::compare_by(a, b, col, desc);
 
-        let mut shown = if tree {
+        let shown = if tree {
             mproc::flatten_tree(filtered, TreeMode::Tree, &self.collapsed.borrow(), &cmp)
         } else if frozen {
             // 固定顺序：沿用上次的顺序，新出现的进程排最后
@@ -682,9 +723,24 @@ impl ProcsTab {
 
         *self.order.borrow_mut() = shown.iter().map(|p| p.pid).collect();
 
+        // 身份按 pid 缓存、内容就地更新：见 [`ProcObj`]（机制实验已验证：
+        // 全量新对象 = 73% CPU 的单元格销毁重建，同身份 = 0~5%）。
+        let live: HashSet<i32> = shown.iter().map(|p| p.pid).collect();
+        let mut objs = self.objs.borrow_mut();
+        objs.retain(|pid, _| live.contains(pid));
         let items: Vec<glib::BoxedAnyObject> = shown
-            .iter_mut()
-            .map(|p| glib::BoxedAnyObject::new(p.clone()))
+            .iter()
+            .map(|p| {
+                if let Some(o) = objs.get(&p.pid) {
+                    let rc = o.borrow::<ProcObj>().clone();
+                    *rc.borrow_mut() = p.clone();
+                    o.clone()
+                } else {
+                    let o = glib::BoxedAnyObject::new(Rc::new(RefCell::new(p.clone())));
+                    objs.insert(p.pid, o.clone());
+                    o
+                }
+            })
             .collect();
         self.store.splice(0, self.store.n_items(), &items);
 
@@ -738,12 +794,14 @@ impl ProcsTab {
             .selection
             .selected_item()
             .and_then(|o| o.downcast::<glib::BoxedAnyObject>().ok())
-            .map(|o| o.borrow::<Process>().pid);
-        if let Some(pid) = pid {
-            if self.selected_pid.get() != Some(pid) {
-                self.selected_pid.set(Some(pid));
-                self.refresh_detail(true);
-            }
+            .map(|o| o.borrow::<ProcObj>().borrow().pid);
+        // 详情面板在用 io 速率/累计值：有选中时采样必须读 /proc/<pid>/io
+        mon::set_io_detail(pid.is_some());
+        if let Some(pid) = pid
+            && self.selected_pid.get() != Some(pid)
+        {
+            self.selected_pid.set(Some(pid));
+            self.refresh_detail(true);
         }
     }
 
@@ -775,8 +833,10 @@ impl ProcsTab {
         else {
             return;
         };
-        let pid = obj.borrow::<Process>().pid;
-        let has_children = obj.borrow::<Process>().child_count > 0;
+        let rc = obj.borrow::<ProcObj>().clone();
+        let inner = rc.borrow();
+        let pid = inner.pid;
+        let has_children = inner.child_count > 0;
         if !has_children {
             return;
         }
@@ -818,14 +878,18 @@ impl ProcsTab {
             return;
         };
         // 读 /proc/<pid>/* 开销较大：换进程时读一次，之后每 5 轮刷新一次
-        if self.detail_pid.get() != p.pid || force || self.update_count.get() % 5 == 0 {
+        if self.detail_pid.get() != p.pid || force || self.update_count.get().is_multiple_of(5) {
             *self.detail.borrow_mut() = Some(mproc::process_detail(p.pid));
             self.detail_pid.set(p.pid);
         }
         let d = self.detail.borrow();
         let exe = detail_str(&d, |x| &x.exe, "读不到（需要 root）");
         let cwd = detail_str(&d, |x| &x.cwd, "读不到（需要 root）");
-        let aff = mproc::affinity_cpus(&p.affinity);
+        // 快照不再每轮算亲和性，详情里有（每 5 轮刷新一次）
+        let aff = d
+            .as_ref()
+            .map(|x| mproc::affinity_cpus(&x.affinity))
+            .unwrap_or_default();
 
         self.d_overview.set_text(&format!(
             "名称        {}（PID {}）\n\
@@ -1069,30 +1133,45 @@ impl ProcsTab {
         dialog.set_close_response("cancel");
         // 闭包要求 'static，把借用的名字拷一份进去
         let name = name.to_string();
-        dialog.connect_response(
-            None,
-            clone!(
-                #[weak(rename_to = tab)]
-                self,
-                move |dlg, resp| {
-                    dlg.close();
-                    if resp != "ok" {
-                        return;
-                    }
-                    match msig::pkexec_send_signal(pid, sig) {
-                        Ok(()) => {
-                            tab.toast_msg(&format!("已通过 pkexec 向 PID {pid} 发送 {name}"), false)
+        dialog.connect_response(None, move |dlg, resp| {
+            dlg.close();
+            if resp != "ok" {
+                return;
+            }
+            // pkexec 要同步等待 Polkit 授权对话框 + 目标进程结束，
+            // 绝不能在 UI 线程上跑（GOAL.md 3.2）：结果经 idle 回主线程。
+            let msg_ok = format!("已通过 pkexec 向 PID {pid} 发送 {name}");
+            std::thread::spawn(move || {
+                let res = msig::pkexec_send_signal(pid, sig);
+                // idle 闭包是 FnMut：结果与文案都包 Cell，避免 move 出捕获变量
+                let cell = std::cell::Cell::new(Some(res));
+                let msg = std::cell::Cell::new(Some(msg_ok));
+                glib::source::idle_add(move || {
+                    if let Some(res) = cell.take() {
+                        match res {
+                            Ok(()) => {
+                                Self::toast_from_ui_thread(msg.take().unwrap_or_default(), false)
+                            }
+                            Err(e) => {
+                                Self::toast_from_ui_thread(format!("提权发送失败：{e}"), true)
+                            }
                         }
-                        Err(e) => tab.toast_msg(&format!("提权发送失败：{e}"), true),
                     }
-                }
-            ),
-        );
+                    glib::ControlFlow::Break
+                });
+            });
+        });
         dialog.present();
     }
 
     fn toast_msg(&self, msg: &str, err: bool) {
         (self.toast)(msg, err);
+    }
+
+    /// 后台线程回主线程发 toast 的入口：不捕获 `!Send` 的控件，
+    /// 经监视器页全局句柄（[`super::with_ui`]）取回进程表实例。
+    pub(crate) fn toast_from_ui_thread(msg: String, err: bool) {
+        super::with_ui(|ui| ui.procs.toast_msg(&msg, err));
     }
 
     fn window(&self) -> Option<gtk::Window> {
@@ -1158,7 +1237,8 @@ impl ProcsTab {
         let total = std::thread::available_parallelism()
             .map(|v| v.get())
             .unwrap_or(8);
-        let cur = mproc::affinity_cpus(&p.affinity);
+        // 现场读一次（快照不再携带亲和性，且打开对话框时的实时值更准确）
+        let cur = mproc::affinity_cpus(&mproc::affinity_hex(p.pid));
         let flow = gtk::FlowBox::new();
         flow.set_selection_mode(gtk::SelectionMode::None);
         flow.set_max_children_per_line(8);
