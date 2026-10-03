@@ -1,6 +1,7 @@
 pub mod archive_cracker;
 pub mod download;
 pub mod env_editor;
+pub mod fstab;
 pub mod http;
 pub mod imfix;
 pub mod inotify_tune;

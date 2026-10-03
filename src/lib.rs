@@ -28,6 +28,7 @@ const PAGE_DOWNLOAD: &str = "download";
 const PAGE_NOTEPAD: &str = "notepad";
 const PAGE_SYSTEMD: &str = "systemd";
 const PAGE_INOTIFY: &str = "inotify";
+const PAGE_FSTAB: &str = "fstab";
 const PAGE_MONITOR: &str = "monitor";
 const PAGE_SETTINGS: &str = "settings";
 
@@ -59,6 +60,7 @@ pub fn run() -> glib::ExitCode {
         page::download::shutdown();
         page::notepad::shutdown();
         page::inotify_tune::shutdown();
+        page::fstab::shutdown();
         page::systemd::shutdown();
         page::monitor::shutdown();
     });
@@ -324,6 +326,16 @@ fn build_ui(app: &adw::Application) {
         page::inotify_tune::build().widget(),
     );
 
+    // 磁盘挂载页面（/etc/fstab 管理，Phase 7）
+    add_nav_item(
+        &nav_list,
+        &stack,
+        PAGE_FSTAB,
+        "drive-harddisk-symbolic",
+        "磁盘挂载",
+        page::fstab::build().widget(),
+    );
+
     // 设置项：固定在底部
     let settings_page = adw::StatusPage::new();
     settings_page.set_title("设置");
@@ -383,7 +395,6 @@ fn build_ui(app: &adw::Application) {
         home_list.select_row(Some(&first));
         stack.set_visible_child_name(PAGE_HOME);
     }
-
     // ---------- 左右组合成导航视图 ----------
     // 用 OverlaySplitView：抽屉式侧边栏，set_show_sidebar 切换自带滑入/滑出弹簧动画，
     // 且接受普通 Widget（无需 NavigationPage 包裹），支持边缘滑动手势。
