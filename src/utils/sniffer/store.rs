@@ -460,6 +460,9 @@ mod tests {
 
     #[test]
     fn sqlite_round_trip_and_dedup() {
+        // 独占进程级 XDG_DATA_HOME（见 crate::test_env）：与 notepad 的
+        // 场景单测串行，双方改目录互不可见，消除偶发的 meta 读取失败。
+        let _xdg = crate::test_env::lock_xdg();
         // 用独立临时数据目录，避免污染用户真实本地库；
         // 必须在任何 pool() 调用之前设置环境变量（池路径在首次连接时固定）
         let tmp = std::env::temp_dir().join(format!("linbox_sqlite_test_{}", std::process::id()));

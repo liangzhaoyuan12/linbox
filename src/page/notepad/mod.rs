@@ -2419,6 +2419,9 @@ mod tests {
     /// different threads」，并行时甚至 SIGSEGV —— 实测教训）。
     #[test]
     fn gtk_scenarios() {
+        // 独占进程级 XDG_DATA_HOME：与 sniffer 的 sqlite 单测串行，
+        // 否则对方会在本测试 create → load_meta 的窗口里翻掉目录（偶发失败根因）。
+        let _xdg = crate::test_env::lock_xdg();
         if gtk::init().is_err() {
             eprintln!("跳过：当前环境无法初始化 GTK");
             return;
@@ -2455,7 +2458,8 @@ mod tests {
         let dir: PathBuf = std::env::temp_dir().join(format!("linbox-notepad-test-{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建临时数据目录失败");
-        // SAFETY: 单测内单线程顺序执行，且其它模块不读 XDG_DATA_HOME。
+        // SAFETY: 本测试全程持有 `crate::test_env::lock_xdg()`，
+        // 所有改写 XDG_DATA_HOME 的单测与本段互斥（模块文档有完整说明）。
         unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
 
         let buffer = gtk::TextBuffer::new(None);

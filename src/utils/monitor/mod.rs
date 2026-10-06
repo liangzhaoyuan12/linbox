@@ -690,10 +690,14 @@ mod tests {
         assert!(!s.sys.kernel.is_empty());
         assert!(!s.sys.distro.is_empty());
         assert!(s.processes.iter().any(|p| p.pid == 1));
-        // 进程 CPU% 汇总（全机口径）不该超过 100% 太多；差分算错（漏除核数）会到几千
+        // 进程 CPU% 汇总（全机口径）：差分算错（漏除核数）会到 ncpu×100=数千，必须拦住。
+        // 上限取 400 而非 150（GOAL 4.6 只断言恒成立的不变量）：各进程差分窗口是各自
+        // 的 /proc 读取时刻，与全局 dt 存在错位——2026-10-05 满载实测总和在 44~98 双向
+        // 波动、门禁曾观测 156.4，即 150 并非恒成立；400 比噪声包络高 2.5×、比漏除
+        // 核数的 bug 信号低 5×。
         let total: f32 = s.processes.iter().map(|p| p.cpu).sum();
         assert!(
-            total <= 150.0,
+            total <= 400.0,
             "进程 CPU 汇总异常：{total}（全机口径应约等于系统总占用，≤100 量级）"
         );
         // 至少有一个进程抓到 CPU 时间

@@ -4,6 +4,8 @@
 //! 不依赖任何 UI 框架；`utils` 读写 `model`，`page` 展示 `model`。
 
 pub mod archive_cracker;
+pub mod cleaner;
+pub mod cpufreq;
 pub mod download;
 pub mod env_editor;
 pub mod fstab;

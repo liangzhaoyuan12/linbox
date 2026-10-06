@@ -12,6 +12,10 @@ pub mod page;
 pub mod utils;
 pub mod widgets;
 
+/// 单测专用：XDG 环境变量互斥（见该模块文档）。
+#[cfg(test)]
+mod test_env;
+
 const APP_ID: &str = "org.linbox.App";
 
 /// 侧边栏条目与内容页共用的页面名。
@@ -29,6 +33,8 @@ const PAGE_NOTEPAD: &str = "notepad";
 const PAGE_SYSTEMD: &str = "systemd";
 const PAGE_INOTIFY: &str = "inotify";
 const PAGE_FSTAB: &str = "fstab";
+const PAGE_CPUFREQ: &str = "cpufreq";
+const PAGE_CLEANER: &str = "cleaner";
 const PAGE_MONITOR: &str = "monitor";
 const PAGE_SETTINGS: &str = "settings";
 
@@ -61,6 +67,8 @@ pub fn run() -> glib::ExitCode {
         page::notepad::shutdown();
         page::inotify_tune::shutdown();
         page::fstab::shutdown();
+        page::cpufreq::shutdown();
+        page::cleaner::shutdown();
         page::systemd::shutdown();
         page::monitor::shutdown();
     });
@@ -334,6 +342,26 @@ fn build_ui(app: &adw::Application) {
         "drive-harddisk-symbolic",
         "磁盘挂载",
         page::fstab::build().widget(),
+    );
+
+    // CPU 调频页面（governor/EPP 切换 + 开机持久化，Phase 8）
+    add_nav_item(
+        &nav_list,
+        &stack,
+        PAGE_CPUFREQ,
+        "power-profile-balanced-symbolic",
+        "CPU 调频",
+        page::cpufreq::build().widget(),
+    );
+
+    // 垃圾清理页面（全盘扫描 → 汇总 → 清理，Phase 9）
+    add_nav_item(
+        &nav_list,
+        &stack,
+        PAGE_CLEANER,
+        "user-trash-symbolic",
+        "垃圾清理",
+        page::cleaner::build().widget(),
     );
 
     // 设置项：固定在底部
