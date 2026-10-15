@@ -6,6 +6,7 @@
 pub mod archive_cracker;
 pub mod cleaner;
 pub mod cpufreq;
+pub mod desktopfile;
 pub mod download;
 pub mod env_editor;
 pub mod fstab;
@@ -16,9 +17,9 @@ pub mod monitor;
 pub mod path_scanner;
 pub mod port_scanner;
 pub mod smart;
-pub mod unitfile;
 pub mod sniffer;
 pub mod systemd;
+pub mod unitfile;
 
 // 故意不做 `pub use xxx::*` 顶层扁平导出：多个模块导出同名项
 // （ScanEvent/ScanConfig/fingerprint），glob 互相冲突（ambiguous glob re-exports）。

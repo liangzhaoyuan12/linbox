@@ -31,6 +31,8 @@ const PAGE_ENVEDITOR: &str = "enveditor";
 const PAGE_DOWNLOAD: &str = "download";
 const PAGE_NOTEPAD: &str = "notepad";
 const PAGE_SYSTEMD: &str = "systemd";
+const PAGE_DESKTOP_MENU: &str = "desktopmenu";
+const PAGE_DESKTOP_AUTOSTART: &str = "desktopautostart";
 const PAGE_INOTIFY: &str = "inotify";
 const PAGE_FSTAB: &str = "fstab";
 const PAGE_CPUFREQ: &str = "cpufreq";
@@ -304,6 +306,26 @@ fn build_ui(app: &adw::Application) {
         "system-run-symbolic",
         "systemd 管理",
         page::systemd::build().widget(),
+    );
+
+    // 应用菜单页面（.desktop 条目管理，Phase 12）
+    add_nav_item(
+        &nav_list,
+        &stack,
+        PAGE_DESKTOP_MENU,
+        "view-grid-symbolic",
+        "应用菜单",
+        page::desktop_menu::build().widget(),
+    );
+
+    // 开机自启页面（autostart .desktop 管理，Phase 12）
+    add_nav_item(
+        &nav_list,
+        &stack,
+        PAGE_DESKTOP_AUTOSTART,
+        "system-run-symbolic",
+        "开机自启",
+        page::desktop_autostart::build().widget(),
     );
 
     // 系统监视器页面（CPU / 内存 / 进程 / 传感器 / 磁盘 / 网络）
