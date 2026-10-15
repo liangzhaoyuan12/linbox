@@ -13,4 +13,5 @@ pub mod monitor;
 pub mod notepad;
 pub mod path_scanner;
 pub mod port_scanner;
+pub mod smart;
 pub mod systemd;

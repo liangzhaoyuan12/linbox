@@ -35,6 +35,7 @@ const PAGE_INOTIFY: &str = "inotify";
 const PAGE_FSTAB: &str = "fstab";
 const PAGE_CPUFREQ: &str = "cpufreq";
 const PAGE_CLEANER: &str = "cleaner";
+const PAGE_SMART: &str = "smart";
 const PAGE_MONITOR: &str = "monitor";
 const PAGE_SETTINGS: &str = "settings";
 
@@ -69,6 +70,7 @@ pub fn run() -> glib::ExitCode {
         page::fstab::shutdown();
         page::cpufreq::shutdown();
         page::cleaner::shutdown();
+        page::smart::shutdown();
         page::systemd::shutdown();
         page::monitor::shutdown();
     });
@@ -362,6 +364,16 @@ fn build_ui(app: &adw::Application) {
         "user-trash-symbolic",
         "垃圾清理",
         page::cleaner::build().widget(),
+    );
+
+    // 硬盘健康页面（SMART 读取与分析，Phase 10）
+    add_nav_item(
+        &nav_list,
+        &stack,
+        PAGE_SMART,
+        "drive-harddisk-solidstate-symbolic",
+        "硬盘健康",
+        page::smart::build().widget(),
     );
 
     // 设置项：固定在底部

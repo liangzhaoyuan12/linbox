@@ -12,5 +12,6 @@ pub mod media;
 pub mod monitor;
 pub mod path_scanner;
 pub mod port_scanner;
+pub mod smart;
 pub mod sniffer;
 pub mod systemd;
