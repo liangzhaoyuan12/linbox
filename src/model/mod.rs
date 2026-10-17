@@ -14,6 +14,7 @@ pub mod imfix;
 pub mod inotify;
 pub mod media;
 pub mod monitor;
+pub mod nav_catalog;
 pub mod path_scanner;
 pub mod port_scanner;
 pub mod smart;

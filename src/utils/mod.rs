@@ -11,6 +11,7 @@ pub mod inotify_tune;
 pub mod json;
 pub mod media;
 pub mod monitor;
+pub mod nav_order;
 pub mod path_scanner;
 pub mod port_scanner;
 pub mod smart;

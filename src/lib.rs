@@ -194,223 +194,241 @@ fn build_ui(app: &adw::Application) {
     stack.set_hhomogeneous(false);
 
     // 注册页面 + 侧边栏条目
-    let home_page = adw::StatusPage::new();
-    home_page.set_title("首页");
-    home_page.set_icon_name(Some("user-home-symbolic"));
-    home_page.set_description(Some("欢迎使用 linbox"));
+    // 首页（Phase 13.4）：功能总览，点击条目切到对应功能页；侧边栏高亮同步
+    // 由下方 `visible-child-notify` 统一处理（原先只有「点侧边栏 → 切 stack」，
+    // 从首页跳页不会高亮，见 GOAL 摸底 9）。
+    let stack_for_home = stack.clone();
+    let home_page = page::home::build(move |page_id| {
+        stack_for_home.set_visible_child_name(page_id);
+    });
     add_nav_item(
         &home_list,
         &stack,
         PAGE_HOME,
         "user-home-symbolic",
         "首页",
-        &home_page,
+        home_page.widget(),
     );
 
-    // JSON 解析页面（真实功能页）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_JSON,
-        "accessories-text-editor-symbolic",
-        "JSON 解析",
-        page::json_parser::build().widget(),
-    );
+    // 功能页：按 model::nav_catalog::NAV_CATALOG 逐条注册。
+    // Phase 13.1 起，page id / 图标 / 中文名的唯一真源是该目录
+    // （D13.1），这里只按 `page` 分派对应的 build 函数。
+    // 顺便收集每个模块的侧边栏行：设置页改序时按新序 remove+append 复用
+    // 同一个 row（GTK4 ListBox 没有重排 API，GOAL 摸底 7）。
+    let mut nav_row_vec: Vec<(String, gtk::ListBoxRow)> = Vec::new();
+    for entry in model::nav_catalog::NAV_CATALOG {
+        let (icon, label) = (entry.icon, entry.label);
+        let row = match entry.page {
+            PAGE_JSON => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::json_parser::build().widget(),
+            ),
+            PAGE_MEDIA => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::media_converter::build().widget(),
+            ),
+            PAGE_APIKEY => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::api_key_sniffer::build().widget(),
+            ),
+            PAGE_FCITX => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::fcitx_fix::build().widget(),
+            ),
+            PAGE_PATHSCANNER => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::path_scanner::build().widget(),
+            ),
+            PAGE_ARCHCRACKER => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::archive_cracker::build().widget(),
+            ),
+            PAGE_PORTSCANNER => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::port_scanner::build().widget(),
+            ),
+            // 下载页的 build() 直接返回 gtk::Widget（其余页返回各自的 Page 结构）
+            PAGE_DOWNLOAD => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                &page::download::build(),
+            ),
+            PAGE_NOTEPAD => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::notepad::build().widget(),
+            ),
+            PAGE_SYSTEMD => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::systemd::build().widget(),
+            ),
+            PAGE_DESKTOP_MENU => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::desktop_menu::build().widget(),
+            ),
+            PAGE_DESKTOP_AUTOSTART => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::desktop_autostart::build().widget(),
+            ),
+            PAGE_MONITOR => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::monitor::build().widget(),
+            ),
+            PAGE_ENVEDITOR => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::env_editor::build().widget(),
+            ),
+            PAGE_INOTIFY => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::inotify_tune::build().widget(),
+            ),
+            PAGE_FSTAB => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::fstab::build().widget(),
+            ),
+            PAGE_CPUFREQ => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::cpufreq::build().widget(),
+            ),
+            PAGE_CLEANER => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::cleaner::build().widget(),
+            ),
+            PAGE_SMART => add_nav_item(
+                &nav_list,
+                &stack,
+                entry.page,
+                icon,
+                label,
+                page::smart::build().widget(),
+            ),
+            // 目录里出现未知 page id 时跳过（正常情况下不会发生，
+            // catalog 与 PAGE_* 常量的一致性由 model::nav_catalog 测试锁定）
+            _ => continue,
+        };
+        nav_row_vec.push((entry.page.to_string(), row));
+    }
 
-    // 音视频 / 图片转换页面（真实功能页）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_MEDIA,
-        "video-x-generic-symbolic",
-        "音视频 / 图片转换",
-        page::media_converter::build().widget(),
-    );
+    // 功能区行 + 设置页（Phase 13.3）：设置页是 v1 唯一的设置项 = 导航排序。
+    // 排序变化经回调重排侧边栏、刷新首页（首页当时被隐藏也要更新，避免
+    // 下次进入是旧序）。
+    let nav_rows: std::rc::Rc<std::cell::RefCell<Vec<(String, gtk::ListBoxRow)>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(nav_row_vec));
 
-    // API Key 嗅探页面（真实功能页）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_APIKEY,
-        "dialog-password-symbolic",
-        "API Key 嗅探",
-        page::api_key_sniffer::build().widget(),
-    );
-
-    // 输入法修复页面（fcitx5 / Wayland）（真实功能页）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_FCITX,
-        "input-keyboard-symbolic",
-        "输入法修复",
-        page::fcitx_fix::build().widget(),
-    );
-
-    // 路径扫描页面（真实功能页）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_PATHSCANNER,
-        "system-search-symbolic",
-        "域名/IP 路径扫描",
-        page::path_scanner::build().widget(),
-    );
-
-    // 压缩包密码爆破页面（真实功能页）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_ARCHCRACKER,
-        "changes-prevent-symbolic",
-        "压缩包爆破",
-        page::archive_cracker::build().widget(),
-    );
-
-    // 端口扫描与服务识别页面（真实功能页）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_PORTSCANNER,
-        "network-transmit-receive-symbolic",
-        "端口扫描",
-        page::port_scanner::build().widget(),
-    );
-
-    // 下载页面（HTTP(S) 多线程下载）
-    let download_page = page::download::build();
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_DOWNLOAD,
-        "folder-download-symbolic",
-        "下载",
-        &download_page,
-    );
-
-    // 备忘录页面（文本 + 图片 + ZIP 导入/导出）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_NOTEPAD,
-        "edit-paste-symbolic",
-        "备忘录",
-        page::notepad::build().widget(),
-    );
-
-    // systemd 管理页面（展示 systemd 能力清单）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_SYSTEMD,
-        "system-run-symbolic",
-        "systemd 管理",
-        page::systemd::build().widget(),
-    );
-
-    // 应用菜单页面（.desktop 条目管理，Phase 12）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_DESKTOP_MENU,
-        "view-grid-symbolic",
-        "应用菜单",
-        page::desktop_menu::build().widget(),
-    );
-
-    // 开机自启页面（autostart .desktop 管理，Phase 12）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_DESKTOP_AUTOSTART,
-        "system-run-symbolic",
-        "开机自启",
-        page::desktop_autostart::build().widget(),
-    );
-
-    // 系统监视器页面（CPU / 内存 / 进程 / 传感器 / 磁盘 / 网络）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_MONITOR,
-        "power-profile-performance-symbolic",
-        "系统监视器",
-        page::monitor::build().widget(),
-    );
-
-    // 环境变量编辑器页面（真实功能页）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_ENVEDITOR,
-        "preferences-system-symbolic",
-        "环境变量编辑",
-        page::env_editor::build().widget(),
-    );
-
-    // inotify 监视数提升页面（真实功能页）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_INOTIFY,
-        "preferences-desktop-symbolic",
-        "inotify 调优",
-        page::inotify_tune::build().widget(),
-    );
-
-    // 磁盘挂载页面（/etc/fstab 管理，Phase 7）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_FSTAB,
-        "drive-harddisk-symbolic",
-        "磁盘挂载",
-        page::fstab::build().widget(),
-    );
-
-    // CPU 调频页面（governor/EPP 切换 + 开机持久化，Phase 8）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_CPUFREQ,
-        "power-profile-balanced-symbolic",
-        "CPU 调频",
-        page::cpufreq::build().widget(),
-    );
-
-    // 垃圾清理页面（全盘扫描 → 汇总 → 清理，Phase 9）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_CLEANER,
-        "user-trash-symbolic",
-        "垃圾清理",
-        page::cleaner::build().widget(),
-    );
-
-    // 硬盘健康页面（SMART 读取与分析，Phase 10）
-    add_nav_item(
-        &nav_list,
-        &stack,
-        PAGE_SMART,
-        "drive-harddisk-solidstate-symbolic",
-        "硬盘健康",
-        page::smart::build().widget(),
-    );
-
-    // 设置项：固定在底部
-    let settings_page = adw::StatusPage::new();
-    settings_page.set_title("设置");
-    settings_page.set_icon_name(Some("preferences-system-symbolic"));
-    settings_page.set_description(Some("此页面尚未实现"));
+    let nav_list_for_order = nav_list.clone();
+    let nav_rows_for_order = nav_rows.clone();
+    let home_page_cb = home_page.clone();
+    let stack_for_cb = stack.clone();
+    let home_list_for_cb = home_list.clone();
+    let nav_list_for_cb = nav_list.clone();
+    let settings_list_for_cb = settings_list.clone();
+    let settings_page = page::settings::build(move |new_order| {
+        {
+            let mut rows = nav_rows_for_order.borrow_mut();
+            reorder_nav_rows(&nav_list_for_order, &mut rows, &new_order);
+        }
+        // 重排会清掉选中态：把当前显示页对应的行重新选上
+        if let Some(name) = stack_for_cb.visible_child_name() {
+            let rows = nav_rows_for_order.borrow();
+            select_nav_row(
+                &home_list_for_cb,
+                &nav_list_for_cb,
+                &settings_list_for_cb,
+                &rows,
+                name.as_str(),
+            );
+        }
+        home_page_cb.set_order(&new_order);
+    });
     add_nav_item(
         &settings_list,
         &stack,
         PAGE_SETTINGS,
         "preferences-system-symbolic",
         "设置",
-        &settings_page,
+        settings_page.widget(),
     );
+
+    // 应用已保存的排序（Phase 13.3）：坏配置由 utils::nav_order 归一化为默认序，
+    // 首页与侧边栏同源同序（用户要求的硬口径）。
+    let saved_cfg = utils::nav_order::load();
+    let default_order = model::nav_catalog::default_order();
+    let effective_order = utils::nav_order::normalize_order(&saved_cfg.order, &default_order);
+    {
+        let mut rows = nav_rows.borrow_mut();
+        reorder_nav_rows(&nav_list, &mut rows, &effective_order);
+    }
+    home_page.set_order(&effective_order);
 
     // 三个 ListBox 互斥选中：选中一行时取消另外两个 ListBox 的选中
     let _home_list_c = home_list.clone();
@@ -451,6 +469,30 @@ fn build_ui(app: &adw::Application) {
     home_list.connect_row_activated(handler.clone());
     nav_list.connect_row_activated(handler.clone());
     settings_list.connect_row_activated(handler);
+
+    // 反向导航同步（Phase 13.4 摸底 9）：stack 当前页变了 → 三个 ListBox 的
+    // 选中态跟着变（首页点卡片跳页后侧边栏也会高亮）。
+    // `select_row` 只触发 row-selected，不会触发 row-activated，无递归风险。
+    // 顺带：本闭包与 stack（= 窗口）同寿，把首页/设置两个页面句柄也捕获进来，
+    // 避免 build_ui 结束后页面被析构（它们的回调还要继续工作）。
+    let home_list_sync = home_list.clone();
+    let nav_list_sync = nav_list.clone();
+    let settings_list_sync = settings_list.clone();
+    let nav_rows_sync = nav_rows.clone();
+    let _keep_pages_alive = (home_page.clone(), settings_page.clone());
+    stack.connect_visible_child_notify(move |stack| {
+        let _ = &_keep_pages_alive;
+        let Some(name) = stack.visible_child_name() else {
+            return;
+        };
+        select_nav_row(
+            &home_list_sync,
+            &nav_list_sync,
+            &settings_list_sync,
+            &nav_rows_sync.borrow(),
+            name.as_str(),
+        );
+    });
 
     // 默认选中首页
     if let Some(first) = home_list.row_at_index(0) {
@@ -633,6 +675,9 @@ fn apply_scheme_animated(
 }
 
 /// 添加一个侧边栏菜单条目，并同步注册已构建好的内容页。
+///
+/// 返回创建的行：功能区行需要被设置页排序时按新序重排（Phase 13.3），
+/// 首页/设置两行固定位置、不参与排序，可忽略返回值。
 fn add_nav_item(
     sidebar: &gtk::ListBox,
     stack: &gtk::Stack,
@@ -640,7 +685,7 @@ fn add_nav_item(
     icon: &str,
     label: &str,
     content: &impl IsA<gtk::Widget>,
-) {
+) -> gtk::ListBoxRow {
     // 内容页
     stack.add_named(content, Some(page));
 
@@ -660,4 +705,64 @@ fn add_nav_item(
     // 把页面名记在行上，供 `row-activated` 回调取出（分隔行没有名字，会被跳过）
     row.set_widget_name(page);
     sidebar.append(&row);
+    row
+}
+
+/// 按页面名在三个 ListBox 里选中对应的行（Phase 13.4 反向导航同步 +
+/// Phase 13.3 重排后的选中态恢复）。
+///
+/// 功能模块在 `rows` 里按 `widget_name` = page id 精确匹配；首页与设置固定
+/// 在各自列表的第 0 行（D13.3：它们不参与排序）。
+fn select_nav_row(
+    home_list: &gtk::ListBox,
+    nav_list: &gtk::ListBox,
+    settings_list: &gtk::ListBox,
+    rows: &[(String, gtk::ListBoxRow)],
+    name: &str,
+) {
+    let hit = rows
+        .iter()
+        .find(|(id, _)| id == name)
+        .map(|(_, row)| row.clone());
+    match hit {
+        Some(row) => {
+            home_list.unselect_all();
+            settings_list.unselect_all();
+            nav_list.select_row(Some(&row));
+        }
+        None if name == PAGE_HOME => {
+            nav_list.unselect_all();
+            settings_list.unselect_all();
+            if let Some(r) = home_list.row_at_index(0) {
+                home_list.select_row(Some(&r));
+            }
+        }
+        None if name == PAGE_SETTINGS => {
+            nav_list.unselect_all();
+            home_list.unselect_all();
+            if let Some(r) = settings_list.row_at_index(0) {
+                settings_list.select_row(Some(&r));
+            }
+        }
+        None => {
+            // 未知页面名：不猜，保持现状
+        }
+    }
+}
+
+/// 按给定顺序重排侧边栏功能区的行（Phase 13.3）。
+///
+/// GTK4 `ListBox` 没有重排 API（GOAL 摸底 7）：按新序 `remove` 全部行、
+/// 再按新序 `append` 回去，全程复用同一个 row widget（行的 `widget_name`
+/// = page id 不变，与 stack 页面的对应关系不受影响；stack 内页面不重建）。
+fn reorder_nav_rows(list: &gtk::ListBox, rows: &mut [(String, gtk::ListBoxRow)], order: &[String]) {
+    rows.sort_by_key(|(id, _)| {
+        order.iter().position(|o| o == id).unwrap_or(usize::MAX) // 不在新序里的（理论上不会发生）排到最后
+    });
+    for (_, row) in rows.iter() {
+        list.remove(row);
+    }
+    for (_, row) in rows.iter() {
+        list.append(row);
+    }
 }
